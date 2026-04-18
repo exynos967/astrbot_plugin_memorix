@@ -270,7 +270,13 @@ class EmbeddedWebUIServer:
             register_lifecycle_handler(app, "shutdown", _shutdown_managers)
             app.state._memorix_import_hooks_registered = True
 
-        server.start()
+        raw_startup_timeout = self._cfg("webui.startup_timeout_seconds", self._cfg("webui.startup_timeout", 8.0))
+        try:
+            startup_timeout = max(0.5, float(raw_startup_timeout))
+        except (TypeError, ValueError):
+            startup_timeout = 8.0
+
+        await asyncio.to_thread(server.start, True, startup_timeout)
         self._server = server
         self.state = WebUIServerState(
             scope_key=scope_key,

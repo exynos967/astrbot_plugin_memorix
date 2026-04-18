@@ -95,6 +95,7 @@ class GraphStore:
         self._adjacency_T: Optional[Union[csr_matrix, csc_matrix]] = None
         self._adjacency_dirty: bool = True
         self._saliency_cache: Optional[Dict[str, float]] = None
+        self._saliency_dirty: bool = True
 
         # V5: 多关系映射 (src_idx, dst_idx) -> Set[relation_hash]
         self._edge_hash_map: Dict[Tuple[int, int], Set[str]] = defaultdict(set)
@@ -108,6 +109,13 @@ class GraphStore:
         if not node:
             return ""
         return str(node).strip().lower()
+
+
+    def _mark_graph_dirty(self) -> None:
+        """失效依赖图结构的缓存。"""
+        self._adjacency_dirty = True
+        self._saliency_dirty = True
+        self._saliency_cache = None
 
     @contextlib.contextmanager
     def batch_update(self):
@@ -181,8 +189,7 @@ class GraphStore:
             idx = len(self._nodes)
             self._nodes.append(node) # 存储原始节点名
             self._node_to_idx[canon] = idx # 映射规范化节点名到索引
-            self._adjacency_dirty = True
-            self._saliency_cache = None
+            self._mark_graph_dirty()
 
             # 添加属性
             if attributes and node in attributes:
@@ -308,7 +315,7 @@ class GraphStore:
 
         self._total_edges_added += len(edges)
         self._total_edges_added += len(edges)
-        self._adjacency_dirty = True  # 标记脏位
+        self._mark_graph_dirty()  # 标记脏位
         
         # V5: 更新边哈希映射 (Edge Hash Map)
         if relation_hashes:
@@ -438,7 +445,7 @@ class GraphStore:
 
         deleted_count = len(existing_nodes)
         self._total_nodes_deleted += deleted_count
-        self._adjacency_dirty = True
+        self._mark_graph_dirty()
 
         logger.info(f"删除 {deleted_count} 个节点")
         return deleted_count
@@ -499,7 +506,7 @@ class GraphStore:
             self._adjacency = self._adjacency.tocsc()
 
         self._total_edges_deleted += deleted
-        self._adjacency_dirty = True
+        self._mark_graph_dirty()
         logger.info(f"删除 {deleted} 条边")
         return deleted
 
@@ -623,7 +630,7 @@ class GraphStore:
                     self._adjacency[idx_s, idx_t] = 0.0
                     deactivated_count += 1
 
-        self._adjacency_dirty = True
+        self._mark_graph_dirty()
         return deactivated_count
 
     def _ensure_adjacency_T(self):
@@ -834,13 +841,13 @@ class GraphStore:
         """
         获取节点显著性得分 (带有缓存机制)
         """
-        if self._saliency_cache is not None and not self._adjacency_dirty:
+        if self._saliency_cache is not None and not self._saliency_dirty:
             return self._saliency_cache
 
         logger.debug("正在计算节点显著性得分 (PageRank)...")
         scores = self.compute_pagerank()
         self._saliency_cache = scores
-        # 注意：这里我们不把 _adjacency_dirty 设为 False，因为其它逻辑(如_adjacency_T)也依赖它
+        self._saliency_dirty = False
         return scores
 
     def connect_synonyms(
@@ -914,7 +921,7 @@ class GraphStore:
         # if min_active_weight > 0:
         #    ... (复杂操作，暂不需要，由 prune 逻辑处理)
             
-        self._adjacency_dirty = True
+        self._mark_graph_dirty()
 
     def prune_relation_hashes(self, operations: List[Tuple[str, str, str]]) -> None:
         """
@@ -1040,7 +1047,7 @@ class GraphStore:
         self._node_attrs.clear()
         self._adjacency = None
         self._adjacency_T = None
-        self._adjacency_dirty = True
+        self._mark_graph_dirty()
         self._total_nodes_added = 0
         self._total_edges_added = 0
         self._total_nodes_deleted = 0
@@ -1166,7 +1173,7 @@ class GraphStore:
                  logger.warning(f"检测到图存储维度不匹配: 节点数={current_n}, 矩阵大小={adj_n}. 正在自动修复...")
                  self._expand_adjacency_matrix(current_n - adj_n)
 
-        self._adjacency_dirty = True
+        self._mark_graph_dirty()
         logger.info(
             f"图存储已加载: {len(self._nodes)} 个节点, "
             f"{self._adjacency.nnz if self._adjacency is not None else 0} 条边"
@@ -1235,7 +1242,7 @@ class GraphStore:
             new_adjacency = csc_matrix((new_n, new_n), dtype=np.float32)
             new_adjacency[:old_n, :old_n] = self._adjacency
         self._adjacency = new_adjacency
-        self._adjacency_dirty = True
+        self._mark_graph_dirty()
         
         # 如果都在增量模式，确保是LIL
         if self._modification_mode == GraphModificationMode.INCREMENTAL:
@@ -1316,7 +1323,6 @@ class GraphStore:
                 self._edge_hash_map[(u, v)].add(h)
                 count += 1
                 
-        self._adjacency_dirty = True
+        self._mark_graph_dirty()
         logger.info(f"已从 {count} 条哈希重建边哈希映射，覆盖 {len(self._edge_hash_map)} 条边")
         return count
-
