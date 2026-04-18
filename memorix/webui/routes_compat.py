@@ -87,6 +87,9 @@ class MemorixServer:
         self._relation_cache = None
         self._relation_cache_timestamp = 0
         self._relation_cache_lock = threading.Lock()
+        # /api/graph 会下沉到 worker thread，串行化所有 store-backed 路由可避免
+        # 共享 graph/sqlite/vector store 在不同请求间发生交叉读写。
+        self._store_access_lock = asyncio.Lock()
         
         # 配置 CORS（默认不放开跨域，允许通过配置白名单）
         allowed_origins = self.plugin.get_config("cors.allow_origins", []) if hasattr(self.plugin, "get_config") else []
@@ -500,12 +503,13 @@ class MemorixServer:
         async def get_graph(exclude_leaf: bool = False, source: Optional[str] = None, density: float = 1.0):
             """获取图谱数据，支持过滤叶子节点、来源及信息密度控制。"""
             try:
-                return await asyncio.to_thread(
-                    self._build_graph_payload,
-                    exclude_leaf=exclude_leaf,
-                    source=source,
-                    density=density,
-                )
+                async with self._store_access_lock:
+                    return await asyncio.to_thread(
+                        self._build_graph_payload,
+                        exclude_leaf=exclude_leaf,
+                        source=source,
+                        density=density,
+                    )
             except HTTPException:
                 raise
             except Exception as exc:
@@ -519,18 +523,13 @@ class MemorixServer:
                 raise HTTPException(status_code=503, detail="Graph store not initialized")
             
             try:
-                # 计算增量 (因为 update_edge_weight 是基于增量的)
-                # 或者我们需要一个直接设置权重的方法。
-                # 查看 GraphStore源码，update_edge_weight 是 add weight.
-                # 如果我们要 set weight，我们需要先获取当前权重。
-                
-                current_weight = self.plugin.graph_store.get_edge_weight(data.source, data.target)
-                delta = data.weight - current_weight
-                
-                new_weight = self.plugin.graph_store.update_edge_weight(data.source, data.target, delta)
-                # 持久化保存到磁盘
-                self.plugin.graph_store.save()
-                return {"success": True, "new_weight": new_weight}
+                async with self._store_access_lock:
+                    current_weight = self.plugin.graph_store.get_edge_weight(data.source, data.target)
+                    delta = data.weight - current_weight
+
+                    new_weight = self.plugin.graph_store.update_edge_weight(data.source, data.target, delta)
+                    self.plugin.graph_store.save()
+                    return {"success": True, "new_weight": new_weight}
             except Exception as e:
                 logger.error(f"Update weight failed: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
@@ -542,17 +541,14 @@ class MemorixServer:
                 raise HTTPException(status_code=503, detail="Graph store not initialized")
                 
             try:
-                # 使用 GraphStore.delete_nodes 方法
-                deleted_count = self.plugin.graph_store.delete_nodes([data.node_id])
-                
-                # 同时从 MetadataStore 删除实体
-                if self.plugin.metadata_store:
-                    self.plugin.metadata_store.delete_entity(data.node_id)
-                
-                # 持久化保存
-                self.plugin.graph_store.save()
-                self._reset_relation_cache()
-                return {"success": True, "deleted_count": deleted_count}
+                async with self._store_access_lock:
+                    deleted_count = self.plugin.graph_store.delete_nodes([data.node_id])
+                    if self.plugin.metadata_store:
+                        self.plugin.metadata_store.delete_entity(data.node_id)
+
+                    self.plugin.graph_store.save()
+                    self._reset_relation_cache()
+                    return {"success": True, "deleted_count": deleted_count}
             except Exception as e:
                 logger.error(f"Delete node failed: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
@@ -564,15 +560,13 @@ class MemorixServer:
                 raise HTTPException(status_code=503, detail="Graph store not initialized")
             
             try:
-                # 将权重设为 0 或移除
-                # 简单做法：update_edge_weight 减去当前权重
-                current_weight = self.plugin.graph_store.get_edge_weight(data.source, data.target)
-                self.plugin.graph_store.update_edge_weight(data.source, data.target, -current_weight)
-                
-                # 持久化保存
-                self.plugin.graph_store.save()
-                self._reset_relation_cache()
-                return {"success": True}
+                async with self._store_access_lock:
+                    current_weight = self.plugin.graph_store.get_edge_weight(data.source, data.target)
+                    self.plugin.graph_store.update_edge_weight(data.source, data.target, -current_weight)
+
+                    self.plugin.graph_store.save()
+                    self._reset_relation_cache()
+                    return {"success": True}
             except Exception as e:
                 logger.error(f"Delete edge failed: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
@@ -580,21 +574,18 @@ class MemorixServer:
         @self.app.post("/api/node")
         async def create_node(data: NodeCreate):
             """创建节点"""
-            print(f"DEBUG: graph_store={self.plugin.graph_store}")
             if self.plugin.graph_store is None:
                 raise HTTPException(status_code=503, detail="Graph store not initialized")
             
             try:
-                # 1. 使用 GraphStore.add_nodes 方法建立物理节点
-                added_count = self.plugin.graph_store.add_nodes([data.node_id])
-                
-                # 2. 同时在 MetadataStore 注册实体，保证元数据一致性
-                if self.plugin.metadata_store:
-                    self.plugin.metadata_store.add_entity(name=data.node_id)
-                
-                # 持久化保存
-                self.plugin.graph_store.save()
-                return {"success": True, "added_count": added_count, "node_id": data.node_id}
+                async with self._store_access_lock:
+                    added_count = self.plugin.graph_store.add_nodes([data.node_id])
+
+                    if self.plugin.metadata_store:
+                        self.plugin.metadata_store.add_entity(name=data.node_id)
+
+                    self.plugin.graph_store.save()
+                    return {"success": True, "added_count": added_count, "node_id": data.node_id}
             except Exception as e:
                 logger.error(f"Create node failed: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
@@ -606,28 +597,25 @@ class MemorixServer:
                 raise HTTPException(status_code=503, detail="Graph store not initialized")
             
             try:
-                # 确保节点存在
-                self.plugin.graph_store.add_nodes([data.source, data.target])
-                
-                # 1. 如果有语义关系，先存入 MetadataStore
-                if data.predicate and self.plugin.metadata_store:
-                   self.plugin.metadata_store.add_relation(
-                       subject=data.source, 
-                       predicate=data.predicate, 
-                       obj=data.target,
-                       confidence=data.weight
-                   )
+                async with self._store_access_lock:
+                    self.plugin.graph_store.add_nodes([data.source, data.target])
 
-                # 2. 使用 GraphStore.add_edges 方法建立物理连接
-                added_count = self.plugin.graph_store.add_edges(
-                    [(data.source, data.target)],
-                    weights=[data.weight]
-                )
-                
-                # 持久化保存
-                self.plugin.graph_store.save()
-                self._reset_relation_cache()
-                return {"success": True, "added_count": added_count, "predicate": data.predicate}
+                    if data.predicate and self.plugin.metadata_store:
+                       self.plugin.metadata_store.add_relation(
+                           subject=data.source,
+                           predicate=data.predicate,
+                           obj=data.target,
+                           confidence=data.weight
+                       )
+
+                    added_count = self.plugin.graph_store.add_edges(
+                        [(data.source, data.target)],
+                        weights=[data.weight]
+                    )
+
+                    self.plugin.graph_store.save()
+                    self._reset_relation_cache()
+                    return {"success": True, "added_count": added_count, "predicate": data.predicate}
             except Exception as e:
                 logger.error(f"Create edge failed: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
@@ -639,37 +627,29 @@ class MemorixServer:
                 raise HTTPException(status_code=503, detail="Graph store not initialized")
             
             try:
-                # 检查旧节点是否存在
-                if not self.plugin.graph_store.has_node(data.old_id):
-                    raise HTTPException(status_code=404, detail=f"Node '{data.old_id}' not found")
-                
-                # 获取旧节点的所有边
-                neighbors = self.plugin.graph_store.get_neighbors(data.old_id)
-                
-                # 添加新节点
-                self.plugin.graph_store.add_nodes([data.new_id])
-                
-                # 复制边到新节点
-                for neighbor in neighbors:
-                    weight = self.plugin.graph_store.get_edge_weight(data.old_id, neighbor)
-                    if weight > 0:
-                        self.plugin.graph_store.add_edges([(data.new_id, neighbor)], weights=[weight])
-                
-                # 获取指向旧节点的边 (反向边)
-                all_nodes = self.plugin.graph_store.get_nodes()
-                for node in all_nodes:
-                    if node != data.old_id and node != data.new_id:
-                        weight = self.plugin.graph_store.get_edge_weight(node, data.old_id)
+                async with self._store_access_lock:
+                    if not self.plugin.graph_store.has_node(data.old_id):
+                        raise HTTPException(status_code=404, detail=f"Node '{data.old_id}' not found")
+
+                    neighbors = self.plugin.graph_store.get_neighbors(data.old_id)
+                    self.plugin.graph_store.add_nodes([data.new_id])
+
+                    for neighbor in neighbors:
+                        weight = self.plugin.graph_store.get_edge_weight(data.old_id, neighbor)
                         if weight > 0:
-                            self.plugin.graph_store.add_edges([(node, data.new_id)], weights=[weight])
-                
-                # 删除旧节点
-                self.plugin.graph_store.delete_nodes([data.old_id])
-                
-                # 持久化保存
-                self.plugin.graph_store.save()
-                self._reset_relation_cache()
-                return {"success": True, "old_id": data.old_id, "new_id": data.new_id}
+                            self.plugin.graph_store.add_edges([(data.new_id, neighbor)], weights=[weight])
+
+                    all_nodes = self.plugin.graph_store.get_nodes()
+                    for node in all_nodes:
+                        if node != data.old_id and node != data.new_id:
+                            weight = self.plugin.graph_store.get_edge_weight(node, data.old_id)
+                            if weight > 0:
+                                self.plugin.graph_store.add_edges([(node, data.new_id)], weights=[weight])
+
+                    self.plugin.graph_store.delete_nodes([data.old_id])
+                    self.plugin.graph_store.save()
+                    self._reset_relation_cache()
+                    return {"success": True, "old_id": data.old_id, "new_id": data.new_id}
             except HTTPException:
                 raise
             except Exception as e:
@@ -686,45 +666,39 @@ class MemorixServer:
             seen_hashes = set()
             
             try:
-                # 0. 如果无任何参数，则返回文件列表 (Summary Mode)
-                if not data.node_id and not data.edge_source and not data.edge_target:
-                    sources = self.plugin.metadata_store.get_all_sources()
-                    return {"mode": "summary", "sources": sources}
-                # 1. 如果是查节点来源 (By Entity)
-                if data.node_id:
-                    # 注意: WebUI 传来的 node_id 通常是实体名称 (Node Name)
-                    # MetadataStore.get_paragraphs_by_entity 接受 entity_name
-                    entity_paras = self.plugin.metadata_store.get_paragraphs_by_entity(data.node_id)
-                    for p in entity_paras:
-                        if p['hash'] not in seen_hashes:
-                            paragraphs.append(p)
-                            seen_hashes.add(p['hash'])
-                            
-                # 2. 如果是查边来源 (By Relation)
-                if data.edge_source and data.edge_target:
-                    # 查出两点间的所有关系
-                    relations = self.plugin.metadata_store.get_relations(
-                        subject=data.edge_source, 
-                        object=data.edge_target
-                    )
-                    for rel in relations:
-                        rel_paras = self.plugin.metadata_store.get_paragraphs_by_relation(rel['hash'])
-                        for p in rel_paras:
+                async with self._store_access_lock:
+                    if not data.node_id and not data.edge_source and not data.edge_target:
+                        sources = self.plugin.metadata_store.get_all_sources()
+                        return {"mode": "summary", "sources": sources}
+                    if data.node_id:
+                        entity_paras = self.plugin.metadata_store.get_paragraphs_by_entity(data.node_id)
+                        for p in entity_paras:
                             if p['hash'] not in seen_hashes:
                                 paragraphs.append(p)
                                 seen_hashes.add(p['hash'])
-                                
-                # 简化返回结构
-                result = []
-                for p in paragraphs:
-                    result.append({
-                        "hash": p["hash"],
-                        "content": p["content"], # 全文或截断
-                        "created_at": p.get("created_at"),
-                        "source": p.get("source", "unknown")
-                    })
-                    
-                return {"sources": result}
+
+                    if data.edge_source and data.edge_target:
+                        relations = self.plugin.metadata_store.get_relations(
+                            subject=data.edge_source,
+                            object=data.edge_target
+                        )
+                        for rel in relations:
+                            rel_paras = self.plugin.metadata_store.get_paragraphs_by_relation(rel['hash'])
+                            for p in rel_paras:
+                                if p['hash'] not in seen_hashes:
+                                    paragraphs.append(p)
+                                    seen_hashes.add(p['hash'])
+
+                    result = []
+                    for p in paragraphs:
+                        result.append({
+                            "hash": p["hash"],
+                            "content": p["content"],
+                            "created_at": p.get("created_at"),
+                            "source": p.get("source", "unknown")
+                        })
+
+                    return {"sources": result}
                 
             except Exception as e:
                 logger.error(f"List sources failed: {e}")
@@ -737,55 +711,50 @@ class MemorixServer:
                  raise HTTPException(status_code=503, detail="Stores not fully initialized")
                  
             try:
-                # 1. 找出所有相关段落
-                paragraphs = self.plugin.metadata_store.get_paragraphs_by_source(data.source)
-                if not paragraphs:
-                    return {"success": True, "message": "No paragraphs found for this source", "count": 0}
-                
-                deleted_count = 0
-                errors = []
-                
-                # 2. 逐个删除 (复用原子删除逻辑)
-                # 考虑到性能，这里是简单的循环。如果有成千上万条，可能需要优化为批量事务。
-                for p in paragraphs:
+                async with self._store_access_lock:
+                    paragraphs = self.plugin.metadata_store.get_paragraphs_by_source(data.source)
+                    if not paragraphs:
+                        return {"success": True, "message": "No paragraphs found for this source", "count": 0}
+
+                    deleted_count = 0
+                    errors = []
+
+                    for p in paragraphs:
+                        try:
+                            cleanup_plan = self.plugin.metadata_store.delete_paragraph_atomic(p['hash'])
+
+                            vec_id = cleanup_plan.get("vector_id_to_remove")
+                            if vec_id:
+                                try:
+                                    self.plugin.vector_store.delete([vec_id])
+                                except Exception:
+                                    pass
+
+                            edges_to_remove = cleanup_plan.get("edges_to_remove", [])
+                            if edges_to_remove:
+                                try:
+                                    self.plugin.graph_store.delete_edges(edges_to_remove)
+                                except Exception:
+                                    pass
+
+                            deleted_count += 1
+
+                        except Exception as pe:
+                            logger.error(f"Failed to delete paragraph {p['hash']}: {pe}")
+                            errors.append(f"{p['hash']}: {pe}")
+
                     try:
-                        # Phase 1: DB Transaction
-                        cleanup_plan = self.plugin.metadata_store.delete_paragraph_atomic(p['hash'])
-                        
-                        # Phase 2: Memory Store Cleanup
-                        vec_id = cleanup_plan.get("vector_id_to_remove")
-                        if vec_id:
-                            try:
-                                self.plugin.vector_store.delete([vec_id])
-                            except Exception:
-                                pass # ignore missing vector
-                                
-                        edges_to_remove = cleanup_plan.get("edges_to_remove", [])
-                        if edges_to_remove:
-                            try:
-                                self.plugin.graph_store.delete_edges(edges_to_remove)
-                            except Exception:
-                                pass
-                                
-                        deleted_count += 1
-                        
-                    except Exception as pe:
-                        logger.error(f"Failed to delete paragraph {p['hash']}: {pe}")
-                        errors.append(f"{p['hash']}: {pe}")
-                
-                # 3. 保存变更
-                try:
-                    self.plugin.vector_store.save()
-                    self.plugin.graph_store.save()
-                except Exception as se:
-                    logger.warning(f"Auto-save after batch delete failed: {se}")
-                    
-                msg = f"Successfully deleted {deleted_count} paragraphs from source '{data.source}'"
-                if errors:
-                    msg += f". Errors: {len(errors)} occurred."
-                    
-                self._reset_relation_cache()
-                return {"success": True, "message": msg, "count": deleted_count, "errors": errors}
+                        self.plugin.vector_store.save()
+                        self.plugin.graph_store.save()
+                    except Exception as se:
+                        logger.warning(f"Auto-save after batch delete failed: {se}")
+
+                    msg = f"Successfully deleted {deleted_count} paragraphs from source '{data.source}'"
+                    if errors:
+                        msg += f". Errors: {len(errors)} occurred."
+
+                    self._reset_relation_cache()
+                    return {"success": True, "message": msg, "count": deleted_count, "errors": errors}
                 
             except Exception as e:
                 logger.error(f"Batch source delete failed: {e}")
@@ -797,47 +766,38 @@ class MemorixServer:
                  raise HTTPException(status_code=503, detail="Stores not fully initialized")
                  
             try:
-                # === Phase 1: DB Transaction & Plan Generation ===
-                # 调用我们在 MetadataStore 实现的原子方法
-                cleanup_plan = self.plugin.metadata_store.delete_paragraph_atomic(data.paragraph_hash)
-                
-                # === Phase 2: Post-Commit Cleanup (In-Memory Stores) ===
-                # 这一步失败不会回滚 DB，但保证了 DB 的一致性
-                errors = []
-                
-                # 1. 清理向量 (使用稳定 ID)
-                vec_id = cleanup_plan.get("vector_id_to_remove")
-                if vec_id:
+                async with self._store_access_lock:
+                    cleanup_plan = self.plugin.metadata_store.delete_paragraph_atomic(data.paragraph_hash)
+                    errors = []
+
+                    vec_id = cleanup_plan.get("vector_id_to_remove")
+                    if vec_id:
+                        try:
+                            self.plugin.vector_store.delete([vec_id])
+                        except Exception as ve:
+                            logger.error(f"Vector cleanup failed for {vec_id}: {ve}")
+                            errors.append(f"Vector cleanup error: {ve}")
+
+                    edges_to_remove = cleanup_plan.get("edges_to_remove", [])
+                    if edges_to_remove:
+                        try:
+                            self.plugin.graph_store.delete_edges(edges_to_remove)
+                        except Exception as ge:
+                            logger.error(f"Graph cleanup failed: {ge}")
+                            errors.append(f"Graph cleanup error: {ge}")
+
+                    msg = "来源删除成功"
+                    if errors:
+                        msg += f"，但带有清理警告: {'; '.join(errors)}"
+
                     try:
-                        # VectorStore.delete 接受 ID 列表
-                        self.plugin.vector_store.delete([vec_id])
-                    except Exception as ve:
-                        logger.error(f"Vector cleanup failed for {vec_id}: {ve}")
-                        errors.append(f"Vector cleanup error: {ve}")
-                        
-                # 2. 清理图边 (批量删除)
-                edges_to_remove = cleanup_plan.get("edges_to_remove", [])
-                if edges_to_remove:
-                    try:
-                        self.plugin.graph_store.delete_edges(edges_to_remove)
-                    except Exception as ge:
-                        logger.error(f"Graph cleanup failed: {ge}")
-                        errors.append(f"Graph cleanup error: {ge}")
-                
-                # 如果有非致命错误，记录并在响应中提示
-                msg = "来源删除成功"
-                if errors:
-                    msg += f"，但带有清理警告: {'; '.join(errors)}"
-                    
-                # 触发保存以持久化内存中的变更
-                try:
-                    self.plugin.vector_store.save()
-                    self.plugin.graph_store.save()
-                except Exception as se:
-                    logger.warning(f"删除来源后的自动保存失败: {se}")
-                
-                self._reset_relation_cache()
-                return {"success": True, "message": msg, "details": cleanup_plan}
+                        self.plugin.vector_store.save()
+                        self.plugin.graph_store.save()
+                    except Exception as se:
+                        logger.warning(f"删除来源后的自动保存失败: {se}")
+
+                    self._reset_relation_cache()
+                    return {"success": True, "message": msg, "details": cleanup_plan}
                 
             except Exception as e:
                 logger.error(f"Delete source failed: {e}")
@@ -864,18 +824,16 @@ class MemorixServer:
                 raise HTTPException(status_code=503, detail="Metadata store missing")
             
             try:
-                # 1. 关系
-                deleted_rels = self.plugin.metadata_store.get_deleted_relations(limit)
-                for x in deleted_rels: x['type'] = 'relation'
-                
-                # 2. 实体
-                deleted_ents = self.plugin.metadata_store.get_deleted_entities(limit)
-                
-                # 3. 合并
-                combined = deleted_rels + deleted_ents
-                combined.sort(key=lambda x: x.get('deleted_at', 0) or 0, reverse=True)
-                
-                return {"items": combined[:limit]}
+                async with self._store_access_lock:
+                    deleted_rels = self.plugin.metadata_store.get_deleted_relations(limit)
+                    for x in deleted_rels:
+                        x['type'] = 'relation'
+
+                    deleted_ents = self.plugin.metadata_store.get_deleted_entities(limit)
+                    combined = deleted_rels + deleted_ents
+                    combined.sort(key=lambda x: x.get('deleted_at', 0) or 0, reverse=True)
+
+                    return {"items": combined[:limit]}
             except Exception as e:
                 logger.error(f"Recycle bin fetch failed: {e}")
                 return {"items": [], "error": str(e)}
@@ -887,32 +845,29 @@ class MemorixServer:
                 raise HTTPException(status_code=503, detail="Stores missing")
 
             try:
-                if data.type == "entity":
-                    # 复活实体
-                    cursor = self.plugin.metadata_store._conn.cursor()
-                    cursor.execute("UPDATE entities SET is_deleted=0, deleted_at=NULL WHERE hash=?", (data.hash,))
-                    self.plugin.metadata_store._conn.commit()
-                    return {"success": True, "type": "entity", "hash": data.hash}
+                async with self._store_access_lock:
+                    if data.type == "entity":
+                        cursor = self.plugin.metadata_store._conn.cursor()
+                        cursor.execute("UPDATE entities SET is_deleted=0, deleted_at=NULL WHERE hash=?", (data.hash,))
+                        self.plugin.metadata_store._conn.commit()
+                        return {"success": True, "type": "entity", "hash": data.hash}
 
-                # relation: 先从回收站恢复元数据，再回灌图边
-                record = self.plugin.metadata_store.restore_relation(data.hash)
-                if not record:
-                    raise HTTPException(status_code=404, detail="回收站中未找到该记忆")
+                    record = self.plugin.metadata_store.restore_relation(data.hash)
+                    if not record:
+                        raise HTTPException(status_code=404, detail="回收站中未找到该记忆")
 
-                s, t = record["subject"], record["object"]
+                    s, t = record["subject"], record["object"]
+                    self.plugin.metadata_store.revive_entities_by_names([s, t])
+                    self.plugin.graph_store.add_nodes([s, t])
+                    self.plugin.graph_store.add_edges(
+                        [(s, t)],
+                        weights=[record["confidence"]],
+                        relation_hashes=[data.hash],
+                    )
+                    self.plugin.graph_store.save()
+                    self._reset_relation_cache()
 
-                # 若实体处于软删除状态，先复活再补图。
-                self.plugin.metadata_store.revive_entities_by_names([s, t])
-                self.plugin.graph_store.add_nodes([s, t])
-                self.plugin.graph_store.add_edges(
-                    [(s, t)],
-                    weights=[record["confidence"]],
-                    relation_hashes=[data.hash],
-                )
-                self.plugin.graph_store.save()
-                self._reset_relation_cache()
-
-                return {"success": True, "type": "relation", "hash": data.hash}
+                    return {"success": True, "type": "relation", "hash": data.hash}
             except HTTPException:
                 raise
             except Exception as e:
@@ -928,20 +883,20 @@ class MemorixServer:
             if not self.plugin.graph_store: raise HTTPException(503, "Graph store missing")
             
             try:
-                gst = self.plugin.graph_store
-                s_idx = gst._node_to_idx.get(gst._canonicalize(s))
-                t_idx = gst._node_to_idx.get(gst._canonicalize(t))
-                
-                if s_idx is not None and t_idx is not None:
-                     hashes = gst._edge_hash_map.get((s_idx, t_idx), set())
-                     if hashes:
-                         self.plugin.metadata_store.reinforce_relations(list(hashes))
-                
-                # 稍微提升权重
-                self.plugin.graph_store.update_edge_weight(s, t, 0.1) 
-                self.plugin.graph_store.save()
-                
-                return {"success": True}
+                async with self._store_access_lock:
+                    gst = self.plugin.graph_store
+                    s_idx = gst._node_to_idx.get(gst._canonicalize(s))
+                    t_idx = gst._node_to_idx.get(gst._canonicalize(t))
+
+                    if s_idx is not None and t_idx is not None:
+                         hashes = gst._edge_hash_map.get((s_idx, t_idx), set())
+                         if hashes:
+                             self.plugin.metadata_store.reinforce_relations(list(hashes))
+
+                    self.plugin.graph_store.update_edge_weight(s, t, 0.1)
+                    self.plugin.graph_store.save()
+
+                    return {"success": True}
             except Exception as e:
                 logger.error(f"Reinforce failed: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
@@ -955,21 +910,20 @@ class MemorixServer:
             if not self.plugin.graph_store: raise HTTPException(503, "Graph store missing")
 
             try:
-                gst = self.plugin.graph_store
-                s_idx = gst._node_to_idx.get(gst._canonicalize(s))
-                t_idx = gst._node_to_idx.get(gst._canonicalize(t))
-                
-                # 1. 在元数据中标记为不活跃
-                if s_idx is not None and t_idx is not None:
-                     hashes = gst._edge_hash_map.get((s_idx, t_idx), set())
-                     if hashes:
-                         self.plugin.metadata_store.mark_relations_inactive(list(hashes))
-                
-                # 2. 在图中停用 (移除边但保留映射)
-                gst.deactivate_edges([(s, t)])
-                gst.save()
-                
-                return {"success": True}
+                async with self._store_access_lock:
+                    gst = self.plugin.graph_store
+                    s_idx = gst._node_to_idx.get(gst._canonicalize(s))
+                    t_idx = gst._node_to_idx.get(gst._canonicalize(t))
+
+                    if s_idx is not None and t_idx is not None:
+                         hashes = gst._edge_hash_map.get((s_idx, t_idx), set())
+                         if hashes:
+                             self.plugin.metadata_store.mark_relations_inactive(list(hashes))
+
+                    gst.deactivate_edges([(s, t)])
+                    gst.save()
+
+                    return {"success": True}
             except Exception as e:
                  logger.error(f"Freeze failed: {e}")
                  raise HTTPException(status_code=500, detail=str(e))
@@ -983,20 +937,21 @@ class MemorixServer:
             if not self.plugin.graph_store: raise HTTPException(503, "Graph store missing")
 
             try:
-                gst = self.plugin.graph_store
-                s_idx = gst._node_to_idx.get(gst._canonicalize(s))
-                t_idx = gst._node_to_idx.get(gst._canonicalize(t))
-                
-                if s_idx is not None and t_idx is not None:
-                     hashes = gst._edge_hash_map.get((s_idx, t_idx), set())
-                     if hashes:
-                         h_list = list(hashes)
-                         is_pinned = (data.type == "pin")
-                         ttl = data.duration * 3600 if data.type == "ttl" else 0
-                         
-                         self.plugin.metadata_store.protect_relations(h_list, is_pinned=is_pinned, ttl_seconds=ttl)
-                
-                return {"success": True}
+                async with self._store_access_lock:
+                    gst = self.plugin.graph_store
+                    s_idx = gst._node_to_idx.get(gst._canonicalize(s))
+                    t_idx = gst._node_to_idx.get(gst._canonicalize(t))
+
+                    if s_idx is not None and t_idx is not None:
+                         hashes = gst._edge_hash_map.get((s_idx, t_idx), set())
+                         if hashes:
+                             h_list = list(hashes)
+                             is_pinned = (data.type == "pin")
+                             ttl = data.duration * 3600 if data.type == "ttl" else 0
+
+                             self.plugin.metadata_store.protect_relations(h_list, is_pinned=is_pinned, ttl_seconds=ttl)
+
+                    return {"success": True}
             except Exception as e:
                  logger.error(f"Protect failed: {e}")
                  raise HTTPException(status_code=500, detail=str(e))
@@ -1009,20 +964,21 @@ class MemorixServer:
             if self.plugin.metadata_store is None:
                 raise HTTPException(status_code=503, detail="Metadata store not initialized")
             try:
-                service = _build_person_profile_service()
-                ttl_minutes = float(self.plugin.get_config("person_profile.profile_ttl_minutes", 360))
-                ttl_seconds = max(60.0, ttl_minutes * 60.0)
-                result = await service.query_person_profile(
-                    person_id=str(data.person_id or "").strip(),
-                    person_keyword=str(data.person_keyword or "").strip(),
-                    top_k=max(4, int(data.top_k or 12)),
-                    ttl_seconds=ttl_seconds,
-                    force_refresh=bool(data.force_refresh),
-                    source_note="webui:person_profile_query",
-                )
-                if not result.get("success", False):
-                    raise HTTPException(status_code=400, detail=result.get("error", "人物画像查询失败"))
-                return result
+                async with self._store_access_lock:
+                    service = _build_person_profile_service()
+                    ttl_minutes = float(self.plugin.get_config("person_profile.profile_ttl_minutes", 360))
+                    ttl_seconds = max(60.0, ttl_minutes * 60.0)
+                    result = await service.query_person_profile(
+                        person_id=str(data.person_id or "").strip(),
+                        person_keyword=str(data.person_keyword or "").strip(),
+                        top_k=max(4, int(data.top_k or 12)),
+                        ttl_seconds=ttl_seconds,
+                        force_refresh=bool(data.force_refresh),
+                        source_note="webui:person_profile_query",
+                    )
+                    if not result.get("success", False):
+                        raise HTTPException(status_code=400, detail=result.get("error", "人物画像查询失败"))
+                    return result
             except HTTPException:
                 raise
             except Exception as e:
@@ -1037,87 +993,88 @@ class MemorixServer:
         ):
             """获取人物列表（支持关键词与分页）。"""
             try:
-                kw = str(keyword or "").strip()
-                conn = self.plugin.metadata_store._conn if self.plugin.metadata_store is not None else None
-                if conn is None:
-                    raise HTTPException(status_code=503, detail="Metadata store not initialized")
-                cursor = conn.cursor()
+                async with self._store_access_lock:
+                    kw = str(keyword or "").strip()
+                    conn = self.plugin.metadata_store._conn if self.plugin.metadata_store is not None else None
+                    if conn is None:
+                        raise HTTPException(status_code=503, detail="Metadata store not initialized")
+                    cursor = conn.cursor()
 
-                where_sql = ""
-                params: List[Any] = []
-                if kw:
-                    where_sql = (
-                        "WHERE person_name LIKE ? OR nickname LIKE ? OR user_id LIKE ? "
-                        "OR person_id LIKE ? OR group_nick_name LIKE ?"
+                    where_sql = ""
+                    params: List[Any] = []
+                    if kw:
+                        where_sql = (
+                            "WHERE person_name LIKE ? OR nickname LIKE ? OR user_id LIKE ? "
+                            "OR person_id LIKE ? OR group_nick_name LIKE ?"
+                        )
+                        like_kw = f"%{kw}%"
+                        params.extend([like_kw, like_kw, like_kw, like_kw, like_kw])
+
+                    cursor.execute(
+                        f"SELECT COUNT(*) FROM person_registry {where_sql}",
+                        tuple(params),
                     )
-                    like_kw = f"%{kw}%"
-                    params.extend([like_kw, like_kw, like_kw, like_kw, like_kw])
+                    total = int(cursor.fetchone()[0] or 0)
+                    offset = (int(page) - 1) * int(page_size)
 
-                cursor.execute(
-                    f"SELECT COUNT(*) FROM person_registry {where_sql}",
-                    tuple(params),
-                )
-                total = int(cursor.fetchone()[0] or 0)
-                offset = (int(page) - 1) * int(page_size)
-
-                cursor.execute(
-                    f"""
-                    SELECT person_id, person_name, nickname, user_id, platform, group_nick_name, last_know
-                    FROM person_registry
-                    {where_sql}
-                    ORDER BY last_know DESC, updated_at DESC
-                    LIMIT ? OFFSET ?
-                    """,
-                    tuple(params + [int(page_size), int(offset)]),
-                )
-                rows = cursor.fetchall()
-
-                items: List[Dict[str, Any]] = []
-                for row in rows:
-                    pid = str(row[0] or "").strip()
-                    person_name = str(row[1] or "").strip()
-                    nickname = str(row[2] or "").strip()
-                    user_id = str(row[3] or "").strip()
-                    aliases = _parse_group_nicks(row[5])
-
-                    has_snapshot = False
-                    has_override = False
-                    latest_profile_updated_at = None
-                    if self.plugin.metadata_store is not None and pid:
-                        snapshot = self.plugin.metadata_store.get_latest_person_profile_snapshot(pid)
-                        override = self.plugin.metadata_store.get_person_profile_override(pid)
-                        has_snapshot = snapshot is not None
-                        has_override = override is not None and bool(str(override.get("override_text", "")).strip())
-                        if has_override:
-                            latest_profile_updated_at = override.get("updated_at")
-                        elif has_snapshot:
-                            latest_profile_updated_at = snapshot.get("updated_at")
-
-                    display_name = person_name or nickname or user_id or pid
-                    items.append(
-                        {
-                            "person_id": pid,
-                            "display_name": display_name,
-                            "person_name": person_name,
-                            "nickname": nickname,
-                            "user_id": user_id,
-                            "platform": str(row[4] or ""),
-                            "aliases": aliases,
-                            "last_know": row[6],
-                            "has_snapshot": has_snapshot,
-                            "has_override": has_override,
-                            "latest_profile_updated_at": latest_profile_updated_at,
-                        }
+                    cursor.execute(
+                        f"""
+                        SELECT person_id, person_name, nickname, user_id, platform, group_nick_name, last_know
+                        FROM person_registry
+                        {where_sql}
+                        ORDER BY last_know DESC, updated_at DESC
+                        LIMIT ? OFFSET ?
+                        """,
+                        tuple(params + [int(page_size), int(offset)]),
                     )
+                    rows = cursor.fetchall()
 
-                return {
-                    "success": True,
-                    "keyword": kw,
-                    "page": int(page),
-                    "page_size": int(page_size),
-                    "total": int(total),
-                    "items": items,
-                }
+                    items: List[Dict[str, Any]] = []
+                    for row in rows:
+                        pid = str(row[0] or "").strip()
+                        person_name = str(row[1] or "").strip()
+                        nickname = str(row[2] or "").strip()
+                        user_id = str(row[3] or "").strip()
+                        aliases = _parse_group_nicks(row[5])
+
+                        has_snapshot = False
+                        has_override = False
+                        latest_profile_updated_at = None
+                        if self.plugin.metadata_store is not None and pid:
+                            snapshot = self.plugin.metadata_store.get_latest_person_profile_snapshot(pid)
+                            override = self.plugin.metadata_store.get_person_profile_override(pid)
+                            has_snapshot = snapshot is not None
+                            has_override = override is not None and bool(str(override.get("override_text", "")).strip())
+                            if has_override:
+                                latest_profile_updated_at = override.get("updated_at")
+                            elif has_snapshot:
+                                latest_profile_updated_at = snapshot.get("updated_at")
+
+                        display_name = person_name or nickname or user_id or pid
+                        items.append(
+                            {
+                                "person_id": pid,
+                                "display_name": display_name,
+                                "person_name": person_name,
+                                "nickname": nickname,
+                                "user_id": user_id,
+                                "platform": str(row[4] or ""),
+                                "aliases": aliases,
+                                "last_know": row[6],
+                                "has_snapshot": has_snapshot,
+                                "has_override": has_override,
+                                "latest_profile_updated_at": latest_profile_updated_at,
+                            }
+                        )
+
+                    return {
+                        "success": True,
+                        "keyword": kw,
+                        "page": int(page),
+                        "page_size": int(page_size),
+                        "total": int(total),
+                        "items": items,
+                    }
             except Exception as e:
                 logger.error(f"List person profile candidates failed: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
@@ -1130,32 +1087,33 @@ class MemorixServer:
             if self.plugin.metadata_store is None:
                 raise HTTPException(status_code=503, detail="Metadata store not initialized")
             try:
-                service = _build_person_profile_service()
-                resolved_pid = _resolve_person_id_for_web(service, data.person_id)
-                if not resolved_pid:
-                    raise HTTPException(status_code=400, detail="person_id 不能为空")
+                async with self._store_access_lock:
+                    service = _build_person_profile_service()
+                    resolved_pid = _resolve_person_id_for_web(service, data.person_id)
+                    if not resolved_pid:
+                        raise HTTPException(status_code=400, detail="person_id 不能为空")
 
-                override = self.plugin.metadata_store.set_person_profile_override(
-                    person_id=resolved_pid,
-                    override_text=str(data.override_text or ""),
-                    updated_by=str(data.updated_by or "webui"),
-                    source="webui",
-                )
-                ttl_minutes = float(self.plugin.get_config("person_profile.profile_ttl_minutes", 360))
-                ttl_seconds = max(60.0, ttl_minutes * 60.0)
-                merged = await service.query_person_profile(
-                    person_id=resolved_pid,
-                    top_k=12,
-                    ttl_seconds=ttl_seconds,
-                    force_refresh=False,
-                    source_note="webui:person_profile_override",
-                )
-                return {
-                    "success": True,
-                    "person_id": resolved_pid,
-                    "override": override,
-                    "profile": merged,
-                }
+                    override = self.plugin.metadata_store.set_person_profile_override(
+                        person_id=resolved_pid,
+                        override_text=str(data.override_text or ""),
+                        updated_by=str(data.updated_by or "webui"),
+                        source="webui",
+                    )
+                    ttl_minutes = float(self.plugin.get_config("person_profile.profile_ttl_minutes", 360))
+                    ttl_seconds = max(60.0, ttl_minutes * 60.0)
+                    merged = await service.query_person_profile(
+                        person_id=resolved_pid,
+                        top_k=12,
+                        ttl_seconds=ttl_seconds,
+                        force_refresh=False,
+                        source_note="webui:person_profile_override",
+                    )
+                    return {
+                        "success": True,
+                        "person_id": resolved_pid,
+                        "override": override,
+                        "profile": merged,
+                    }
             except HTTPException:
                 raise
             except Exception as e:
@@ -1168,13 +1126,14 @@ class MemorixServer:
             if self.plugin.metadata_store is None:
                 raise HTTPException(status_code=503, detail="Metadata store not initialized")
             try:
-                service = _build_person_profile_service()
-                resolved_pid = _resolve_person_id_for_web(service, data.person_id)
-                if not resolved_pid:
-                    raise HTTPException(status_code=400, detail="person_id 不能为空")
+                async with self._store_access_lock:
+                    service = _build_person_profile_service()
+                    resolved_pid = _resolve_person_id_for_web(service, data.person_id)
+                    if not resolved_pid:
+                        raise HTTPException(status_code=400, detail="person_id 不能为空")
 
-                deleted = self.plugin.metadata_store.delete_person_profile_override(resolved_pid)
-                return {"success": True, "person_id": resolved_pid, "deleted": bool(deleted)}
+                    deleted = self.plugin.metadata_store.delete_person_profile_override(resolved_pid)
+                    return {"success": True, "person_id": resolved_pid, "deleted": bool(deleted)}
             except HTTPException:
                 raise
             except Exception as e:
@@ -1185,31 +1144,32 @@ class MemorixServer:
         async def manual_save():
             """手动保存所有数据到磁盘。"""
             try:
-                saved_components = []
-                save_all = getattr(self.plugin, "save_all", None)
+                async with self._store_access_lock:
+                    saved_components = []
+                    save_all = getattr(self.plugin, "save_all", None)
 
-                if callable(save_all):
-                    if inspect.iscoroutinefunction(save_all):
-                        await save_all()
+                    if callable(save_all):
+                        if inspect.iscoroutinefunction(save_all):
+                            await save_all()
+                        else:
+                            await asyncio.to_thread(save_all)
+                        if self.plugin.graph_store is not None:
+                            saved_components.append("graph_store")
+                        if self.plugin.vector_store is not None:
+                            saved_components.append("vector_store")
                     else:
-                        await asyncio.to_thread(save_all)
-                    if self.plugin.graph_store is not None:
-                        saved_components.append("graph_store")
-                    if self.plugin.vector_store is not None:
-                        saved_components.append("vector_store")
-                else:
-                    tasks = []
-                    if self.plugin.graph_store is not None:
-                        tasks.append(asyncio.to_thread(self.plugin.graph_store.save))
-                        saved_components.append("graph_store")
-                    if self.plugin.vector_store is not None:
-                        tasks.append(asyncio.to_thread(self.plugin.vector_store.save))
-                        saved_components.append("vector_store")
-                    if tasks:
-                        await asyncio.gather(*tasks)
+                        tasks = []
+                        if self.plugin.graph_store is not None:
+                            tasks.append(asyncio.to_thread(self.plugin.graph_store.save))
+                            saved_components.append("graph_store")
+                        if self.plugin.vector_store is not None:
+                            tasks.append(asyncio.to_thread(self.plugin.vector_store.save))
+                            saved_components.append("vector_store")
+                        if tasks:
+                            await asyncio.gather(*tasks)
 
-                logger.info(f"手动保存完成: {saved_components}")
-                return {"success": True, "saved": saved_components}
+                    logger.info(f"手动保存完成: {saved_components}")
+                    return {"success": True, "saved": saved_components}
             except Exception as exc:
                 logger.error(f"Manual save failed: {exc}")
                 raise HTTPException(status_code=500, detail=str(exc))
@@ -1259,7 +1219,7 @@ class MemorixServer:
             config = uvicorn.Config(self.app, host=self.host, port=self.port, log_level="info")
             self._server = uvicorn.Server(config)
             self._server.run()
-        except BaseException as exc:
+        except Exception as exc:
             self._startup_error = exc
             logger.error(f"A_Memorix WebUI 启动失败: {exc}", exc_info=True)
             raise
