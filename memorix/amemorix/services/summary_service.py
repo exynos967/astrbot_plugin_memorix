@@ -54,7 +54,6 @@ class SummaryService:
         endpoint_cfg = resolve_openapi_endpoint_config(self.ctx.config, section="embedding")
         selected_model = (
             str(endpoint_cfg.get("chat_model", "") or "")
-            or str(endpoint_cfg.get("model", "") or "")
             or "gpt-4o-mini"
         )
         logger.warning(

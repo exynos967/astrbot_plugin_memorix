@@ -132,27 +132,32 @@ class AstrBotProviderBridge:
     def enabled(self) -> bool:
         return self._context is not None
 
-    async def _pick_default_chat_provider_id(self) -> str:
+    async def _pick_default_chat_provider_id(self, unified_msg_origin: str = "") -> str:
         ctx = self._context
         if ctx is None:
             return ""
 
         get_using = getattr(ctx, "get_using_provider", None)
         if callable(get_using):
-            try:
-                provider = await _invoke_maybe_async(get_using, None)
-                pid = _extract_provider_id(provider)
-                if pid:
-                    return pid
-            except Exception:
-                logger.debug("resolve default chat provider via get_using_provider failed", exc_info=True)
+            origins_to_try: list[str | None] = [None]
+            if unified_msg_origin:
+                origins_to_try.insert(0, unified_msg_origin)
+            for origin in origins_to_try:
+                try:
+                    provider = await _invoke_maybe_async(get_using, origin)
+                    pid = _extract_provider_id(provider)
+                    if pid:
+                        return pid
+                except Exception:
+                    continue
+            logger.debug("resolve default chat provider via get_using_provider failed", exc_info=True)
         return ""
 
-    async def resolve_chat_provider_id(self) -> str:
+    async def resolve_chat_provider_id(self, unified_msg_origin: str = "") -> str:
         # 聊天模型优先使用插件配置；未配置时回退当前会话 provider。
         if self.chat_provider_id:
             return self.chat_provider_id
-        default_id = await self._pick_default_chat_provider_id()
+        default_id = await self._pick_default_chat_provider_id(unified_msg_origin)
         if default_id:
             return default_id
         return ""
@@ -224,12 +229,13 @@ class AstrBotProviderBridge:
         *,
         temperature: float = 0.2,
         max_tokens: int = 1200,
+        unified_msg_origin: str = "",
     ) -> str:
         ctx = self._context
         if ctx is None:
             raise RuntimeError("AstrBot context is not available")
 
-        provider_id = await self.resolve_chat_provider_id()
+        provider_id = await self.resolve_chat_provider_id(unified_msg_origin)
         if not provider_id:
             raise RuntimeError("chat provider is not configured")
 

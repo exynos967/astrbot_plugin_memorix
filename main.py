@@ -686,6 +686,10 @@ class MemorixPlugin(Star):
         if not self._bool_cfg(self.config, "ingest.record_all_events", True):
             return
         try:
+            adapted = AstrbotEventAdapter.from_event(event, self._resolve_scope(event))
+            if not await self._is_adapted_chat_enabled(adapted, adapted.sender_id):
+                logger.debug("[memorix] skip chat-filtered message %s", self._event_ctx_text(event, adapted.scope_key))
+                return
             text = await self._format_event_text_for_memory(event)
             if not text and self._bool_cfg(self.config, "ingest.skip_empty_text", True):
                 logger.debug("[memorix] skip empty/placeholder message %s", self._event_ctx_text(event))
@@ -697,7 +701,6 @@ class MemorixPlugin(Star):
             if not ingested:
                 return
             if not self._bool_cfg(self.config, "summarization.auto_import.after_reply_only", True):
-                adapted = AstrbotEventAdapter.from_event(event, self._resolve_scope(event))
                 await self.summary_service.maybe_enqueue_auto_summary(
                     scope_key=adapted.scope_key,
                     session_id=adapted.session_id,
@@ -711,6 +714,9 @@ class MemorixPlugin(Star):
         if not text:
             return
         adapted = AstrbotEventAdapter.from_event(event, self._resolve_scope(event))
+        if not await self._is_adapted_chat_enabled(adapted, adapted.sender_id):
+            logger.debug("[memorix] skip chat-filtered LLM response %s", self._event_ctx_text(event, adapted.scope_key))
+            return
         try:
             user_text = await self._format_event_text_for_memory(event)
             ingested = await self._ingest_event_message(event, "assistant", text)
@@ -730,6 +736,7 @@ class MemorixPlugin(Star):
                         sender_name=adapted.sender_name,
                         message_id=adapted.message_id,
                         timestamp=float(adapted.timestamp) if adapted.timestamp else time.time(),
+                        unified_msg_origin=adapted.unified_msg_origin,
                     )
                 )
             result = await self.summary_service.maybe_enqueue_auto_summary(

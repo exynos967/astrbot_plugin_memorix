@@ -30,6 +30,7 @@ class PersonFactWritebackItem:
     sender_name: str = ""
     message_id: str = ""
     timestamp: float = 0.0
+    unified_msg_origin: str = ""
 
 
 class PersonFactWritebackService:
@@ -191,6 +192,7 @@ class PersonFactWritebackService:
             person_name=display_name,
             user_text=item.user_text,
             assistant_text=item.assistant_text,
+            item=item,
         )
         if not facts:
             return
@@ -211,14 +213,14 @@ class PersonFactWritebackService:
         platform = str(item.platform or "").strip()
         return f"{platform}:{uid}" if platform else uid
 
-    async def _extract_facts(self, *, ctx: Any, person_name: str, user_text: str, assistant_text: str) -> List[str]:
+    async def _extract_facts(self, *, ctx: Any, person_name: str, user_text: str, assistant_text: str, item: PersonFactWritebackItem) -> List[str]:
         prompt = self._build_prompt(
             person_name=person_name,
             user_text=self._truncate(user_text, self._max_evidence_chars()),
             assistant_text=self._truncate(assistant_text, self._max_evidence_chars()),
         )
         try:
-            raw = await self._complete(ctx, prompt)
+            raw = await self._complete(ctx, prompt, item)
         except Exception as exc:
             logger.debug("[memorix] person fact extractor failed: %s", exc, exc_info=True)
             return []
@@ -245,7 +247,7 @@ class PersonFactWritebackService:
 严格输出 JSON 数组，例如：["{person_name}喜欢深夜打游戏"]。
 如果没有可写入的事实，输出 []。"""
 
-    async def _complete(self, ctx: Any, prompt: str) -> str:
+    async def _complete(self, ctx: Any, prompt: str, item: PersonFactWritebackItem) -> str:
         bridge = getattr(ctx, "provider_bridge", None)
         provider_id = str(self._cfg("person_fact_writeback.chat_provider_id", "") or "").strip()
         if bridge is not None and getattr(bridge, "enabled", False):
@@ -260,6 +262,7 @@ class PersonFactWritebackService:
                 prompt,
                 temperature=float(self._cfg("person_fact_writeback.temperature", 0.1) or 0.1),
                 max_tokens=int(self._cfg("person_fact_writeback.max_tokens", 800) or 800),
+                unified_msg_origin=item.unified_msg_origin,
             )
 
         llm_client = getattr(ctx, "llm_client", None)
