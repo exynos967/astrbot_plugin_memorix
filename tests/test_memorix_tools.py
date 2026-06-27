@@ -439,8 +439,8 @@ class _FakeEmbeddingManager:
 
 
 class _StaticFactService(PersonFactWritebackService):
-    async def _complete(self, ctx, prompt):
-        del ctx, prompt
+    async def _complete(self, ctx, prompt, item):
+        del ctx, prompt, item
         return '["小明喜欢深夜打游戏"]'
 
 
