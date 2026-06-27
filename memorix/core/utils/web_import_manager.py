@@ -22,7 +22,11 @@ import traceback
 import uuid
 
 from ...amemorix.common.logging import get_logger
-from ...amemorix.common.maibot_stubs import llm_api
+
+try:
+    from ...amemorix.common.maibot_stubs import llm_api
+except Exception:  # pragma: no cover - 非主线，软导入防断链
+    llm_api = None
 
 from ...paths import default_data_dir, repo_root, resolve_repo_path, scripts_root
 from ..storage import (
