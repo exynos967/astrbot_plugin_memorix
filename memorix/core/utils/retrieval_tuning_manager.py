@@ -20,19 +20,8 @@ from ...amemorix.common.logging import get_logger
 
 from ...paths import artifacts_root
 from ..runtime.search_runtime_initializer import build_search_runtime
-from .model_routing import (
-    ResolvedLLMModel,
-    generate_with_resolved_model,
-    get_text_generation_model_tasks,
-    pick_text_generation_task,
-    resolve_text_generation_model_selector,
-)
+from .model_routing import generate_text
 from .search_execution_service import SearchExecutionRequest, SearchExecutionService
-
-try:
-    from ...amemorix.common.maibot_stubs import llm_api
-except Exception:  # pragma: no cover
-    llm_api = None
 
 logger = get_logger("A_Memorix.RetrievalTuningManager")
 
@@ -137,7 +126,15 @@ def _safe_json_loads(text: str) -> Optional[Any]:
         try:
             return json.loads(raw[s : e + 1])
         except Exception:
-            return None
+            pass
+    try:
+        from json_repair import repair_json
+
+        repaired = repair_json(raw, return_objects=True)
+        if repaired is not None:
+            return repaired
+    except Exception:
+        pass
     return None
 
 
@@ -251,9 +248,12 @@ class RetrievalTuningManager:
         plugin: Any,
         *,
         import_write_blocked_provider: Optional[Callable[[], bool]] = None,
+        ctx_provider: Optional[Callable[[], Any]] = None,
     ):
         self.plugin = plugin
         self._import_write_blocked_provider = import_write_blocked_provider
+        # 后台调优任务运行时才取 ctx，借此拿 provider_bridge；缺失则降级 env LLMClient。
+        self._ctx_provider = ctx_provider
 
         self._lock = asyncio.Lock()
         self._tasks: Dict[str, RetrievalTuningTaskRecord] = {}
@@ -1289,40 +1289,8 @@ class RetrievalTuningManager:
         ]
         return templates[seq % len(templates)]
 
-    async def _select_llm_model(self) -> Optional[ResolvedLLMModel]:
-        if llm_api is None:
-            return None
-        try:
-            models = get_text_generation_model_tasks(llm_api) or {}
-        except Exception:
-            return None
-        if not models:
-            return None
-
-        cfg_model = str(self._cfg("advanced.extraction_model", "auto") or "auto").strip()
-        if cfg_model.lower() != "auto":
-            task_name, task_config, selected_model_name = resolve_text_generation_model_selector(models, cfg_model)
-            if task_name and task_config:
-                return ResolvedLLMModel(
-                    task_name=task_name,
-                    task_config=task_config,
-                    selected_model_name=selected_model_name,
-                )
-            logger.warning(f"advanced.extraction_model={cfg_model!r} 不可用于文本生成，已回退自动选择")
-        task_name, task_config = pick_text_generation_task(
-            models,
-            preferred=("memory", "utils", "planner", "tool_use", "replyer"),
-        )
-        if task_name and task_config:
-            return ResolvedLLMModel(task_name=task_name, task_config=task_config)
-        return None
-
     async def _llm_call_text(self, prompt: str, *, request_type: str) -> str:
-        if llm_api is None:
-            raise RuntimeError("llm_api unavailable")
-        resolved_model = await self._select_llm_model()
-        if resolved_model is None:
-            raise RuntimeError("no_llm_model")
+        ctx = self._ctx_provider() if self._ctx_provider else None
 
         retry = self._llm_retry_cfg()
         max_attempts = int(retry["max_attempts"])
@@ -1330,34 +1298,20 @@ class RetrievalTuningManager:
         max_wait = float(retry["max_wait_seconds"])
         backoff = float(retry["backoff_multiplier"])
 
-        last_error: Optional[Exception] = None
+        last_error: str = ""
         for idx in range(max_attempts):
-            try:
-                result = await generate_with_resolved_model(
-                    resolved_model,
-                    request_type=request_type,
-                    prompt=prompt,
-                    temperature=getattr(resolved_model.task_config, "temperature", None),
-                    max_tokens=getattr(resolved_model.task_config, "max_tokens", None),
-                )
-                success = bool(result.success)
-                response = str(result.completion.response or "")
-                if not success:
-                    raise RuntimeError("llm_generation_failed")
-                text = str(response or "").strip()
-                if text:
-                    return text
-                raise RuntimeError("empty_llm_response")
-            except Exception as e:
-                last_error = e
-                if idx >= max_attempts - 1:
-                    break
-                delay = min(max_wait, min_wait * (backoff ** idx))
-                await asyncio.sleep(max(0.05, delay))
+            result = await generate_text(ctx, prompt, request_type=request_type)
+            if result.success and result.text:
+                return str(result.text).strip()
+            last_error = result.error or "empty_llm_response"
+            if idx >= max_attempts - 1:
+                break
+            delay = min(max_wait, min_wait * (backoff ** idx))
+            await asyncio.sleep(max(0.05, delay))
         raise RuntimeError(f"LLM call failed: {last_error}")
 
     async def _generate_nl_queries_with_llm(self, anchors: List[Dict[str, Any]], *, enabled: bool) -> Dict[str, str]:
-        if not enabled or llm_api is None or not anchors:
+        if not enabled or not anchors:
             return {}
         payload = [
             {
@@ -1404,7 +1358,7 @@ class RetrievalTuningManager:
         max_count: int,
         enabled: bool,
     ) -> List[Dict[str, Any]]:
-        if not enabled or llm_api is None or max_count <= 0:
+        if not enabled or max_count <= 0:
             return []
         prompt = (
             "你是检索调参专家。"

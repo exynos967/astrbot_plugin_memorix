@@ -6,3 +6,4 @@ pydantic>=2.0.0
 jieba>=0.42.1
 openai>=1.40.0
 httpx>=0.28.0
+json-repair>=0.30.0

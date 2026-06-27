@@ -10,19 +10,11 @@ Episode 语义切分服务（LLM 主路径）。
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from ...amemorix.common.logging import get_logger
-from ...amemorix.common.task_config import TaskConfig
-from ...amemorix.common.maibot_stubs import llm_api
 
-from .model_routing import (
-    ResolvedLLMModel,
-    generate_with_resolved_model,
-    get_text_generation_model_tasks,
-    pick_text_generation_task,
-    resolve_text_generation_model_selector,
-)
+from .model_routing import generate_text
 
 logger = get_logger("A_Memorix.EpisodeSegmentationService")
 
@@ -32,8 +24,10 @@ class EpisodeSegmentationService:
 
     SEGMENTATION_VERSION = "episode_mvp_v1"
 
-    def __init__(self, plugin_config: Optional[dict] = None):
+    def __init__(self, plugin_config: Optional[dict] = None, ctx: Any = None):
         self.plugin_config = plugin_config or {}
+        # 本土化命脉：segment() 调 generate_text 时据此取 provider_bridge，缺省降级 env LLMClient。
+        self._ctx = ctx
 
     def _cfg(self, key: str, default: Any = None) -> Any:
         current: Any = self.plugin_config
@@ -43,55 +37,6 @@ class EpisodeSegmentationService:
             else:
                 return default
         return current
-
-    @staticmethod
-    def _is_task_config(obj: Any) -> bool:
-        return hasattr(obj, "model_list") and bool(getattr(obj, "model_list", []))
-
-    def _pick_template_task(self, available_tasks: Dict[str, Any]) -> Optional[TaskConfig]:
-        _, task_config = pick_text_generation_task(
-            available_tasks,
-            preferred=("memory", "utils", "replyer", "planner", "tool_use"),
-        )
-        return task_config
-
-    def _resolve_model_config(self) -> Tuple[Optional[ResolvedLLMModel], str]:
-        available_tasks = get_text_generation_model_tasks(llm_api) or {}
-        if not available_tasks:
-            return None, "unavailable"
-
-        selector = str(self._cfg("episode.segmentation_model", "auto") or "auto").strip()
-
-        if selector and selector.lower() != "auto":
-            task_name, task_config, selected_model_name = resolve_text_generation_model_selector(
-                available_tasks,
-                selector,
-            )
-            if task_name and task_config:
-                return (
-                    ResolvedLLMModel(
-                        task_name=task_name,
-                        task_config=task_config,
-                        selected_model_name=selected_model_name,
-                    ),
-                    selector,
-                )
-
-            logger.warning(f"episode.segmentation_model='{selector}' 不可用，回退 auto")
-
-        task_name, task_config = pick_text_generation_task(
-            available_tasks,
-            preferred=("memory", "utils", "replyer", "planner", "tool_use"),
-        )
-        if task_name and task_config:
-            return ResolvedLLMModel(task_name=task_name, task_config=task_config), task_name
-
-        fallback = self._pick_template_task(available_tasks)
-        if fallback is not None:
-            task_name, task_config = pick_text_generation_task(available_tasks)
-            if task_name and task_config:
-                return ResolvedLLMModel(task_name=task_name, task_config=task_config), "auto"
-        return None, "unavailable"
 
     @staticmethod
     def _clamp_score(value: Any, default: float = 0.0) -> float:
@@ -134,6 +79,15 @@ class EpisodeSegmentationService:
             data = json.loads(candidate)
             if isinstance(data, dict):
                 return data
+
+        try:
+            from json_repair import repair_json
+
+            repaired = repair_json(raw, return_objects=True)
+            if isinstance(repaired, dict):
+                return repaired
+        except Exception:
+            pass
 
         raise ValueError("invalid_json_response")
 
@@ -273,34 +227,26 @@ class EpisodeSegmentationService:
         if not paragraphs:
             raise ValueError("paragraphs_empty")
 
-        resolved_model, model_label = self._resolve_model_config()
-        if resolved_model is None:
-            raise RuntimeError("episode segmentation model unavailable")
-
         prompt = self._build_prompt(
             source=source,
             window_start=window_start,
             window_end=window_end,
             paragraphs=paragraphs,
         )
-        result = await generate_with_resolved_model(
-            resolved_model,
+        result = await generate_text(
+            self._ctx,
+            prompt,
             request_type="A_Memorix.EpisodeSegmentation",
-            prompt=prompt,
-            temperature=getattr(resolved_model.task_config, "temperature", None),
-            max_tokens=getattr(resolved_model.task_config, "max_tokens", None),
         )
-        success = bool(result.success)
-        response = str(result.completion.response or "")
-        if not success or not response:
+        if not result.success or not result.text:
             raise RuntimeError("llm_generate_failed")
 
-        payload = self._safe_json_loads(str(response))
+        payload = self._safe_json_loads(str(result.text))
         input_hashes = [str(p.get("hash", "") or "").strip() for p in paragraphs]
         episodes = self._normalize_episodes(payload=payload, input_hashes=input_hashes)
 
         return {
             "episodes": episodes,
-            "segmentation_model": model_label,
+            "segmentation_model": "auto",
             "segmentation_version": self.SEGMENTATION_VERSION,
         }

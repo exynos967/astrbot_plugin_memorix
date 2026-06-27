@@ -18,7 +18,6 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from ...amemorix.common.logging import get_logger
-from ...amemorix.common.maibot_stubs import global_config
 
 from .episode_segmentation_service import EpisodeSegmentationService
 from .hash import compute_hash
@@ -529,10 +528,12 @@ class EpisodeService:
                 "paragraph_count": 0,
             }
 
-        memory_cfg = global_config.a_memorix.integration
+        hard_filter_enabled = bool(
+            self._cfg("integration.feedback_correction_paragraph_hard_filter_enabled", True)
+        )
         paragraphs = self.metadata_store.get_live_paragraphs_by_source(
             token,
-            exclude_stale=bool(getattr(memory_cfg, "feedback_correction_paragraph_hard_filter_enabled", True)),
+            exclude_stale=hard_filter_enabled,
         )
         if not paragraphs:
             replace_result = self.metadata_store.replace_episodes_for_source(token, [])
