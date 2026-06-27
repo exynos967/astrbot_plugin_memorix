@@ -70,7 +70,7 @@ class EpisodeRetrievalService:
                     temporal=temporal,
                 )
             except Exception as exc:
-                logger.warning("episode evidence retrieval failed, fallback to lexical only: %s", exc)
+                logger.warning(f"episode evidence retrieval failed, fallback to lexical only: {exc}")
             else:
                 paragraph_rank_map: Dict[str, int] = {}
                 relation_rank_map: Dict[str, int] = {}
@@ -163,7 +163,6 @@ class EpisodeRetrievalService:
                     payload.pop("matched_relation_hashes", None)
                     payload.pop("matched_paragraph_count", None)
                     payload.pop("matched_relation_count", None)
-                    payload["type"] = "episode"
                     payload["_fusion_score"] = 0.0
                     bucket[episode_id] = payload
                 bucket[episode_id]["_fusion_score"] = float(

@@ -18,6 +18,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from ...amemorix.common.logging import get_logger
+from ...amemorix.common.maibot_stubs import global_config
 
 from .episode_segmentation_service import EpisodeSegmentationService
 from .hash import compute_hash
@@ -384,10 +385,10 @@ class EpisodeService:
                 raise ValueError("llm_empty_episodes")
         except Exception as e:
             logger.warning(
-                "Episode segmentation fallback: source=%s size=%s err=%s",
-                source,
-                len(group_hashes),
-                e,
+                "Episode segmentation fallback: "
+                f"source={source} "
+                f"size={len(group_hashes)} "
+                f"err={e}"
             )
             episodes = [self._build_fallback_episode(group)]
             fallback_used = True
@@ -528,7 +529,11 @@ class EpisodeService:
                 "paragraph_count": 0,
             }
 
-        paragraphs = self.metadata_store.get_live_paragraphs_by_source(token)
+        memory_cfg = global_config.a_memorix.integration
+        paragraphs = self.metadata_store.get_live_paragraphs_by_source(
+            token,
+            exclude_stale=bool(getattr(memory_cfg, "feedback_correction_paragraph_hard_filter_enabled", True)),
+        )
         if not paragraphs:
             replace_result = self.metadata_store.replace_episodes_for_source(token, [])
             return {

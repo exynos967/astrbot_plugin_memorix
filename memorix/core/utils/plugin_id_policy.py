@@ -24,3 +24,4 @@ class PluginIdPolicy:
         if normalized == cls.CANONICAL_ID:
             return True
         return normalized.split(".")[-1] == cls.CANONICAL_ID
+

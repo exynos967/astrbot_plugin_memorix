@@ -342,4 +342,3 @@ def _product_dequantize(codes: np.ndarray, centroids: np.ndarray) -> np.ndarray:
         vector[i * ds : (i + 1) * ds] = centroids[i, code, :]
 
     return vector
-

@@ -82,8 +82,9 @@ class RelationWriteService:
             )
             self.metadata_store.set_relation_vector_state(hash_value, "ready")
             logger.info(
-                "metric.relation_vector_write_success=1 metric.relation_vector_write_success_count=1 hash=%s",
-                hash_value[:16],
+                "metric.relation_vector_write_success=1 "
+                "metric.relation_vector_write_success_count=1 "
+                f"hash={hash_value[:16]}"
             )
             return RelationWriteResult(
                 hash_value=hash_value,
@@ -109,9 +110,10 @@ class RelationWriteService:
                 bump_retry=True,
             )
             logger.warning(
-                "metric.relation_vector_write_fail=1 metric.relation_vector_write_fail_count=1 hash=%s err=%s",
-                hash_value[:16],
-                err,
+                "metric.relation_vector_write_fail=1 "
+                "metric.relation_vector_write_fail_count=1 "
+                f"hash={hash_value[:16]} "
+                f"err={err}"
             )
             return RelationWriteResult(
                 hash_value=hash_value,
@@ -126,7 +128,7 @@ class RelationWriteService:
         predicate: str,
         obj: str,
         confidence: float = 1.0,
-        source_paragraph: str = "",
+        source_paragraph: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
         *,
         write_vector: bool = True,
