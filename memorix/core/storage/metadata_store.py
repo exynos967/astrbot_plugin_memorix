@@ -3726,6 +3726,39 @@ class MetadataStore:
         self._conn.commit()
         return items
 
+    def soft_delete_paragraphs(self, paragraph_hashes: List[str]) -> Dict[str, Any]:
+        """软删段落并清理其实体/关系关联与外部引用，集中替代散落裸 SQL。
+
+        供反馈纠错回滚（撤销已写入的纠正段落）使用：先标记 paragraphs.is_deleted，
+        再硬删 paragraph_entities / paragraph_relations 关联，最后删 external_memory_refs。
+        返回段落快照与被删外部引用，供 action_log 回放与回滚审计。
+        """
+        hashes = self._normalize_hash_sequence(paragraph_hashes)
+        if not hashes:
+            return {"deleted_hashes": [], "paragraph_rows": {}, "deleted_external_refs": []}
+
+        paragraph_rows: Dict[str, Optional[Dict[str, Any]]] = {
+            hash_value: self.get_paragraph(hash_value) for hash_value in hashes
+        }
+        self.mark_as_deleted(hashes, "paragraph")
+        placeholders = ",".join(["?"] * len(hashes))
+        cursor = self._conn.cursor()
+        cursor.execute(
+            f"DELETE FROM paragraph_entities WHERE paragraph_hash IN ({placeholders})",
+            tuple(hashes),
+        )
+        cursor.execute(
+            f"DELETE FROM paragraph_relations WHERE paragraph_hash IN ({placeholders})",
+            tuple(hashes),
+        )
+        self._conn.commit()
+        deleted_external_refs = self.delete_external_memory_refs_by_paragraphs(hashes)
+        return {
+            "deleted_hashes": hashes,
+            "paragraph_rows": paragraph_rows,
+            "deleted_external_refs": deleted_external_refs,
+        }
+
     def restore_external_memory_refs(self, refs: List[Dict[str, Any]]) -> int:
         count = 0
         for item in refs or []:
