@@ -1,14 +1,31 @@
+from typing import Any, Dict, List
+
 import re
-from typing import List, Dict, Any
+
 from .base import BaseStrategy, ProcessedChunk, KnowledgeType, SourceInfo, ChunkContext
 
 class NarrativeStrategy(BaseStrategy):
+    DEFAULT_WINDOW_SIZE = 1600
+    DEFAULT_OVERLAP = 400
+
+    def __init__(self, filename: str, window_size: int = DEFAULT_WINDOW_SIZE, overlap: int = DEFAULT_OVERLAP):
+        super().__init__(filename)
+        self.window_size = max(200, int(window_size or self.DEFAULT_WINDOW_SIZE))
+        normalized_overlap = max(0, int(overlap or 0))
+        self.overlap = min(normalized_overlap, max(0, self.window_size - 1))
+
     def split(self, text: str) -> List[ProcessedChunk]:
         scenes = self._split_into_scenes(text)
         chunks = []
         
         for scene_idx, (scene_text, scene_title) in enumerate(scenes):
-             scene_chunks = self._sliding_window(scene_text, scene_title, scene_idx)
+             scene_chunks = self._sliding_window(
+                 scene_text,
+                 scene_title,
+                 scene_idx,
+                 window_size=self.window_size,
+                 overlap=self.overlap,
+             )
              chunks.extend(scene_chunks)
              
         return chunks
@@ -72,7 +89,10 @@ class NarrativeStrategy(BaseStrategy):
             
             chunks.append(self._create_chunk(chunk_text, scene_id, scene_idx, local_idx, start))
             
-            start += len(chunk_text) - overlap if end < len(text) else len(chunk_text)
+            if end < len(text):
+                start += max(1, len(chunk_text) - overlap)
+            else:
+                start += len(chunk_text)
             local_idx += 1
             
         return chunks
