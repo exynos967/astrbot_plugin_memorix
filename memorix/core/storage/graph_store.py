@@ -24,6 +24,20 @@ try:
     from scipy.sparse.linalg import norm
     HAS_SCIPY = True
 except ImportError:
+    class _SparseMatrixPlaceholder:
+        pass
+
+    def _scipy_missing(*args, **kwargs):
+        raise ImportError("SciPy 未安装，请安装: pip install scipy")
+
+    csr_matrix = _SparseMatrixPlaceholder
+    csc_matrix = _SparseMatrixPlaceholder
+    lil_matrix = _SparseMatrixPlaceholder
+    triu = _scipy_missing
+    save_npz = _scipy_missing
+    load_npz = _scipy_missing
+    bmat = _scipy_missing
+    norm = _scipy_missing
     HAS_SCIPY = False
 
 import contextlib
@@ -59,7 +73,7 @@ class GraphStore:
 
     def __init__(
         self,
-        matrix_format: str = "csr",
+        matrix_format: Union[str, SparseMatrixFormat] = "csr",
         data_dir: Optional[Union[str, Path]] = None,
     ):
         """
@@ -105,7 +119,7 @@ class GraphStore:
         # V5: 简单的异步锁 (实际上 asyncio 环境下单线程主循环可能不需要，但为了安全保留)
         self._lock = asyncio.Lock()
 
-        logger.info(f"GraphStore 初始化: format={matrix_format}")
+        logger.debug(f"图存储初始化: format={matrix_format}")
 
     def _canonicalize(self, node: str) -> str:
         """规范化节点名称 (用于去重和内部索引)"""
@@ -1176,11 +1190,14 @@ class GraphStore:
         data_dir.mkdir(parents=True, exist_ok=True)
 
         # 保存邻接矩阵
+        matrix_path = data_dir / "graph_adjacency.npz"
         if self._adjacency is not None:
-            matrix_path = data_dir / "graph_adjacency.npz"
             with atomic_write(matrix_path, "wb") as f:
                 save_npz(f, self._adjacency)
             logger.debug(f"保存邻接矩阵: {matrix_path}")
+        elif matrix_path.exists():
+            matrix_path.unlink()
+            logger.debug(f"删除陈旧邻接矩阵: {matrix_path}")
 
         # 保存元数据
         metadata = {
@@ -1274,14 +1291,34 @@ class GraphStore:
         if self._adjacency is not None:
              adj_n = self._adjacency.shape[0]
              current_n = len(self._nodes)
-             if current_n > adj_n:
+             if current_n == 0:
+                 logger.warning("检测到空图元数据但邻接矩阵仍然存在，已重置为空图。")
+                 self._adjacency = None
+                 self._edge_hash_map = defaultdict(set)
+             elif current_n > adj_n:
                  logger.warning(f"检测到图存储维度不匹配: 节点数={current_n}, 矩阵大小={adj_n}. 正在自动修复...")
                  self._expand_adjacency_matrix(current_n - adj_n)
+             elif current_n < adj_n:
+                 logger.warning(
+                     f"检测到过期邻接矩阵: 节点数={current_n}, 矩阵大小={adj_n}. 正在重置邻接矩阵..."
+                 )
+                 if self.matrix_format == "csc":
+                     self._adjacency = csc_matrix((current_n, current_n), dtype=np.float32)
+                 else:
+                     self._adjacency = csr_matrix((current_n, current_n), dtype=np.float32)
+                 self._edge_hash_map = defaultdict(
+                     set,
+                     {
+                         (src_idx, dst_idx): set(hashes)
+                         for (src_idx, dst_idx), hashes in self._edge_hash_map.items()
+                         if src_idx < current_n and dst_idx < current_n
+                     },
+                 )
 
         self._adjacency_dirty = True
         logger.info(
-            f"图存储已加载: {len(self._nodes)} 个节点, "
-            f"{self._adjacency.nnz if self._adjacency is not None else 0} 条边"
+            f"图存储已加载: 节点={len(self._nodes)}, "
+            f"边={self._adjacency.nnz if self._adjacency is not None else 0}"
         )
 
     def _expand_adjacency_matrix(self, added_nodes: int) -> None:
@@ -1431,4 +1468,3 @@ class GraphStore:
         self._adjacency_dirty = True
         logger.info(f"已从 {count} 条哈希重建边哈希映射，覆盖 {len(self._edge_hash_map)} 条边")
         return count
-
