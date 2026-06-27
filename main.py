@@ -39,6 +39,7 @@ from .memorix.services import (
     QueryService,
     SummaryService,
 )
+from .memorix.amemorix.services.feedback_service import FeedbackService
 from .memorix.tools import _format_search_result_for_llm, build_memorix_tools
 from .memorix.utils.message_formatting import (
     format_astrbot_event_message,
@@ -78,10 +79,16 @@ class MemorixPlugin(Star):
         self.profile_service = ProfileService(self.runtime_manager)
         self.summary_service = SummaryService(self.runtime_manager)
         self.person_fact_writeback_service = PersonFactWritebackService(self.runtime_manager, self.config)
-        self.admin_service = AdminService(self.runtime_manager)
+        self.feedback_service = FeedbackService(
+            self.runtime_manager,
+            self.config,
+            ingest_service=self.ingest_service,
+        )
+        self.admin_service = AdminService(self.runtime_manager, feedback_service=self.feedback_service)
         self.webui_page_bridge = PluginPageWebUIBridge(
             runtime_manager=self.runtime_manager,
             scope_resolver=self._resolve_dashboard_webui_scope,
+            admin_service=self.admin_service,
         )
 
     async def initialize(self):
@@ -90,6 +97,7 @@ class MemorixPlugin(Star):
         self._llm_tools = build_memorix_tools(self)
         self.context.add_llm_tools(*self._llm_tools)
         await self.person_fact_writeback_service.start()
+        await self.feedback_service.start_background_loops()
         logger.info("[memorix] initialize done")
 
     async def terminate(self):
@@ -97,9 +105,48 @@ class MemorixPlugin(Star):
         self._remove_llm_tools()
         await self.person_fact_writeback_service.close()
         await self.webui_page_bridge.close()
+        await self.feedback_service.stop_background_loops()
         await self.admin_service.close()
         await self.runtime_manager.close_all()
         logger.info("[memorix] terminate done")
+
+    async def feedback_service_enabled(self, scope_key: str) -> bool:
+        """该 scope 是否启用反馈纠错（读 integration.feedback_correction_enabled）。"""
+        try:
+            runtime = await self.runtime_manager.get_runtime(scope_key)
+            ctx = runtime.context
+            return bool(ctx.get_config("integration.feedback_correction_enabled", False))
+        except Exception:
+            return False
+
+    async def enqueue_feedback(
+        self,
+        *,
+        scope_key: str,
+        query: str,
+        chat_id: str,
+        group_id: str = "",
+        user_id: str = "",
+        hit_hashes: list | None = None,
+    ) -> dict:
+        """检索命中后入队反馈纠错任务（失败不影响检索结果）。"""
+        if self.feedback_service is None:
+            return {"success": False, "queued": False, "reason": "feedback_service_unavailable"}
+        query_tool_id = f"search:{time.time_ns()}"
+        structured_content = {
+            "query": str(query or ""),
+            "chat_id": str(chat_id or ""),
+            "group_id": str(group_id or ""),
+            "user_id": str(user_id or ""),
+            "hits": [{"hash": h, "type": "paragraph"} for h in (hit_hashes or []) if h],
+        }
+        return await self.feedback_service.enqueue_feedback(
+            scope_key=scope_key,
+            query_tool_id=query_tool_id,
+            session_id=str(chat_id or ""),
+            query_timestamp=time.time(),
+            structured_content=structured_content,
+        )
 
     def _remove_llm_tools(self) -> None:
         tool_manager = getattr(self.context, "get_llm_tool_manager", lambda: None)()
