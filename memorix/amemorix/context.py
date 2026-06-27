@@ -42,6 +42,7 @@ class AppContext:
     llm_client: LLMClient
     data_dir: Path
     config: Dict[str, Any]
+    provider_bridge: Optional[Any] = None
     _runtime_self_check_report: Optional[Dict[str, Any]] = None
     _runtime_auto_save: Optional[bool] = None
     _request_dedup_cache: Dict[str, Dict[str, Any]] = field(default_factory=dict)

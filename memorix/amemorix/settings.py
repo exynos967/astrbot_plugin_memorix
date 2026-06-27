@@ -237,6 +237,23 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "queue_maxsize": 1024,
         "summary_poll_interval_seconds": 1,
     },
+    "integration": {
+        "feedback_correction_enabled": False,
+        "feedback_correction_window_hours": 12.0,
+        "feedback_correction_check_interval_minutes": 30,
+        "feedback_correction_batch_size": 20,
+        "feedback_correction_auto_apply_threshold": 0.85,
+        "feedback_correction_max_feedback_messages": 30,
+        "feedback_correction_prefilter_enabled": True,
+        "feedback_correction_paragraph_mark_enabled": True,
+        "feedback_correction_paragraph_hard_filter_enabled": True,
+        "feedback_correction_profile_refresh_enabled": True,
+        "feedback_correction_profile_force_refresh_on_read": True,
+        "feedback_correction_episode_rebuild_enabled": True,
+        "feedback_correction_episode_query_block_enabled": True,
+        "feedback_correction_reconcile_interval_minutes": 5,
+        "feedback_correction_reconcile_batch_size": 20,
+    },
 }
 
 

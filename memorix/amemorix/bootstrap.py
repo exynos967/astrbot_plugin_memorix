@@ -289,7 +289,7 @@ def build_context(settings: AppSettings) -> AppContext:
         retriever=retriever,
     )
 
-    return AppContext(
+    ctx = AppContext(
         settings=settings,
         vector_store=vector_store,
         graph_store=graph_store,
@@ -307,3 +307,8 @@ def build_context(settings: AppSettings) -> AppContext:
         data_dir=data_dir,
         config=settings.config,
     )
+    # 本土化回填：segmentation_service 构造时 ctx 尚未成型，此处补齐引用，
+    # 使 segment() 经 generate_text -> resolve_llm_client 走到 provider_bridge；
+    # provider_bridge 由上层运行时注入到同一个 ctx，时机在回填之后亦无妨。
+    ctx.episode_service.segmentation_service._ctx = ctx
+    return ctx
