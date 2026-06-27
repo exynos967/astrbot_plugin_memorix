@@ -32,6 +32,16 @@ class DummyContext:
         return self._tool_manager
 
 
+class _FakeProviderRequest(SimpleNamespace):
+    async def assemble_context(self):
+        content = []
+        if self.prompt:
+            content.append({"type": "text", "text": self.prompt})
+        for part in self.extra_user_content_parts:
+            content.append(part.model_dump_for_context())
+        return {"role": "user", "content": content}
+
+
 class DummyPlugin:
     def _resolve_scope(self, event):
         del event
@@ -218,13 +228,20 @@ def test_llm_request_injects_profile_and_auto_memory():
         return True
 
     plugin._is_adapted_chat_enabled = _enabled
-    request = SimpleNamespace(prompt="我喜欢什么游戏？", system_prompt="原始系统提示", extra_user_content_parts=[])
+    request = _FakeProviderRequest(prompt="我喜欢什么游戏？", system_prompt="原始系统提示", extra_user_content_parts=[])
 
     asyncio.run(plugin.on_llm_request(_FakeEvent(), request))
 
     assert request.system_prompt == "原始系统提示"
+    assert request.prompt == "我喜欢什么游戏？"
     assert len(request.extra_user_content_parts) == 1
     injected_text = request.extra_user_content_parts[0].text
+    assert request.extra_user_content_parts[0].model_dump_for_context().get("_no_save") is True
+    assembled = asyncio.run(request.assemble_context())
+    # 真实 astrbot assemble_context 顺序：prompt 在前，extra_user_content_parts 在后。
+    assert assembled["content"][0] == {"type": "text", "text": "我喜欢什么游戏？"}
+    assert assembled["content"][1]["text"] == injected_text
+    assert assembled["content"][1].get("_no_save") is True
     assert MEMORY_INJECTION_MARKER in injected_text
     assert "【人物画像-内部参考】" in injected_text
     assert "小明喜欢深夜玩 RPG" in injected_text

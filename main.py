@@ -14,12 +14,17 @@ except Exception:  # pragma: no cover - only used by lightweight unit-test stubs
     class TextPart:  # type: ignore[no-redef]
         def __init__(self, text: str):
             self.text = text
+            self._no_save = False
 
         def mark_as_temp(self):
+            self._no_save = True
             return self
 
         def model_dump_for_context(self):
-            return {"type": "text", "text": self.text}
+            data = {"type": "text", "text": self.text}
+            if self._no_save:
+                data["_no_save"] = True
+            return data
 
 from .memorix.adapters.astrbot_event_adapter import AstrbotEventAdapter, MemorixEvent
 from .memorix.app_context import ScopeRuntimeManager
