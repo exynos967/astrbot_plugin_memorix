@@ -9,6 +9,7 @@ from .dual_path import (
     FusionConfig,
     RelationIntentConfig,
 )
+from .posterior_graph import PosteriorGraphConfig
 from .pagerank import (
     PersonalizedPageRank,
     PageRankConfig,
@@ -20,14 +21,16 @@ from .threshold import (
     ThresholdConfig,
 )
 from .sparse_bm25 import (
-    SparseBM25Index,
+    ExperimentalExternalInvertedIndexBackend,
     SparseBM25Config,
+    SparseBM25Index,
+    SparseSearchBackend,
+    SQLiteFTS5SparseBackend,
 )
 from .graph_relation_recall import (
     GraphRelationRecallConfig,
     GraphRelationRecallService,
 )
-from .posterior_graph import PosteriorGraphConfig
 
 __all__ = [
     # DualPathRetriever
@@ -38,6 +41,7 @@ __all__ = [
     "TemporalQueryOptions",
     "FusionConfig",
     "RelationIntentConfig",
+    "PosteriorGraphConfig",
     # PersonalizedPageRank
     "PersonalizedPageRank",
     "PageRankConfig",
@@ -49,8 +53,10 @@ __all__ = [
     # Sparse BM25
     "SparseBM25Index",
     "SparseBM25Config",
+    "SparseSearchBackend",
+    "SQLiteFTS5SparseBackend",
+    "ExperimentalExternalInvertedIndexBackend",
     # Graph relation recall
     "GraphRelationRecallConfig",
     "GraphRelationRecallService",
-    "PosteriorGraphConfig",
 ]
