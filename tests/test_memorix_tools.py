@@ -14,7 +14,7 @@ from astrbot_plugin_memorix.memorix.services.person_fact_writeback_service impor
     PersonFactWritebackItem,
     PersonFactWritebackService,
 )
-from astrbot_plugin_memorix.memorix.tools import _format_search_result_for_llm, build_memorix_tools
+from astrbot_plugin_memorix.memorix.tools import MemorixIngestTextTool, _format_search_result_for_llm, build_memorix_tools
 from astrbot_plugin_memorix.memorix.utils.profile_injection import build_profile_injection_text
 
 
@@ -751,6 +751,40 @@ def test_cron_llm_response_skips_person_fact_writeback():
     plugin._ingest_event_message = _ingest
 
     asyncio.run(plugin.on_llm_response(_CronEvent(), SimpleNamespace(completion_text="已完成")))
+
+
+def test_tool_sender_upsert_skips_cron_event():
+    class _CronMessageObj:
+        session_id = "799462158"
+        message_id = "cron-msg"
+        timestamp = 123
+        message = []
+
+    class _CronEvent:
+        unified_msg_origin = "aiocqhttp:GroupMessage:799462158"
+        message_obj = _CronMessageObj()
+        message_str = "定时任务结果"
+
+        def get_platform_name(self):
+            return "cron"
+
+        def get_sender_id(self):
+            return "799462158"
+
+        def get_sender_name(self):
+            return "Scheduler"
+
+        def get_group_id(self):
+            return ""
+
+    class _ProfileService:
+        async def upsert_registry_from_event(self, **_kwargs):
+            raise AssertionError("cron tool call should not upsert current sender")
+
+    plugin = SimpleNamespace(profile_service=_ProfileService())
+    tool = MemorixIngestTextTool(plugin=plugin)
+
+    asyncio.run(tool._upsert_current_sender(_CronEvent(), "aiocqhttp:group:799462158", respect_filter=False))
 
 
 def test_episode_and_aggregate_queries_respect_chat_filter():

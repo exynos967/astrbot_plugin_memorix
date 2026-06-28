@@ -163,6 +163,10 @@ class MemorixToolBase(FunctionTool[AstrAgentContext]):
     def _adapted(self, event: AstrMessageEvent, scope_key: str):
         return AstrbotEventAdapter.from_event(event, scope_key)
 
+    @staticmethod
+    def _is_cron_event(event: AstrMessageEvent) -> bool:
+        return str(getattr(event, "get_platform_name", lambda: "")() or "").strip() == "cron"
+
     def _source_for_event(self, event: AstrMessageEvent, scope_key: str) -> str:
         adapted = self._adapted(event, scope_key)
         return f"chat:{adapted.platform}:{adapted.session_id}"
@@ -204,6 +208,8 @@ class MemorixToolBase(FunctionTool[AstrAgentContext]):
         *,
         respect_filter: bool = True,
     ) -> None:
+        if self._is_cron_event(event):
+            return
         adapted = self._adapted(event, scope_key)
         if not adapted.sender_id:
             return
@@ -555,7 +561,7 @@ class MemorixPersonProfileTool(MemorixToolBase):
         adapted = self._adapted(event, scope_key)
         person_id = str(kwargs.get("person_id", "") or "").strip()
         keyword = str(kwargs.get("person_keyword", "") or "").strip()
-        if not person_id and not keyword and adapted.sender_id:
+        if not person_id and not keyword and adapted.sender_id and not self._is_cron_event(event):
             person_id = f"{adapted.platform}:{adapted.sender_id}"
             keyword = adapted.sender_name or adapted.sender_id
         limit = _to_int(kwargs.get("limit", 10), 10, min_value=1, max_value=50)
