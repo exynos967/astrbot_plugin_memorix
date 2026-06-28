@@ -171,7 +171,7 @@ data/plugin_data/astrbot_plugin_memorix/scopes/<scope_key>/
 
 > **破坏性更新提醒**
 >
-> 从 `main` 旧版升级到 feat2.0 / SCHEMA 15 时，旧版 `metadata.db` 为 `SCHEMA_VERSION=8`，新版本运行时不会直接打开 v8 库。请先停止插件，备份 `data/plugin_data/astrbot_plugin_memorix/`，并按下方步骤对每个 scope 手动执行离线迁移后再启动新版本。
+> 从 `main` 旧版升级到 feat2.0 / SCHEMA 15 时，旧版 `metadata.db` 为 `SCHEMA_VERSION=8`，新版本运行时不会直接打开 v8 库。请先停止插件，备份 `data/plugin_data/astrbot_plugin_memorix/`，并按下方步骤执行一次离线迁移脚本，自动扫描所有 scope 后再启动新版本。
 
 当前元数据 Schema 版本为 **SCHEMA 15**。相对前一版本，本次升级包含两项结构变更：
 
@@ -180,14 +180,13 @@ data/plugin_data/astrbot_plugin_memorix/scopes/<scope_key>/
 
 升级路径：
 
-- **从 `main` 旧版升级**：`main` 使用 `SCHEMA_VERSION=8`，feat2.0 运行时不会直接打开 v8 库。升级代码后、启动插件前，需要对每个 scope 的 `metadata.db` 执行离线迁移：
+- **从 `main` 旧版升级**：`main` 使用 `SCHEMA_VERSION=8`，feat2.0 运行时不会直接打开 v8 库。升级代码后、启动插件前，执行一次离线迁移脚本即可自动扫描所有 scope：
 
   ```bash
-  uv run python scripts/migrate_schema_v8_to_v13.py \
-    --db data/plugin_data/astrbot_plugin_memorix/scopes/<scope_key>/metadata/metadata.db
+  uv run python scripts/migrate_schema_v8_to_v13.py
   ```
 
-  脚本文件名保留历史兼容，实际目标版本取当前代码的 `SCHEMA_VERSION`（本版为 15）。脚本会先备份原库，迁移后旧段落/关系数据保留。
+  脚本默认查找 `data/plugin_data/astrbot_plugin_memorix/scopes/*/metadata/metadata.db`；如果数据目录不在默认位置，可加 `--plugin-data-dir /path/to/data/plugin_data/astrbot_plugin_memorix`。高级用户仍可用 `--db /path/to/metadata.db` 只迁移单个数据库。脚本文件名保留历史兼容，实际目标版本取当前代码的 `SCHEMA_VERSION`（本版为 15）。脚本会先备份原库，迁移后旧段落/关系数据保留。
 - **从已版本化的新库升级**：`schema_version >= 9 && < 15` 时，插件启动会自动迁移到 15。
 - **全新安装**：直接创建 SCHEMA 15 库。
 

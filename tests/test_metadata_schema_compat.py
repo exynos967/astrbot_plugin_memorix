@@ -1,4 +1,7 @@
 import sqlite3
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 from astrbot_plugin_memorix.memorix.core.storage.metadata_store import SCHEMA_VERSION, MetadataStore
@@ -493,6 +496,90 @@ def test_v8_legacy_db_migrates_to_current_schema(tmp_path):
         assert kept is not None and kept[0] == "legacy paragraph"
         kept_rel = after.execute("SELECT subject FROM relations WHERE hash='r1'").fetchone()
         assert kept_rel is not None and kept_rel[0] == "Alice"
+    finally:
+        after.close()
+
+
+def test_schema_migration_script_discovers_scope_dbs(tmp_path):
+    """不传 --db 时，脚本应自动扫描 plugin_data 下所有 scope metadata.db。"""
+
+    plugin_data_dir = tmp_path / "plugin_data" / "astrbot_plugin_memorix"
+    metadata_dir = plugin_data_dir / "scopes" / "scope_a" / "metadata"
+    metadata_dir.mkdir(parents=True)
+    (metadata_dir.parent / ".scope.json").write_text(
+        '{"scope_key": "aiocqhttp:group:123"}',
+        encoding="utf-8",
+    )
+    db_path = metadata_dir / "metadata.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at REAL NOT NULL);
+        INSERT INTO schema_migrations(version, applied_at) VALUES (8, 1.0);
+        CREATE TABLE paragraphs (
+            hash TEXT PRIMARY KEY,
+            content TEXT NOT NULL,
+            vector_index INTEGER,
+            created_at REAL,
+            updated_at REAL,
+            metadata TEXT,
+            source TEXT,
+            word_count INTEGER,
+            event_time REAL,
+            event_time_start REAL,
+            event_time_end REAL,
+            time_granularity TEXT,
+            time_confidence REAL DEFAULT 1.0,
+            knowledge_type TEXT DEFAULT 'mixed',
+            is_permanent BOOLEAN DEFAULT 0,
+            last_accessed REAL,
+            access_count INTEGER DEFAULT 0,
+            is_deleted INTEGER DEFAULT 0,
+            deleted_at REAL
+        );
+        CREATE TABLE relations (
+            hash TEXT PRIMARY KEY,
+            subject TEXT NOT NULL,
+            predicate TEXT NOT NULL,
+            object TEXT NOT NULL,
+            vector_index INTEGER,
+            confidence REAL DEFAULT 1.0,
+            created_at REAL,
+            source_paragraph TEXT,
+            metadata TEXT
+        );
+        INSERT INTO paragraphs(hash, content, created_at, updated_at, source, word_count)
+        VALUES ('p-script', 'script paragraph', 1.0, 1.0, 'source-script', 2);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "scripts" / "migrate_schema_v8_to_v13.py"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--plugin-data-dir",
+            str(plugin_data_dir),
+        ],
+        cwd=repo_root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert "发现 1 个 scope metadata.db" in result.stdout
+    assert "aiocqhttp:group:123" in result.stdout
+
+    after = sqlite3.connect(db_path)
+    try:
+        version_row = after.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
+        assert int(version_row[0] or 0) == SCHEMA_VERSION
+        kept = after.execute("SELECT content FROM paragraphs WHERE hash='p-script'").fetchone()
+        assert kept is not None and kept[0] == "script paragraph"
     finally:
         after.close()
 

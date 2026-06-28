@@ -15,6 +15,9 @@
 
 用法
 ----
+    uv run python scripts/migrate_schema_v8_to_v13.py
+    uv run python scripts/migrate_schema_v8_to_v13.py --dry-run
+    uv run python scripts/migrate_schema_v8_to_v13.py --plugin-data-dir /path/to/data/plugin_data/astrbot_plugin_memorix
     uv run python scripts/migrate_schema_v8_to_v13.py --db /path/to/metadata.db
     uv run python scripts/migrate_schema_v8_to_v13.py --db /path/to/metadata.db --dry-run
     uv run python scripts/migrate_schema_v8_to_v13.py --db /path/to/metadata.db --restore /path/to/metadata.db.v8.bak
@@ -25,12 +28,15 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import sqlite3
 import sys
 import time
 from pathlib import Path
 from typing import Any, Dict
+
+PLUGIN_NAME = "astrbot_plugin_memorix"
 
 
 def _resolve_metadata_store():
@@ -89,6 +95,65 @@ def _restore_db(db_path: Path, backup_path: Path) -> None:
     print(f"[完成] 已从备份恢复: {backup_path} -> {db_path}")
 
 
+def _scope_label(scope_dir: Path) -> str:
+    manifest = scope_dir / ".scope.json"
+    if manifest.exists():
+        try:
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            scope_key = str(payload.get("scope_key", "") or "").strip()
+            if scope_key:
+                return scope_key
+        except Exception:  # noqa: BLE001
+            pass
+    return scope_dir.name
+
+
+def _candidate_plugin_data_dirs(explicit: Path | None) -> list[Path]:
+    if explicit is not None:
+        return [explicit.expanduser()]
+
+    cwd = Path.cwd()
+    script_root = Path(__file__).resolve().parent.parent
+    candidates = [
+        cwd / "data" / "plugin_data" / PLUGIN_NAME,
+        script_root / "data" / "plugin_data" / PLUGIN_NAME,
+    ]
+
+    for base in (cwd, script_root):
+        for parent in (base, *base.parents):
+            if parent.name == "data":
+                candidates.append(parent / "plugin_data" / PLUGIN_NAME)
+            candidates.append(parent / "data" / "plugin_data" / PLUGIN_NAME)
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        resolved = candidate.expanduser().resolve()
+        token = str(resolved)
+        if token not in seen:
+            unique.append(resolved)
+            seen.add(token)
+    return unique
+
+
+def _discover_scope_dbs(plugin_data_dir: Path | None) -> list[tuple[str, Path]]:
+    discovered: list[tuple[str, Path]] = []
+    for candidate in _candidate_plugin_data_dirs(plugin_data_dir):
+        scopes_dir = candidate / "scopes"
+        if not scopes_dir.exists():
+            continue
+        for scope_dir in sorted(scopes_dir.iterdir(), key=lambda path: path.name):
+            if not scope_dir.is_dir():
+                continue
+            db_path = scope_dir / "metadata" / "metadata.db"
+            if db_path.exists():
+                discovered.append((_scope_label(scope_dir), db_path))
+        if discovered:
+            print(f"[信息] 自动发现 scope 数据目录: {candidate}")
+            break
+    return discovered
+
+
 def _migrate(db_path: Path, dry_run: bool) -> int:
     MetadataStore, schema_version = _resolve_metadata_store()
     current = _read_current_version(db_path)
@@ -135,20 +200,61 @@ def _migrate(db_path: Path, dry_run: bool) -> int:
     return 0 if after == schema_version else 3
 
 
+def _migrate_all(plugin_data_dir: Path | None, dry_run: bool) -> int:
+    scope_dbs = _discover_scope_dbs(plugin_data_dir)
+    if not scope_dbs:
+        searched = ", ".join(str(path) for path in _candidate_plugin_data_dirs(plugin_data_dir)[:5])
+        print(
+            "[信息] 未发现可迁移的 scope metadata.db，已跳过。"
+            f" 搜索路径示例: {searched}"
+        )
+        return 0
+
+    print(f"[信息] 发现 {len(scope_dbs)} 个 scope metadata.db，开始批量迁移。")
+    failures: list[tuple[str, Path, int]] = []
+    for index, (scope_key, db_path) in enumerate(scope_dbs, start=1):
+        print(f"[scope {index}/{len(scope_dbs)}] {scope_key}: {db_path}")
+        try:
+            code = _migrate(db_path, dry_run)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[错误] scope={scope_key} 迁移异常: {exc}", file=sys.stderr)
+            code = 3
+        if code != 0:
+            failures.append((scope_key, db_path, code))
+
+    if failures:
+        print(f"[错误] {len(failures)} 个 scope 迁移失败：", file=sys.stderr)
+        for scope_key, db_path, code in failures:
+            print(f"  - scope={scope_key} code={code} db={db_path}", file=sys.stderr)
+        return 3
+    print("[完成] 所有 scope metadata.db 均已处理。")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Memorix metadata.db schema 离线迁移 v8 -> 当前 SCHEMA_VERSION",
     )
-    parser.add_argument("--db", required=True, type=Path, help="metadata.db 文件路径")
+    parser.add_argument("--db", type=Path, help="metadata.db 文件路径；不填则自动扫描所有 scope")
+    parser.add_argument(
+        "--plugin-data-dir",
+        type=Path,
+        help="插件数据目录，默认自动查找 data/plugin_data/astrbot_plugin_memorix",
+    )
     parser.add_argument("--dry-run", action="store_true", help="仅打印将执行的步骤，不改动数据库")
-    parser.add_argument("--restore", type=Path, help="从指定备份恢复数据库")
+    parser.add_argument("--restore", type=Path, help="从指定备份恢复单个 --db 数据库")
     args = parser.parse_args()
 
     if args.restore is not None:
+        if args.db is None:
+            parser.error("--restore 必须配合 --db 使用")
         _restore_db(args.db, args.restore)
         return 0
 
-    return _migrate(args.db, args.dry_run)
+    if args.db is not None:
+        return _migrate(args.db, args.dry_run)
+
+    return _migrate_all(args.plugin_data_dir, args.dry_run)
 
 
 if __name__ == "__main__":
