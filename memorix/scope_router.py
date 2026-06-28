@@ -19,6 +19,13 @@ class ScopeRouter:
         group = self._safe_str(getattr(event, "get_group_id", lambda: "")())
         umo = self._safe_str(getattr(event, "unified_msg_origin", ""))
 
+        if platform == "cron":
+            parsed = self._parse_unified_msg_origin(umo)
+            if parsed is not None:
+                platform, message_type, session_id = parsed
+                sender = session_id or sender
+                group = session_id if message_type == "GroupMessage" else ""
+
         if mode == "umo":
             return self._sanitize(umo or f"{platform}:{sender}")
         if mode == "user_global":
@@ -45,3 +52,13 @@ class ScopeRouter:
         if text in {"", ".", ".."}:
             return "default"
         return text or "default"
+
+    @staticmethod
+    def _parse_unified_msg_origin(value: str) -> tuple[str, str, str] | None:
+        parts = str(value or "").split(":", 2)
+        if len(parts) != 3:
+            return None
+        platform, message_type, session_id = (part.strip() for part in parts)
+        if not platform or not message_type or not session_id:
+            return None
+        return platform, message_type, session_id
