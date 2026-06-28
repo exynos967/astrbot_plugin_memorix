@@ -1,0 +1,78 @@
+/* 设计 token：从 legacy vanilla index.html 提取，保持视觉一致。
+   light 为默认（:root），dark 覆盖关键变量。
+   effects（glass/lite）在 base.css 中按 html[data-effects] 切换背景层。 */
+:root {
+  color-scheme: light;
+  --page-bg: #eef6ff;
+  --page-bg-2: #f8fbff;
+  --ink: #0f172a;
+  --text: #102035;
+  --muted: #536579;
+  --muted-2: #7d8da0;
+  --hairline: rgba(107, 139, 176, 0.22);
+  --hairline-strong: rgba(59, 130, 246, 0.34);
+  --shell: rgba(255, 255, 255, 0.52);
+  --surface: rgba(255, 255, 255, 0.64);
+  --surface-strong: rgba(255, 255, 255, 0.82);
+  --surface-soft: rgba(248, 252, 255, 0.58);
+  --nav: rgba(255, 255, 255, 0.54);
+  --nav-soft: rgba(30, 64, 175, 0.1);
+  --glass-highlight: rgba(255, 255, 255, 0.88);
+  --accent: #2563eb;
+  --accent-strong: #1d4ed8;
+  --accent-ink: #0b2d63;
+  --accent-soft: rgba(37, 99, 235, 0.11);
+  --blue: #2563eb;
+  --blue-soft: rgba(37, 99, 235, 0.11);
+  --teal: #0891b2;
+  --teal-soft: rgba(8, 145, 178, 0.12);
+  --pink: #be5ac8;
+  --pink-soft: rgba(190, 90, 200, 0.12);
+  --amber: #b7791f;
+  --amber-soft: rgba(245, 158, 11, 0.16);
+  --red: #dc2626;
+  --red-soft: rgba(220, 38, 38, 0.12);
+  --green: #047857;
+  --green-soft: rgba(5, 150, 105, 0.12);
+  --shadow: 0 30px 80px rgba(31, 85, 149, 0.16);
+  --shadow-sm: 0 14px 36px rgba(31, 85, 149, 0.1);
+  --shadow-xs: 0 8px 20px rgba(31, 85, 149, 0.07);
+  --blur: blur(24px) saturate(150%);
+  --blur-soft: blur(16px) saturate(140%);
+  --radius-xl: 28px;
+  --radius-lg: 20px;
+  --radius-md: 14px;
+  --control-h: 44px;
+}
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --page-bg: #07111f;
+  --page-bg-2: #101827;
+  --ink: #f6f9ff;
+  --text: #dbe7f7;
+  --muted: #94a8bf;
+  --muted-2: #71839a;
+  --hairline: rgba(148, 163, 184, 0.24);
+  --hairline-strong: rgba(96, 165, 250, 0.42);
+  --shell: rgba(8, 17, 31, 0.7);
+  --surface: rgba(15, 23, 42, 0.66);
+  --surface-strong: rgba(30, 41, 59, 0.78);
+  --surface-soft: rgba(15, 23, 42, 0.58);
+  --nav: rgba(15, 23, 42, 0.66);
+  --nav-soft: rgba(96, 165, 250, 0.12);
+  --glass-highlight: rgba(148, 163, 184, 0.34);
+  --accent: #60a5fa;
+  --accent-strong: #93c5fd;
+  --accent-ink: #dbeafe;
+  --accent-soft: rgba(96, 165, 250, 0.16);
+  --blue-soft: rgba(96, 165, 250, 0.16);
+  --teal-soft: rgba(45, 212, 191, 0.14);
+  --pink-soft: rgba(216, 180, 254, 0.14);
+  --amber-soft: rgba(245, 158, 11, 0.18);
+  --red-soft: rgba(248, 113, 113, 0.16);
+  --green-soft: rgba(52, 211, 153, 0.16);
+  --shadow: 0 30px 80px rgba(0, 0, 0, 0.42);
+  --shadow-sm: 0 14px 36px rgba(0, 0, 0, 0.32);
+  --shadow-xs: 0 10px 26px rgba(0, 0, 0, 0.24);
+}
