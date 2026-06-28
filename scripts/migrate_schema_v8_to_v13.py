@@ -15,12 +15,12 @@
 
 用法
 ----
-    uv run python scripts/migrate_schema_v8_to_v13.py
-    uv run python scripts/migrate_schema_v8_to_v13.py --dry-run
-    uv run python scripts/migrate_schema_v8_to_v13.py --plugin-data-dir /path/to/data/plugin_data/astrbot_plugin_memorix
-    uv run python scripts/migrate_schema_v8_to_v13.py --db /path/to/metadata.db
-    uv run python scripts/migrate_schema_v8_to_v13.py --db /path/to/metadata.db --dry-run
-    uv run python scripts/migrate_schema_v8_to_v13.py --db /path/to/metadata.db --restore /path/to/metadata.db.v8.bak
+    uv run --no-project python scripts/migrate_schema_v8_to_v13.py
+    uv run --no-project python scripts/migrate_schema_v8_to_v13.py --dry-run
+    uv run --no-project python scripts/migrate_schema_v8_to_v13.py --plugin-data-dir /path/to/data/plugin_data/astrbot_plugin_memorix
+    uv run --no-project python scripts/migrate_schema_v8_to_v13.py --db /path/to/metadata.db
+    uv run --no-project python scripts/migrate_schema_v8_to_v13.py --db /path/to/metadata.db --dry-run
+    uv run --no-project python scripts/migrate_schema_v8_to_v13.py --db /path/to/metadata.db --restore /path/to/metadata.db.v8.bak
 
 注意：本脚本需在插件代码已升级到目标版本后运行，目标版本取当前 ``SCHEMA_VERSION``。
 """

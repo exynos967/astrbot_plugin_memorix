@@ -22,10 +22,10 @@ memorix vendored core 升级支持双池向量检索后，运行时默认仍以 
 
 用法
 ----
-    uv run python scripts/migrate_vectors_to_dual_pools.py --data-dir /path/to/scope
-    uv run python scripts/migrate_vectors_to_dual_pools.py --data-dir /path/to/scope --dry-run
-    uv run python scripts/migrate_vectors_to_dual_pools.py --data-dir /path/to/scope --force
-    uv run python scripts/migrate_vectors_to_dual_pools.py --data-dir /path/to/scope --batch-size 2048
+    uv run --no-project python scripts/migrate_vectors_to_dual_pools.py --data-dir /path/to/scope
+    uv run --no-project python scripts/migrate_vectors_to_dual_pools.py --data-dir /path/to/scope --dry-run
+    uv run --no-project python scripts/migrate_vectors_to_dual_pools.py --data-dir /path/to/scope --force
+    uv run --no-project python scripts/migrate_vectors_to_dual_pools.py --data-dir /path/to/scope --batch-size 2048
 """
 
 from __future__ import annotations

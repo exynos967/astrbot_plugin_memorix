@@ -11,7 +11,7 @@
 - 升级代码后、首次启动新版本前，必须执行一次离线迁移脚本；脚本会自动扫描并迁移所有 scope 的 `metadata.db`：
 
   ```bash
-  uv run python scripts/migrate_schema_v8_to_v13.py
+  uv run --no-project python scripts/migrate_schema_v8_to_v13.py
   ```
 
 - 如 AstrBot 数据目录不在默认位置，可使用 `--plugin-data-dir /path/to/data/plugin_data/astrbot_plugin_memorix`；高级用户仍可使用 `--db /path/to/metadata.db` 只迁移单个数据库。
