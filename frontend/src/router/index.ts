@@ -2,6 +2,7 @@ import { createRouter, createWebHashHistory } from "vue-router";
 import type { RouteRecordRaw } from "vue-router";
 import LogsView from "@/views/LogsView.vue";
 import DashboardView from "@/views/DashboardView.vue";
+import SettingsView from "@/views/SettingsView.vue";
 
 // 导航项配置：router 与 Sidebar 共用，避免双写（DRY）。
 // title/subtitle 从 legacy titles 字典（index.html 行 2538-2549）原样迁移。
@@ -30,6 +31,7 @@ export const NAV_ITEMS: NavItem[] = [
 // 已实现 view 映射；未在此映射的 route 指向 PlaceholderView（待对应阶段填充）。
 const REAL_VIEWS: Record<string, () => Promise<unknown>> = {
   dashboard: () => Promise.resolve({ default: DashboardView }),
+  settings: () => Promise.resolve({ default: SettingsView }),
   logs: () => Promise.resolve({ default: LogsView }),
 };
 

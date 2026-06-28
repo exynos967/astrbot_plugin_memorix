@@ -88,6 +88,33 @@ export interface ConfigPayload {
   config?: Record<string, unknown>;
 }
 
+/** PATCH /api/config/runtime 请求体（updates 为点分键→值）。 */
+export interface RuntimeConfigPatch {
+  updates: Record<string, unknown>;
+  persist: boolean;
+}
+
+/** PATCH /api/config/runtime 返回结构。persisted 恒为 false（WebUI 仅运行时更新）。 */
+export interface RuntimeConfigResult {
+  success: boolean;
+  persisted: boolean;
+  persist_message: string;
+  auto_save_enabled: boolean;
+  auto_save_interval: number;
+  config?: Record<string, unknown>;
+}
+
+/** POST /api/config/auto_save 请求体。 */
+export interface AutoSaveConfig {
+  enabled: boolean;
+}
+
+/** POST /api/save 返回结构（手动保存各 store 到磁盘）。 */
+export interface ManualSaveResult {
+  success: boolean;
+  saved: string[];
+}
+
 /** 已知 scope 列表（bridge 层，与 _scope 无关）。 */
 export function fetchScopes(): Promise<ScopesPayload> {
   return api.get<ScopesPayload>("/api/scopes");
@@ -114,4 +141,19 @@ export function fetchRuntimeSelfCheck(force: boolean): Promise<RuntimeReport> {
 /** 脱敏只读配置（用于 dashboard autosave 指示；表单渲染在 P3）。 */
 export function fetchConfig(): Promise<ConfigPayload> {
   return api.get<ConfigPayload>("/api/config");
+}
+
+/** 保存运行时配置（persist=true 时尝试写文件，但 WebUI 恒返回 persisted=false）。 */
+export function patchRuntimeConfig(patch: RuntimeConfigPatch): Promise<RuntimeConfigResult> {
+  return api.patch<RuntimeConfigResult>("/api/config/runtime", patch);
+}
+
+/** 开关自动保存。返回新的 autosave 状态。 */
+export function setAutoSave(enabled: boolean): Promise<AutoSaveConfig & ConfigPayload> {
+  return api.post<AutoSaveConfig & ConfigPayload>("/api/config/auto_save", { enabled });
+}
+
+/** 手动保存所有数据到磁盘（graph_store / vector_store）。 */
+export function manualSave(): Promise<ManualSaveResult> {
+  return api.post<ManualSaveResult>("/api/save", {});
 }

@@ -5,7 +5,7 @@
 const memoryFallback = new Map<string, string>();
 
 /** 当前是否可安全使用真实 localStorage（每次调用重试，不缓存"不可用"结论）。 */
-function realStorageAvailable(): boolean {
+export function realStorageAvailable(): boolean {
   try {
     const probe = "__memorix_storage_probe__";
     window.localStorage.setItem(probe, "1");

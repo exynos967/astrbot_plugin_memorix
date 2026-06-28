@@ -568,3 +568,103 @@ html[data-theme="dark"] .textarea::placeholder {
 .mono {
   font-family: Consolas, "SFMono-Regular", ui-monospace, monospace;
 }
+
+/* Settings 专用（从 legacy 行 820-861, 1290-1321, 1726-1739 迁移）。 */
+
+.settings-groups {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  max-height: min(48vh, 520px);
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.settings-group {
+  min-width: 0;
+  padding: 13px;
+  border: 1px solid var(--hairline);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.54);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.62);
+}
+
+html[data-theme="dark"] .settings-group {
+  border-color: var(--hairline);
+  background: linear-gradient(145deg, rgba(30, 41, 59, 0.74), rgba(15, 23, 42, 0.54));
+}
+
+.settings-group h3 {
+  margin: 0 0 10px;
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.settings-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.settings-fields .field label {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.settings-note {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.advanced-panel {
+  margin-top: 12px;
+  border-top: 1px solid rgba(107, 139, 176, 0.18);
+  padding-top: 10px;
+}
+
+.advanced-panel summary {
+  width: max-content;
+  max-width: 100%;
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 720;
+  list-style: none;
+}
+
+.advanced-panel summary::-webkit-details-marker {
+  display: none;
+}
+
+.advanced-panel summary::after {
+  content: " +";
+  color: var(--accent-strong);
+}
+
+.advanced-panel[open] summary::after {
+  content: " -";
+}
+
+.json {
+  max-height: 300px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  padding: 12px;
+  border: 1px solid rgba(107, 139, 176, 0.24);
+  border-radius: 16px;
+  color: #29415d;
+  background: rgba(248, 252, 255, 0.66);
+  font-size: 12px;
+  line-height: 1.55;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.62);
+}
+
+html[data-theme="dark"] .json {
+  color: var(--text);
+  border-color: var(--hairline);
+  background: rgba(15, 23, 42, 0.66);
+}
