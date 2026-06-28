@@ -37,11 +37,15 @@ class RelationWriteService:
         graph_store: Any,
         vector_store: Any,
         embedding_manager: Any,
+        graph_vector_store: Any = None,
+        use_typed_relation_ids: bool = False,
     ):
         self.metadata_store = metadata_store
         self.graph_store = graph_store
         self.vector_store = vector_store
+        self.graph_vector_store = graph_vector_store or vector_store
         self.embedding_manager = embedding_manager
+        self.use_typed_relation_ids = bool(use_typed_relation_ids)
 
     @staticmethod
     def build_relation_vector_text(subject: str, predicate: str, obj: str) -> str:
@@ -51,6 +55,10 @@ class RelationWriteService:
         # 双表达：兼容关键词检索与自然语言问句
         return f"{s} {p} {o}\n{s}和{o}的关系是{p}"
 
+    @staticmethod
+    def relation_vector_id(hash_value: str) -> str:
+        return f"relation:{str(hash_value or '').strip()}"
+
     async def ensure_relation_vector(
         self,
         hash_value: str,
@@ -59,11 +67,14 @@ class RelationWriteService:
         obj: str,
         *,
         max_error_len: int = ERROR_MAX_LEN,
+        typed_id: bool = False,
     ) -> RelationWriteResult:
         """
         为已有关系确保向量存在并更新状态。
         """
-        if hash_value in self.vector_store:
+        vector_id = self.relation_vector_id(hash_value) if typed_id else str(hash_value or "").strip()
+        target_store = self.graph_vector_store if typed_id else self.vector_store
+        if vector_id in target_store:
             self.metadata_store.set_relation_vector_state(hash_value, "ready")
             return RelationWriteResult(
                 hash_value=hash_value,
@@ -76,9 +87,9 @@ class RelationWriteService:
         try:
             vector_text = self.build_relation_vector_text(subject, predicate, obj)
             embedding = await self.embedding_manager.encode(vector_text)
-            self.vector_store.add(
+            target_store.add(
                 vectors=embedding.reshape(1, -1),
-                ids=[hash_value],
+                ids=[vector_id],
             )
             self.metadata_store.set_relation_vector_state(hash_value, "ready")
             logger.info(
@@ -163,4 +174,5 @@ class RelationWriteService:
             subject=subject,
             predicate=predicate,
             obj=obj,
+            typed_id=self.use_typed_relation_ids,
         )

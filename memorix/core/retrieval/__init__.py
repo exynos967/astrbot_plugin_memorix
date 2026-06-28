@@ -8,6 +8,7 @@ from .dual_path import (
     TemporalQueryOptions,
     FusionConfig,
     RelationIntentConfig,
+    VectorPoolsConfig,
 )
 from .posterior_graph import PosteriorGraphConfig
 from .pagerank import (
@@ -41,6 +42,7 @@ __all__ = [
     "TemporalQueryOptions",
     "FusionConfig",
     "RelationIntentConfig",
+    "VectorPoolsConfig",
     "PosteriorGraphConfig",
     # PersonalizedPageRank
     "PersonalizedPageRank",

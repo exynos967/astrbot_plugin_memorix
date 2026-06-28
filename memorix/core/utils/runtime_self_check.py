@@ -47,6 +47,7 @@ def _build_report(
     encoded_dimension: int,
     elapsed_ms: float,
     sample_text: str,
+    vector_pools: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     return {
         "ok": bool(ok),
@@ -59,7 +60,54 @@ def _build_report(
         "encoded_dimension": int(encoded_dimension),
         "elapsed_ms": float(elapsed_ms),
         "sample_text": str(sample_text or ""),
+        "vector_pools": vector_pools or {},
         "checked_at": time.time(),
+    }
+
+
+def _store_snapshot(store: Optional[Any]) -> Dict[str, Any]:
+    if store is None:
+        return {
+            "available": False,
+            "dimension": 0,
+            "num_vectors": 0,
+            "has_data": False,
+        }
+    num_vectors = _safe_int(getattr(store, "num_vectors", getattr(store, "size", 0)), 0)
+    has_data = False
+    checker = getattr(store, "has_data", None)
+    if callable(checker):
+        try:
+            has_data = bool(checker())
+        except Exception:
+            has_data = False
+    else:
+        has_data = num_vectors > 0
+    return {
+        "available": True,
+        "dimension": _safe_int(getattr(store, "dimension", 0), 0),
+        "num_vectors": num_vectors,
+        "has_data": bool(has_data),
+    }
+
+
+def _build_vector_pools_snapshot(
+    *,
+    config: Any,
+    vector_store: Optional[Any],
+    paragraph_vector_store: Optional[Any],
+    graph_vector_store: Optional[Any],
+) -> Dict[str, Any]:
+    configured = str(_get_config_value(config, "retrieval.vector_pools.mode", "dual") or "dual").strip().lower()
+    runtime_ready = bool(_get_config_value(config, "runtime.vector_pools_ready", False))
+    effective = "dual" if configured == "dual" and runtime_ready else "single"
+    return {
+        "configured_mode": configured if configured in {"single", "dual"} else "single",
+        "effective_mode": effective,
+        "ready": runtime_ready,
+        "single_pool": _store_snapshot(vector_store),
+        "paragraph_pool": _store_snapshot(paragraph_vector_store),
+        "graph_pool": _store_snapshot(graph_vector_store),
     }
 
 
@@ -103,12 +151,20 @@ async def run_embedding_runtime_self_check(
     config: Any,
     vector_store: Optional[Any],
     embedding_manager: Optional[Any],
+    paragraph_vector_store: Optional[Any] = None,
+    graph_vector_store: Optional[Any] = None,
     sample_text: str = _DEFAULT_SAMPLE_TEXT,
 ) -> Dict[str, Any]:
     """Probe the real embedding path and compare dimensions with runtime storage."""
     configured_dimension = _safe_int(_get_config_value(config, "embedding.dimension", 0), 0)
     vector_store_dimension = _safe_int(getattr(vector_store, "dimension", 0), 0)
     requested_dimension = _get_requested_dimension(embedding_manager, configured_dimension)
+    vector_pools = _build_vector_pools_snapshot(
+        config=config,
+        vector_store=vector_store,
+        paragraph_vector_store=paragraph_vector_store,
+        graph_vector_store=graph_vector_store,
+    )
 
     if vector_store is None or embedding_manager is None:
         return _build_report(
@@ -122,6 +178,7 @@ async def run_embedding_runtime_self_check(
             encoded_dimension=0,
             elapsed_ms=0.0,
             sample_text=sample_text,
+            vector_pools=vector_pools,
         )
 
     start = time.perf_counter()
@@ -147,6 +204,7 @@ async def run_embedding_runtime_self_check(
             encoded_dimension=encoded_dimension,
             elapsed_ms=elapsed_ms,
             sample_text=sample_text,
+            vector_pools=vector_pools,
         )
 
     elapsed_ms = (time.perf_counter() - start) * 1000.0
@@ -163,6 +221,7 @@ async def run_embedding_runtime_self_check(
             encoded_dimension=encoded_dimension,
             elapsed_ms=elapsed_ms,
             sample_text=sample_text,
+            vector_pools=vector_pools,
         )
 
     if encoded_dimension != expected_dimension:
@@ -182,6 +241,7 @@ async def run_embedding_runtime_self_check(
             encoded_dimension=encoded_dimension,
             elapsed_ms=elapsed_ms,
             sample_text=sample_text,
+            vector_pools=vector_pools,
         )
 
     return _build_report(
@@ -195,6 +255,7 @@ async def run_embedding_runtime_self_check(
         encoded_dimension=encoded_dimension,
         elapsed_ms=elapsed_ms,
         sample_text=sample_text,
+        vector_pools=vector_pools,
     )
 
 
@@ -217,6 +278,7 @@ async def ensure_runtime_self_check(
             encoded_dimension=0,
             elapsed_ms=0.0,
             sample_text=sample_text,
+            vector_pools={},
         )
 
     cache = getattr(plugin_or_config, "_runtime_self_check_report", None)
@@ -231,10 +293,16 @@ async def ensure_runtime_self_check(
         embedding_manager=getattr(plugin_or_config, "embedding_manager", None)
         if not isinstance(plugin_or_config, dict)
         else plugin_or_config.get("embedding_manager"),
+        paragraph_vector_store=getattr(plugin_or_config, "paragraph_vector_store", None)
+        if not isinstance(plugin_or_config, dict)
+        else plugin_or_config.get("paragraph_vector_store"),
+        graph_vector_store=getattr(plugin_or_config, "graph_vector_store", None)
+        if not isinstance(plugin_or_config, dict)
+        else plugin_or_config.get("graph_vector_store"),
         sample_text=sample_text,
     )
     try:
-        setattr(plugin_or_config, "_runtime_self_check_report", report)
+        plugin_or_config._runtime_self_check_report = report
     except Exception:
         pass
     return report

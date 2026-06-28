@@ -108,6 +108,7 @@ class DualPathRetrieverConfig:
     sparse: SparseBM25Config = field(default_factory=SparseBM25Config)
     fusion: "FusionConfig" = field(default_factory=lambda: FusionConfig())
     relation_intent: "RelationIntentConfig" = field(default_factory=lambda: RelationIntentConfig())
+    vector_pools: "VectorPoolsConfig" = field(default_factory=lambda: VectorPoolsConfig())
     graph_recall: GraphRelationRecallConfig = field(default_factory=GraphRelationRecallConfig)
     posterior_graph: PosteriorGraphConfig = field(default_factory=PosteriorGraphConfig)
 
@@ -119,6 +120,8 @@ class DualPathRetrieverConfig:
             self.fusion = FusionConfig(**self.fusion)
         if isinstance(self.relation_intent, dict):
             self.relation_intent = RelationIntentConfig(**self.relation_intent)
+        if isinstance(self.vector_pools, dict):
+            self.vector_pools = VectorPoolsConfig(**self.vector_pools)
         if isinstance(self.graph_recall, dict):
             self.graph_recall = GraphRelationRecallConfig(**self.graph_recall)
         if isinstance(self.posterior_graph, dict):
@@ -178,6 +181,65 @@ class RelationIntentConfig:
 
 
 @dataclass
+class VectorPoolsConfig:
+    """双向量池检索配置。"""
+
+    mode: str = "dual"
+    paragraph_top_k: int = 20
+    graph_top_k: int = 40
+    graph_expand_paragraph_k: int = 80
+    relation_expand_per_hit: int = 5
+    entity_expand_per_hit: int = 8
+    relation_evidence_weight: float = 1.0
+    entity_evidence_weight: float = 0.55
+    semantic_weight: float = 0.65
+    sparse_weight: float = 0.20
+    graph_weight: float = 0.15
+    relation_intent_graph_top_k: int = 80
+    relation_intent_semantic_weight: float = 0.45
+    relation_intent_sparse_weight: float = 0.15
+    relation_intent_graph_weight: float = 0.40
+    return_relation_items: bool = False
+    relation_intent: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self):
+        self.mode = str(self.mode or "single").strip().lower()
+        if self.mode not in {"single", "dual"}:
+            self.mode = "single"
+        self.paragraph_top_k = max(1, int(self.paragraph_top_k))
+        self.graph_top_k = max(1, int(self.graph_top_k))
+        self.graph_expand_paragraph_k = max(1, int(self.graph_expand_paragraph_k))
+        self.relation_expand_per_hit = max(1, int(self.relation_expand_per_hit))
+        self.entity_expand_per_hit = max(1, int(self.entity_expand_per_hit))
+        self.relation_evidence_weight = max(0.0, float(self.relation_evidence_weight))
+        self.entity_evidence_weight = max(0.0, float(self.entity_evidence_weight))
+        self.semantic_weight = max(0.0, float(self.semantic_weight))
+        self.sparse_weight = max(0.0, float(self.sparse_weight))
+        self.graph_weight = max(0.0, float(self.graph_weight))
+
+        relation_intent = self.relation_intent if isinstance(self.relation_intent, dict) else {}
+        self.relation_intent_graph_top_k = max(
+            1,
+            int(relation_intent.get("graph_top_k", self.relation_intent_graph_top_k)),
+        )
+        self.relation_intent_semantic_weight = max(
+            0.0,
+            float(relation_intent.get("semantic_weight", self.relation_intent_semantic_weight)),
+        )
+        self.relation_intent_sparse_weight = max(
+            0.0,
+            float(relation_intent.get("sparse_weight", self.relation_intent_sparse_weight)),
+        )
+        self.relation_intent_graph_weight = max(
+            0.0,
+            float(relation_intent.get("graph_weight", self.relation_intent_graph_weight)),
+        )
+        self.return_relation_items = bool(
+            relation_intent.get("return_relation_items", self.return_relation_items)
+        )
+
+
+@dataclass
 class FusionConfig:
     """融合配置。"""
 
@@ -229,6 +291,8 @@ class DualPathRetriever:
         embedding_manager: EmbeddingAPIAdapter,
         sparse_index: Optional[SparseBM25Index] = None,
         config: Optional[DualPathRetrieverConfig] = None,
+        paragraph_vector_store: Optional[VectorStore] = None,
+        graph_vector_store: Optional[VectorStore] = None,
     ):
         """
         初始化双路检索器
@@ -241,6 +305,8 @@ class DualPathRetriever:
             config: 检索配置
         """
         self.vector_store = vector_store
+        self.paragraph_vector_store = paragraph_vector_store or vector_store
+        self.graph_vector_store = graph_vector_store or vector_store
         self.graph_store = graph_store
         self.metadata_store = metadata_store
         self.embedding_manager = embedding_manager
@@ -1074,6 +1140,14 @@ class DualPathRetriever:
         Returns:
             融合后的检索结果列表
         """
+        if self.config.vector_pools.mode == "dual" and not self._is_sparse_only_runtime():
+            return await self._retrieve_dual_vector_pools(
+                query=query,
+                top_k=top_k,
+                temporal=temporal,
+                relation_intent=relation_intent,
+            )
+
         query_emb = None
         embedding_ok = False
         relation_intent = relation_intent or {}
@@ -1342,6 +1416,435 @@ class DualPathRetriever:
 
         results = list(merged.values())
         results.sort(key=lambda item: item.score, reverse=True)
+        return results[:top_k]
+
+    @staticmethod
+    def _graph_vector_id(item_type: str, hash_value: str) -> str:
+        return f"{str(item_type or '').strip()}:{str(hash_value or '').strip()}"
+
+    @staticmethod
+    def _parse_graph_vector_id(value: str) -> Tuple[str, str]:
+        token = str(value or "").strip()
+        if ":" not in token:
+            return "", token
+        item_type, hash_value = token.split(":", 1)
+        return item_type.strip().lower(), hash_value.strip()
+
+    def _dual_pool_weights(self, relation_intent: Dict[str, Any]) -> Tuple[float, float, float, int]:
+        cfg = self.config.vector_pools
+        if bool(relation_intent.get("enabled", False)):
+            return (
+                float(cfg.relation_intent_semantic_weight),
+                float(cfg.relation_intent_sparse_weight),
+                float(cfg.relation_intent_graph_weight),
+                int(cfg.relation_intent_graph_top_k),
+            )
+        return (
+            float(cfg.semantic_weight),
+            float(cfg.sparse_weight),
+            float(cfg.graph_weight),
+            int(cfg.graph_top_k),
+        )
+
+    def _ensure_paragraph_candidate(
+        self,
+        candidates: Dict[str, RetrievalResult],
+        paragraph: Dict[str, Any],
+        *,
+        temporal: Optional[TemporalQueryOptions] = None,
+    ) -> RetrievalResult:
+        paragraph_hash = str(paragraph.get("hash", "") or "").strip()
+        item = candidates.get(paragraph_hash)
+        if item is None:
+            metadata = {
+                "word_count": paragraph.get("word_count", 0),
+                "score_breakdown": {},
+                "evidence_items": [],
+            }
+            if temporal:
+                metadata["time_meta"] = self._build_time_meta_from_paragraph(paragraph, temporal=temporal)
+            item = RetrievalResult(
+                hash_value=paragraph_hash,
+                content=str(paragraph.get("content", "") or ""),
+                score=0.0,
+                result_type="paragraph",
+                source="dual_vector_pool",
+                metadata=metadata,
+            )
+            candidates[paragraph_hash] = item
+        return item
+
+    @staticmethod
+    def _candidate_score_meta(candidate: RetrievalResult) -> Dict[str, Any]:
+        metadata = candidate.metadata if isinstance(candidate.metadata, dict) else None
+        if metadata is None:
+            metadata = {}
+            candidate.metadata = metadata
+        score_meta = metadata.get("score_breakdown")
+        if not isinstance(score_meta, dict):
+            score_meta = {}
+            metadata["score_breakdown"] = score_meta
+        return score_meta
+
+    @staticmethod
+    def _candidate_evidence_items(candidate: RetrievalResult) -> List[Dict[str, Any]]:
+        metadata = candidate.metadata if isinstance(candidate.metadata, dict) else None
+        if metadata is None:
+            metadata = {}
+            candidate.metadata = metadata
+        evidence_items = metadata.get("evidence_items")
+        if not isinstance(evidence_items, list):
+            evidence_items = []
+            metadata["evidence_items"] = evidence_items
+        return evidence_items
+
+    @staticmethod
+    def _mark_candidate_source(candidate: RetrievalResult, source: str) -> None:
+        metadata = candidate.metadata if isinstance(candidate.metadata, dict) else {}
+        sources = metadata.get("dual_pool_sources")
+        if not isinstance(sources, list):
+            sources = []
+        if source not in sources:
+            sources.append(source)
+        metadata["dual_pool_sources"] = sources
+        candidate.metadata = metadata
+
+    def _add_candidate_score(
+        self,
+        candidates: Dict[str, RetrievalResult],
+        paragraph: Dict[str, Any],
+        *,
+        score_key: str,
+        score: float,
+        source: str,
+        temporal: Optional[TemporalQueryOptions],
+    ) -> RetrievalResult:
+        item = self._ensure_paragraph_candidate(candidates, paragraph, temporal=temporal)
+        metadata = item.metadata if isinstance(item.metadata, dict) else {}
+        if temporal:
+            metadata["time_meta"] = self._build_time_meta_from_paragraph(paragraph, temporal=temporal)
+        score_meta = self._candidate_score_meta(item)
+        old_score = float(score_meta.get(score_key, 0.0) or 0.0)
+        score_meta[score_key] = max(old_score, float(score))
+        item.metadata = metadata
+        self._mark_candidate_source(item, source)
+        return item
+
+    def _append_graph_evidence(
+        self,
+        candidate: RetrievalResult,
+        *,
+        evidence: Dict[str, Any],
+        score: float,
+    ) -> None:
+        evidence_items = self._candidate_evidence_items(candidate)
+        evidence_payload = dict(evidence)
+        evidence_payload["score"] = float(score)
+        evidence_key = (
+            str(evidence_payload.get("type", "") or ""),
+            str(evidence_payload.get("hash", "") or ""),
+        )
+        for old in evidence_items:
+            old_key = (
+                str(old.get("type", "") or ""),
+                str(old.get("hash", "") or ""),
+            )
+            if old_key == evidence_key:
+                if float(score) > float(old.get("score", 0.0) or 0.0):
+                    old.update(evidence_payload)
+                return
+        evidence_items.append(evidence_payload)
+
+    def _aggregate_graph_evidence_score(self, candidate: RetrievalResult) -> float:
+        evidence_items = self._candidate_evidence_items(candidate)
+        relation_scores = sorted(
+            [
+                float(item.get("score", 0.0) or 0.0)
+                for item in evidence_items
+                if str(item.get("type", "") or "") == "relation"
+            ],
+            reverse=True,
+        )
+        entity_scores = sorted(
+            [
+                float(item.get("score", 0.0) or 0.0)
+                for item in evidence_items
+                if str(item.get("type", "") or "") == "entity"
+            ],
+            reverse=True,
+        )
+        graph_score = 0.0
+        if relation_scores:
+            graph_score += relation_scores[0]
+            graph_score += 0.35 * sum(relation_scores[1:])
+        graph_score += 0.20 * sum(entity_scores)
+        return min(1.0, graph_score)
+
+    @staticmethod
+    def _normalize_graph_scores_by_type(
+        parsed_items: List[Tuple[str, str, float]],
+    ) -> List[Tuple[str, str, float, float]]:
+        scores_by_type: Dict[str, List[float]] = {}
+        for item_type, _hash_value, raw_score in parsed_items:
+            scores_by_type.setdefault(item_type, []).append(float(raw_score))
+
+        bounds_by_type = {
+            item_type: (min(scores), max(scores))
+            for item_type, scores in scores_by_type.items()
+            if scores
+        }
+        normalized_items: List[Tuple[str, str, float, float]] = []
+        for item_type, hash_value, raw_score in parsed_items:
+            min_score, max_score = bounds_by_type.get(item_type, (0.0, 0.0))
+            if max_score > min_score:
+                normalized_score = (float(raw_score) - min_score) / (max_score - min_score)
+            else:
+                normalized_score = max(0.0, min(1.0, float(raw_score)))
+            normalized_items.append((item_type, hash_value, float(raw_score), float(normalized_score)))
+        return normalized_items
+
+    async def _collect_dual_graph_evidence(
+        self,
+        *,
+        query_emb: np.ndarray,
+        top_k: int,
+        temporal: Optional[TemporalQueryOptions],
+    ) -> Dict[str, Dict[str, Any]]:
+        cfg = self.config.vector_pools
+        graph_store = self.graph_vector_store
+        graph_ids, graph_scores = await asyncio.to_thread(graph_store.search, query_emb, k=top_k)
+        parsed_items: List[Tuple[str, str, float]] = []
+        relation_hashes: List[str] = []
+        entity_hashes: List[str] = []
+        for raw_id, raw_score in zip(graph_ids, graph_scores, strict=False):
+            item_type, hash_value = self._parse_graph_vector_id(raw_id)
+            if item_type not in {"relation", "entity"} or not hash_value:
+                continue
+            score = float(raw_score)
+            parsed_items.append((item_type, hash_value, score))
+            if item_type == "relation":
+                relation_hashes.append(hash_value)
+            else:
+                entity_hashes.append(hash_value)
+        normalized_items = self._normalize_graph_scores_by_type(parsed_items)
+
+        relation_rows = self.metadata_store.get_relations_by_hashes(
+            relation_hashes,
+            include_inactive=False,
+        )
+        entity_rows = self.metadata_store.get_entities_by_hashes(entity_hashes)
+        relation_paragraphs = self.metadata_store.get_paragraphs_by_relation_hashes(relation_hashes)
+        entity_paragraphs_getter = getattr(
+            self.metadata_store,
+            "get_paragraphs_by_entity_hashes",
+            None,
+        )
+        if callable(entity_paragraphs_getter):
+            entity_paragraphs = entity_paragraphs_getter(entity_hashes)
+        else:
+            entity_paragraphs = {}
+
+        expanded_entries: List[Tuple[float, int, Dict[str, Any], Dict[str, Any]]] = []
+        for item_index, (item_type, hash_value, raw_score, normalized_score) in enumerate(normalized_items):
+            if item_type == "relation":
+                relation = relation_rows.get(hash_value)
+                if relation is None:
+                    continue
+                evidence_score = float(normalized_score) * float(cfg.relation_evidence_weight)
+                paragraphs = relation_paragraphs.get(hash_value, [])[: cfg.relation_expand_per_hit]
+                evidence = {
+                    "type": "relation",
+                    "hash": hash_value,
+                    "subject": relation.get("subject", ""),
+                    "predicate": relation.get("predicate", ""),
+                    "object": relation.get("object", ""),
+                    "source": "graph_vector_relation",
+                    "raw_score": float(raw_score),
+                    "normalized_score": float(normalized_score),
+                }
+            else:
+                entity = entity_rows.get(hash_value)
+                if entity is None:
+                    continue
+                evidence_score = float(normalized_score) * float(cfg.entity_evidence_weight)
+                paragraphs = entity_paragraphs.get(hash_value, [])[: cfg.entity_expand_per_hit]
+                evidence = {
+                    "type": "entity",
+                    "hash": hash_value,
+                    "name": entity.get("name", ""),
+                    "source": "graph_vector_entity",
+                    "raw_score": float(raw_score),
+                    "normalized_score": float(normalized_score),
+                }
+
+            for paragraph_index, paragraph in enumerate(paragraphs):
+                paragraph_hash = str(paragraph.get("hash", "") or "").strip()
+                if not paragraph_hash:
+                    continue
+                if temporal and not self._is_temporal_match(paragraph, temporal):
+                    continue
+                order = item_index * max(1, max(cfg.relation_expand_per_hit, cfg.entity_expand_per_hit)) + paragraph_index
+                expanded_entries.append((float(evidence_score), order, paragraph, dict(evidence)))
+
+        expanded_entries.sort(key=lambda item: (-item[0], item[1]))
+        evidence_by_paragraph: Dict[str, Dict[str, Any]] = {}
+        for evidence_score, _order, paragraph, evidence in expanded_entries[: cfg.graph_expand_paragraph_k]:
+            paragraph_hash = str(paragraph.get("hash", "") or "").strip()
+            if not paragraph_hash:
+                continue
+            payload = evidence_by_paragraph.setdefault(
+                paragraph_hash,
+                {
+                    "paragraph": paragraph,
+                    "evidence": [],
+                },
+            )
+            payload["evidence"].append((evidence, float(evidence_score)))
+        return evidence_by_paragraph
+
+    async def _retrieve_dual_vector_pools(
+        self,
+        query: str,
+        top_k: int,
+        temporal: Optional[TemporalQueryOptions] = None,
+        relation_intent: Optional[Dict[str, Any]] = None,
+    ) -> List[RetrievalResult]:
+        relation_intent = relation_intent or {}
+        semantic_weight, sparse_weight, graph_weight, graph_top_k = self._dual_pool_weights(relation_intent)
+        try:
+            query_emb = await self.embedding_manager.encode(query)
+            embedding_ok = self._is_embedding_ready_for_vector_search(
+                query_emb,
+                stage="dual_vector_pool",
+            )
+        except Exception as e:
+            logger.warning(f"双向量池检索 embedding 生成失败，将尝试 sparse 回退: {e}")
+            embedding_ok = False
+            query_emb = None
+
+        candidates: Dict[str, RetrievalResult] = {}
+        if embedding_ok and query_emb is not None:
+            paragraph_top_k = max(top_k, int(self.config.vector_pools.paragraph_top_k))
+            para_ids, para_scores = await asyncio.to_thread(
+                self.paragraph_vector_store.search,
+                query_emb,
+                k=paragraph_top_k,
+            )
+            paragraph_map = self.metadata_store.get_paragraphs_by_hashes(para_ids)
+            for hash_value, score in zip(para_ids, para_scores, strict=False):
+                paragraph = paragraph_map.get(hash_value)
+                if paragraph is None:
+                    continue
+                if temporal and not self._is_temporal_match(paragraph, temporal):
+                    continue
+                self._add_candidate_score(
+                    candidates,
+                    paragraph,
+                    score_key="semantic",
+                    score=float(score),
+                    source="paragraph_vector_pool",
+                    temporal=temporal,
+                )
+
+            graph_evidence = await self._collect_dual_graph_evidence(
+                query_emb=query_emb,
+                top_k=graph_top_k,
+                temporal=temporal,
+            )
+            for payload in graph_evidence.values():
+                paragraph = payload.get("paragraph")
+                if not isinstance(paragraph, dict):
+                    continue
+                candidate = self._ensure_paragraph_candidate(candidates, paragraph, temporal=temporal)
+                self._mark_candidate_source(candidate, "graph_vector_pool")
+                for evidence, evidence_score in payload.get("evidence", []):
+                    self._append_graph_evidence(
+                        candidate,
+                        evidence=evidence,
+                        score=float(evidence_score),
+                    )
+                score_meta = self._candidate_score_meta(candidate)
+                score_meta["graph_evidence"] = self._aggregate_graph_evidence_score(candidate)
+        else:
+            logger.warning("embedding 不可用，跳过双向量池向量召回")
+
+        sparse_para_results: List[RetrievalResult] = []
+        if self._should_use_sparse(embedding_ok, list(candidates.values())):
+            sparse_para_results = self._search_paragraphs_sparse(
+                query=query,
+                top_k=max(top_k * 2, self.config.sparse.candidate_k),
+                temporal=temporal,
+            )
+        for sparse_item in sparse_para_results:
+            paragraph = {
+                "hash": sparse_item.hash_value,
+                "content": sparse_item.content,
+                "word_count": sparse_item.metadata.get("word_count", 0)
+                if isinstance(sparse_item.metadata, dict)
+                else 0,
+            }
+            candidate = self._add_candidate_score(
+                candidates,
+                paragraph,
+                score_key="sparse",
+                score=float(sparse_item.score),
+                source="paragraph_sparse",
+                temporal=temporal,
+            )
+            if isinstance(sparse_item.metadata, dict):
+                candidate.metadata.update(
+                    {
+                        key: value
+                        for key, value in sparse_item.metadata.items()
+                        if key not in {"score_breakdown", "evidence_items"}
+                    }
+                )
+
+        results = list(candidates.values())
+        for item in results:
+            score_meta = self._candidate_score_meta(item)
+            semantic_score = float(score_meta.get("semantic", 0.0) or 0.0)
+            sparse_score = float(score_meta.get("sparse", 0.0) or 0.0)
+            graph_score = float(
+                score_meta.get("graph_evidence", self._aggregate_graph_evidence_score(item))
+                or 0.0
+            )
+            final_score = (
+                semantic_weight * semantic_score
+                + sparse_weight * sparse_score
+                + graph_weight * graph_score
+            )
+            score_meta.update(
+                {
+                    "semantic": semantic_score,
+                    "sparse": sparse_score,
+                    "graph_evidence": graph_score,
+                    "semantic_weight": semantic_weight,
+                    "sparse_weight": sparse_weight,
+                    "graph_weight": graph_weight,
+                    "final": final_score,
+                }
+            )
+            item.score = float(final_score)
+            item.source = "dual_vector_pool"
+
+        results.sort(key=lambda x: x.score, reverse=True)
+
+        if self.config.enable_ppr:
+            results = await self._rerank_with_ppr(results, query)
+
+        if temporal:
+            results = self._sort_results_with_temporal(results, temporal)
+
+        results = apply_posterior_graph_gate(
+            self,
+            query=query,
+            base_results=results,
+            top_k=top_k,
+            temporal=temporal,
+            relation_intent=relation_intent,
+        )
+
         return results[:top_k]
 
     def _collect_mixed_candidates(

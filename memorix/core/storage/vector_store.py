@@ -10,7 +10,7 @@ import hashlib
 import shutil
 import time
 from pathlib import Path
-from typing import Optional, Union, Tuple, List, Dict, Set, Any
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 import random
 import threading  # Added threading import
 
@@ -368,6 +368,131 @@ class VectorStore:
 
         return [r[0] for r in results], [r[1] for r in results]
 
+    def get_vectors(self, ids: Sequence[str]) -> Dict[str, np.ndarray]:
+        """按字符串 ID 读取已持久化向量，用于无 embedding 的池间迁移。"""
+        return {
+            key: vector
+            for batch in self.iter_vectors_by_ids(ids)
+            for key, vector in batch.items()
+        }
+
+    def iter_vectors_by_ids(
+        self,
+        ids: Sequence[str],
+        *,
+        batch_size: int = 1024,
+    ) -> Iterator[Dict[str, np.ndarray]]:
+        """按字符串 ID 分批读取持久化向量，避免迁移时把全部向量集中留在内存。"""
+        requested_ids = [
+            str(item or "").strip()
+            for item in ids
+            if str(item or "").strip()
+        ]
+        if not requested_ids:
+            return
+
+        safe_batch_size = max(1, int(batch_size or 1024))
+        unique_ids = list(dict.fromkeys(requested_ids))
+        with self._lock:
+            self._flush_write_buffer_unlocked()
+            known_hashes = set(self._known_hashes)
+            deleted_ids = set(self._deleted_ids)
+            bin_path = self._bin_path
+            ids_bin_path = self._ids_bin_path
+            dimension = int(self.dimension)
+
+        int_to_str: Dict[int, str] = {}
+        for str_id in unique_ids:
+            if str_id not in known_hashes:
+                continue
+            int_id = self._generate_id(str_id)
+            if int_id in deleted_ids:
+                continue
+            int_to_str[int_id] = str_id
+
+        if not int_to_str or not bin_path.exists() or not ids_bin_path.exists():
+            return
+
+        result: Dict[str, np.ndarray] = {}
+        vec_item_size = dimension * 2
+        id_item_size = 8
+        chunk_size = 10000
+
+        with open(bin_path, "rb") as f_vec, open(ids_bin_path, "rb") as f_id:
+            while True:
+                vec_data = f_vec.read(chunk_size * vec_item_size)
+                id_data = f_id.read(chunk_size * id_item_size)
+                if not vec_data:
+                    break
+
+                batch_fp16 = np.frombuffer(vec_data, dtype=np.float16).reshape(-1, dimension)
+                batch_fp32 = batch_fp16.astype(np.float32)
+                faiss.normalize_L2(batch_fp32)
+                batch_ids = np.frombuffer(id_data, dtype=">i8").astype(np.int64)
+
+                for index, int_id in enumerate(batch_ids):
+                    int_key = int(int_id)
+                    key = int_to_str.pop(int_key, None)
+                    if key is None or int_key in deleted_ids:
+                        continue
+                    result[key] = np.array(batch_fp32[index], dtype=np.float32, copy=True)
+                    if len(result) >= safe_batch_size:
+                        yield result
+                        result = {}
+                    if not int_to_str:
+                        break
+                if not int_to_str:
+                    break
+
+        if result:
+            yield result
+
+    def _get_vectors_chunk(self, requested_ids: Sequence[str]) -> Dict[str, np.ndarray]:
+        """读取一批向量，调用方负责控制 batch 大小。"""
+        if not requested_ids:
+            return {}
+
+        with self._lock:
+            self._flush_write_buffer_unlocked()
+            int_to_str: Dict[int, str] = {}
+            for str_id in requested_ids:
+                if str_id not in self._known_hashes:
+                    continue
+                int_id = self._generate_id(str_id)
+                if int_id in self._deleted_ids:
+                    continue
+                int_to_str[int_id] = str_id
+
+            if not int_to_str or not self._bin_path.exists() or not self._ids_bin_path.exists():
+                return {}
+
+            result: Dict[str, np.ndarray] = {}
+            vec_item_size = self.dimension * 2
+            id_item_size = 8
+            chunk_size = 10000
+
+            with open(self._bin_path, "rb") as f_vec, open(self._ids_bin_path, "rb") as f_id:
+                while True:
+                    vec_data = f_vec.read(chunk_size * vec_item_size)
+                    id_data = f_id.read(chunk_size * id_item_size)
+                    if not vec_data:
+                        break
+
+                    batch_fp16 = np.frombuffer(vec_data, dtype=np.float16).reshape(-1, self.dimension)
+                    batch_fp32 = batch_fp16.astype(np.float32)
+                    faiss.normalize_L2(batch_fp32)
+                    batch_ids = np.frombuffer(id_data, dtype=">i8").astype(np.int64)
+
+                    for index, int_id in enumerate(batch_ids):
+                        key = int_to_str.get(int(int_id))
+                        if key is None or key in result or int_id in self._deleted_ids:
+                            continue
+                        result[key] = np.array(batch_fp32[index], dtype=np.float32, copy=True)
+                        if len(result) >= len(int_to_str):
+                            return result
+
+            return result
+
     def warmup_index(self, force_train: bool = True) -> Dict[str, Any]:
         """
         预热向量索引（训练/回放前置），避免首个线上查询触发重初始化。
@@ -593,7 +718,12 @@ class VectorStore:
 
         logger.info("Compaction Complete.")
 
-    def save(self, data_dir: Optional[Union[str, Path]] = None) -> None:
+    def save(
+        self,
+        data_dir: Optional[Union[str, Path]] = None,
+        *,
+        embedding_fingerprint: Optional[Dict[str, Any]] = None,
+    ) -> None:
         with self._lock:
             if not data_dir:
                 data_dir = self.data_dir
@@ -604,6 +734,20 @@ class VectorStore:
             data_dir.mkdir(parents=True, exist_ok=True)
 
             self._flush_write_buffer_unlocked()
+
+            previous_embedding_fingerprint: Optional[Dict[str, Any]] = None
+            meta_path = data_dir / "vectors_metadata.pkl"
+            if embedding_fingerprint is None and meta_path.exists():
+                try:
+                    with open(meta_path, "rb") as f:
+                        previous_meta = pickle.load(f)
+                except Exception as exc:
+                    logger.warning(f"读取旧向量元数据失败，跳过 embedding 指纹继承: {exc}")
+                else:
+                    if isinstance(previous_meta, dict):
+                        previous_raw = previous_meta.get("embedding_fingerprint")
+                        if isinstance(previous_raw, dict) and previous_raw:
+                            previous_embedding_fingerprint = dict(previous_raw)
 
             if self._is_trained:
                 index_path = data_dir / "vectors.index"
@@ -618,8 +762,12 @@ class VectorStore:
                 "deleted_ids": list(self._deleted_ids),
                 "known_hashes": list(self._known_hashes),
             }
+            if isinstance(embedding_fingerprint, dict) and embedding_fingerprint:
+                meta["embedding_fingerprint"] = dict(embedding_fingerprint)
+            elif previous_embedding_fingerprint is not None:
+                meta["embedding_fingerprint"] = previous_embedding_fingerprint
 
-            with atomic_write(data_dir / "vectors_metadata.pkl", "wb") as f:
+            with atomic_write(meta_path, "wb") as f:
                 pickle.dump(meta, f)
 
             logger.debug("VectorStore saved.")

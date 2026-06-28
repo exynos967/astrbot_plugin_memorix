@@ -19,6 +19,7 @@ from ..retrieval import (
     SparseBM25Config,
     ThresholdConfig,
     ThresholdMethod,
+    VectorPoolsConfig,
 )
 
 _logger = get_logger("A_Memorix.SearchRuntimeInitializer")
@@ -54,11 +55,32 @@ def _resolve_debug_enabled(plugin_config: Optional[dict]) -> bool:
     return bool(_get_config_value(plugin_config, "debug", False))
 
 
+def _resolve_vector_pools_ready(plugin_config: Optional[dict]) -> bool:
+    configured = _get_config_value(plugin_config, "runtime.vector_pools_ready", None)
+    if configured is not None:
+        return bool(configured)
+
+    plugin_instance = _get_config_value(plugin_config, "plugin_instance")
+    checker = getattr(plugin_instance, "_dual_vector_pools_enabled", None)
+    if callable(checker):
+        return bool(checker())
+
+    try:
+        from ...runtime_registry import get_runtime_components
+
+        instances = get_runtime_components()
+    except Exception:
+        instances = {}
+    return bool(instances.get("vector_pools_ready")) if isinstance(instances, dict) else False
+
+
 @dataclass
 class SearchRuntimeBundle:
     """Resolved runtime components and initialized retriever/filter."""
 
     vector_store: Optional[Any] = None
+    paragraph_vector_store: Optional[Any] = None
+    graph_vector_store: Optional[Any] = None
     graph_store: Optional[Any] = None
     metadata_store: Optional[Any] = None
     embedding_manager: Optional[Any] = None
@@ -81,6 +103,8 @@ class SearchRuntimeBundle:
 def _resolve_runtime_components(plugin_config: Optional[dict]) -> SearchRuntimeBundle:
     bundle = SearchRuntimeBundle(
         vector_store=_get_config_value(plugin_config, "vector_store"),
+        paragraph_vector_store=_get_config_value(plugin_config, "paragraph_vector_store"),
+        graph_vector_store=_get_config_value(plugin_config, "graph_vector_store"),
         graph_store=_get_config_value(plugin_config, "graph_store"),
         metadata_store=_get_config_value(plugin_config, "metadata_store"),
         embedding_manager=_get_config_value(plugin_config, "embedding_manager"),
@@ -91,6 +115,10 @@ def _resolve_runtime_components(plugin_config: Optional[dict]) -> SearchRuntimeB
         getattr(bundle, key) is None for key in _REQUIRED_COMPONENT_KEYS
     )
     if not missing_required:
+        if bundle.paragraph_vector_store is None:
+            bundle.paragraph_vector_store = bundle.vector_store
+        if bundle.graph_vector_store is None:
+            bundle.graph_vector_store = bundle.vector_store
         return bundle
 
     try:
@@ -105,6 +133,10 @@ def _resolve_runtime_components(plugin_config: Optional[dict]) -> SearchRuntimeB
 
     if bundle.vector_store is None:
         bundle.vector_store = instances.get("vector_store")
+    if bundle.paragraph_vector_store is None:
+        bundle.paragraph_vector_store = instances.get("paragraph_vector_store")
+    if bundle.graph_vector_store is None:
+        bundle.graph_vector_store = instances.get("graph_vector_store")
     if bundle.graph_store is None:
         bundle.graph_store = instances.get("graph_store")
     if bundle.metadata_store is None:
@@ -113,6 +145,10 @@ def _resolve_runtime_components(plugin_config: Optional[dict]) -> SearchRuntimeB
         bundle.embedding_manager = instances.get("embedding_manager")
     if bundle.sparse_index is None:
         bundle.sparse_index = instances.get("sparse_index")
+    if bundle.paragraph_vector_store is None:
+        bundle.paragraph_vector_store = bundle.vector_store
+    if bundle.graph_vector_store is None:
+        bundle.graph_vector_store = bundle.vector_store
     return bundle
 
 
@@ -147,6 +183,14 @@ def build_search_runtime(
     posterior_graph_cfg_raw = _safe_dict(
         _get_config_value(plugin_config, "retrieval.search.posterior_graph", {}) or {}
     )
+    vector_pools_cfg_raw = _safe_dict(
+        _get_config_value(plugin_config, "retrieval.vector_pools", {}) or {}
+    )
+    vector_pools_ready = _resolve_vector_pools_ready(plugin_config)
+    if str(vector_pools_cfg_raw.get("mode", "dual") or "dual").strip().lower() == "dual" and not vector_pools_ready:
+        vector_pools_cfg_raw = dict(vector_pools_cfg_raw)
+        vector_pools_cfg_raw["mode"] = "single"
+        log.warning(f"{prefix_text}[{owner}] 双池向量尚未 ready，当前按单池检索运行")
 
     try:
         sparse_cfg = SparseBM25Config(**sparse_cfg_raw)
@@ -179,6 +223,12 @@ def build_search_runtime(
         posterior_graph_cfg = PosteriorGraphConfig()
 
     try:
+        vector_pools_cfg = VectorPoolsConfig(**vector_pools_cfg_raw)
+    except Exception as e:
+        log.warning(f"{prefix_text}[{owner}] vector_pools 配置非法，回退默认: {e}")
+        vector_pools_cfg = VectorPoolsConfig()
+
+    try:
         config = DualPathRetrieverConfig(
             top_k_paragraphs=_get_config_value(plugin_config, "retrieval.top_k_paragraphs", 20),
             top_k_relations=_get_config_value(plugin_config, "retrieval.top_k_relations", 10),
@@ -204,12 +254,15 @@ def build_search_runtime(
             sparse=sparse_cfg,
             fusion=fusion_cfg,
             relation_intent=relation_intent_cfg,
+            vector_pools=vector_pools_cfg,
             graph_recall=graph_recall_cfg,
             posterior_graph=posterior_graph_cfg,
         )
 
         runtime.retriever = DualPathRetriever(
             vector_store=runtime.vector_store,
+            paragraph_vector_store=runtime.paragraph_vector_store or runtime.vector_store,
+            graph_vector_store=runtime.graph_vector_store or runtime.vector_store,
             graph_store=runtime.graph_store,
             metadata_store=runtime.metadata_store,
             embedding_manager=runtime.embedding_manager,

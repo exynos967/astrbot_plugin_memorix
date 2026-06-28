@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
 from typing import Any, Callable, Coroutine, cast
 
 from ...amemorix.common.logging import get_logger
@@ -21,6 +23,38 @@ from ..utils.runtime_self_check import ensure_runtime_self_check
 from ..utils.relation_write_service import RelationWriteService
 
 logger = get_logger("A_Memorix.LifecycleOrchestrator")
+
+
+def _dual_vector_ready(data_dir: Path, *, expected_dimension: int) -> bool:
+    manifest_path = data_dir / "vectors" / "dual_ready.json"
+    if not manifest_path.exists():
+        return False
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning(f"读取双池 ready manifest 失败: {exc}")
+        return False
+    if not isinstance(payload, dict) or payload.get("status") != "ready":
+        return False
+    manifest_dimension = int(payload.get("dimension", 0) or 0)
+    if manifest_dimension not in {0, int(expected_dimension)}:
+        logger.warning(
+            "双池 ready manifest 维度不匹配: "
+            f"manifest={manifest_dimension}, expected={int(expected_dimension)}"
+        )
+        return False
+    return (data_dir / "vectors" / "paragraph").exists() and (data_dir / "vectors" / "graph").exists()
+
+
+def _set_runtime_vector_pools_ready(plugin: Any, ready: bool) -> None:
+    for attr_name in ("config", "_plugin_config"):
+        config = getattr(plugin, attr_name, None)
+        if not isinstance(config, dict):
+            continue
+        runtime_cfg = config.get("runtime")
+        config["runtime"] = dict(runtime_cfg) if isinstance(runtime_cfg, dict) else {}
+        config["runtime"]["vector_pools_ready"] = bool(ready)
+    plugin._dual_vector_pools_ready = bool(ready)
 
 
 async def ensure_initialized(plugin: Any) -> None:
@@ -177,6 +211,31 @@ async def initialize_storage_async(plugin: Any) -> None:
         data_dir=data_dir / "vectors",
     )
     plugin.vector_store.min_train_threshold = plugin.get_config("embedding.min_train_threshold", 40)
+    plugin.paragraph_vector_store = VectorStore(
+        dimension=detected_dimension,
+        quantization_type=quantization_type,
+        data_dir=data_dir / "vectors" / "paragraph",
+    )
+    plugin.paragraph_vector_store.min_train_threshold = plugin.get_config("embedding.min_train_threshold", 40)
+    plugin.graph_vector_store = VectorStore(
+        dimension=detected_dimension,
+        quantization_type=quantization_type,
+        data_dir=data_dir / "vectors" / "graph",
+    )
+    plugin.graph_vector_store.min_train_threshold = plugin.get_config("embedding.min_train_threshold", 40)
+    vector_pools_cfg = plugin.get_config("retrieval.vector_pools", {}) or {}
+    vector_pool_mode = (
+        str(vector_pools_cfg.get("mode", "dual") if isinstance(vector_pools_cfg, dict) else "dual")
+        .strip()
+        .lower()
+    )
+    dual_vector_ready = vector_pool_mode == "dual" and _dual_vector_ready(
+        data_dir,
+        expected_dimension=detected_dimension,
+    )
+    if vector_pool_mode == "dual" and not dual_vector_ready:
+        logger.warning("双池配置已开启，但 ready manifest 不可用，当前按单池检索与写入运行")
+    _set_runtime_vector_pools_ready(plugin, dual_vector_ready)
     logger.info(
         "向量存储初始化完成（"
         f"维度: {detected_dimension}, "
@@ -204,7 +263,9 @@ async def initialize_storage_async(plugin: Any) -> None:
         metadata_store=plugin.metadata_store,
         graph_store=plugin.graph_store,
         vector_store=plugin.vector_store,
+        graph_vector_store=plugin.graph_vector_store,
         embedding_manager=plugin.embedding_manager,
+        use_typed_relation_ids=dual_vector_ready,
     )
     logger.info("关系写入服务初始化完成")
 
@@ -254,6 +315,16 @@ async def initialize_storage_async(plugin: Any) -> None:
             logger.debug(f"向量数据已加载，共 {plugin.vector_store.num_vectors} 个向量")
         except Exception as e:
             logger.warning(f"加载向量数据失败: {e}")
+    if dual_vector_ready:
+        for store_name in ("paragraph_vector_store", "graph_vector_store"):
+            store = getattr(plugin, store_name, None)
+            if store is None or not store.has_data():
+                continue
+            try:
+                store.load()
+                logger.debug(f"{store_name} 数据已加载，共 {store.num_vectors} 个向量")
+            except Exception as e:
+                logger.warning(f"加载 {store_name} 数据失败: {e}")
 
     try:
         warmup_summary = plugin.vector_store.warmup_index(force_train=True)
@@ -273,6 +344,15 @@ async def initialize_storage_async(plugin: Any) -> None:
             )
     except Exception as e:
         logger.warning(f"向量索引预热异常，继续启用 sparse 降级路径: {e}")
+    if dual_vector_ready:
+        for store_name in ("paragraph_vector_store", "graph_vector_store"):
+            store = getattr(plugin, store_name, None)
+            if store is None:
+                continue
+            try:
+                store.warmup_index(force_train=True)
+            except Exception as e:
+                logger.warning(f"{store_name} 预热失败，后续检索可能降级: {e}")
 
     if plugin.graph_store.has_data():
         try:
