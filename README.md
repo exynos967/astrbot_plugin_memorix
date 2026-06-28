@@ -82,7 +82,7 @@ Dashboard 内嵌导入视图默认启用。页面可进行如下三种导入：
 
 支持基于自然语言请求对既有记忆进行模糊修正：LLM 根据用户的修改诉求生成结构化修改计划，先 **preview** 预览待改写项，由用户/管理员 **确认** 后再 **execute** 落库，并保留 **rollback** 回滚能力。
 
-- **默认关闭**：`integration.fuzzy_modify.enabled=False`，启用需显式设为 `True`。
+- **默认启用**：`integration.fuzzy_modify.enabled=True`，与上游 A_memorix 对齐；如需关闭可显式设为 `False`。
 - **安全默认**：`auto_execute_enabled=False`（必须经过显式 confirmed 才会执行）、`confirm_threshold=0.85`、`allow_global_scope=False`（禁止跨作用域全局修改）。
 - **管理入口**：管理工具 `memory_fuzzy_modify_admin`（actions：`preview` / `execute` / `get` / `list` / `rollback` / `reconcile`），仅 AstrBot 管理员事件可调用；WebUI 路由 `POST /v1/fuzzy_modify`。
 
@@ -124,15 +124,15 @@ https://github.com/exynos967/astrbot_plugin_memorix
 
 ### 推荐配置（启用独立 Embedding）
 
-聊天模型可选指定 AstrBot 已定义 Provider；Embedding 在插件内独立配置 OpenAI 端点：
+聊天模型复用 AstrBot 已定义 Provider；Embedding 没有 AstrBot bridge 时在插件内独立配置 OpenAI-compatible 端点：
 
 | 配置项 | 值 | 说明 |
 |---|---|---|
-| `provider.chat_provider_id` | AstrBot 中的聊天 Provider ID（可选） | 指定后优先使用该模型做总结/画像；总结不再单独配置 Provider/模型 |
+| `provider.chat_provider_id` | AstrBot 中的聊天 Provider ID（可选） | 指定后使用该模型做总结/画像；留空使用当前会话默认 Provider |
 | `embedding.enabled` | `true` | 启用远程向量化 |
-| `embedding.openapi.base_url` | 你的 Embedding API 地址 | 支持不带 `/v1`，插件会自动补全 |
+| `embedding.openapi.base_url` | 你的 Embedding API 地址 | 必填；支持不带 `/v1`，插件会自动补全 |
 | `embedding.openapi.api_key` | 你的 API Key | 远程鉴权 |
-| `embedding.openapi.model` | 你的 Embedding 模型名 | 如 `text-embedding-3-large` |
+| `embedding.openapi.model` | 你的 Embedding 模型名 | 必填，如 `text-embedding-3-large` |
 
 ## 使用方式
 
@@ -169,26 +169,40 @@ data/plugin_data/astrbot_plugin_memorix/scopes/<scope_key>/
 
 ### 数据库 Schema 版本
 
+> **破坏性更新提醒**
+>
+> 从 `main` 旧版升级到 feat2.0 / SCHEMA 15 时，旧版 `metadata.db` 为 `SCHEMA_VERSION=8`，新版本运行时不会直接打开 v8 库。请先停止插件，备份 `data/plugin_data/astrbot_plugin_memorix/`，并按下方步骤对每个 scope 手动执行离线迁移后再启动新版本。
+
 当前元数据 Schema 版本为 **SCHEMA 15**。相对前一版本，本次升级包含两项结构变更：
 
 - **新增 `fuzzy_modify_plans` 表**：存放模糊修正功能的修改计划与执行状态（preview / confirmed / executed / rolled_back），与模糊修正功能配套。
 - **`stale_relation` 表新增三列**：`source_type`、`source_id`、`source_operation_id`，用于精确标记关系条目的来源类型与具体来源操作 ID，便于追溯与回收。
 
-插件启动时会自动检测当前 Schema 版本并按需执行迁移，无需手动干预。
+升级路径：
+
+- **从 `main` 旧版升级**：`main` 使用 `SCHEMA_VERSION=8`，feat2.0 运行时不会直接打开 v8 库。升级代码后、启动插件前，需要对每个 scope 的 `metadata.db` 执行离线迁移：
+
+  ```bash
+  uv run python scripts/migrate_schema_v8_to_v13.py \
+    --db data/plugin_data/astrbot_plugin_memorix/scopes/<scope_key>/metadata/metadata.db
+  ```
+
+  脚本文件名保留历史兼容，实际目标版本取当前代码的 `SCHEMA_VERSION`（本版为 15）。脚本会先备份原库，迁移后旧段落/关系数据保留。
+- **从已版本化的新库升级**：`schema_version >= 9 && < 15` 时，插件启动会自动迁移到 15。
+- **全新安装**：直接创建 SCHEMA 15 库。
 
 ### 双向量池架构（dual-pool）
 
-检索向量默认使用单池（single），段落向量与图谱关系向量共用同一向量索引。SCHEMA 15 起支持双向量池模式，将 **段落向量** 与 **图谱向量** 分离到独立索引，便于独立扩容、独立检索调参。
+SCHEMA 15 起支持双向量池模式，将 **段落向量** 与 **图谱向量** 分离到独立索引，便于独立扩容、独立检索调参。
 
-- **默认 `mode=single`，零行为变化**：未启用 dual 时所有行为与历史版本完全一致。
-- **启用 dual 步骤**：
-  1. 配置 `retrieval.vector_pools.mode=dual`；
-  2. 运行离线迁移脚本预览分流结果（先 dry-run 再正式迁移）：
+- **默认 `mode=dual`，与上游 A_memorix 对齐**：如果未生成 `dual_ready.json`，运行时会自动降级为 single，不会因配置错配而无法检索。
+- **正式启用双池步骤**：
+  1. 运行离线迁移脚本预览分流结果（先 dry-run 再正式迁移）：
      ```
-     python scripts/migrate_vectors_to_dual_pools.py --data-dir <scope目录> [--scope <scope_key>] [--dry-run]
+     uv run python scripts/migrate_vectors_to_dual_pools.py --data-dir <scope目录> [--scope <scope_key>] [--dry-run]
      ```
-  3. 迁移成功后，脚本会在 `vectors/` 下写入 `dual_ready.json` manifest，运行时据此判定 dual 是否就绪；
-  4. 若 manifest 缺失，运行时自动降级为 single，不会因配置错配而无法检索。
+  2. 迁移成功后，脚本会在 `vectors/` 下写入 `dual_ready.json` manifest，运行时据此判定 dual 是否就绪；
+  3. 若 manifest 缺失，运行时自动降级为 single。
 - 迁移脚本幂等，不删除单池原数据，dual 模式可安全回退至 single。
 
 ## 完整配置参考
@@ -247,13 +261,13 @@ data/plugin_data/astrbot_plugin_memorix/scopes/<scope_key>/
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `embedding.enabled` | bool | `false` | 启用插件内 OpenAI embedding（关闭则本地回退） |
+| `embedding.enabled` | bool | `false` | 启用插件内 OpenAI-compatible embedding（关闭则本地回退） |
 | `embedding.dimension` | int | `1024` | 向量维度 |
 | `embedding.batch_size` | int | `32` | 批量请求大小 |
 | `embedding.max_concurrent` | int | `5` | 最大并发请求数 |
-| `embedding.openapi.base_url` | string | `""` | Embedding API Base URL（可不带 `/v1`） |
+| `embedding.openapi.base_url` | string | `""` | Embedding API Base URL（启用远程 embedding 时必填，可不带 `/v1`） |
 | `embedding.openapi.api_key` | string | `""` | Embedding API Key |
-| `embedding.openapi.model` | string | `""` | Embedding 模型名（空为服务端默认） |
+| `embedding.openapi.model` | string | `""` | Embedding 模型名（启用远程 embedding 时必填） |
 | `embedding.openapi.timeout_seconds` | float | `30` | Embedding 请求超时（秒） |
 | `embedding.openapi.max_retries` | int | `3` | Embedding 请求重试次数 |
 
@@ -275,7 +289,7 @@ data/plugin_data/astrbot_plugin_memorix/scopes/<scope_key>/
 | `retrieval.aggregate.weights.search` | float | `1.0` | 语义检索通道权重 |
 | `retrieval.aggregate.weights.time` | float | `1.0` | 时序检索通道权重 |
 | `retrieval.aggregate.weights.episode` | float | `1.0` | 事件摘要检索通道权重 |
-| `retrieval.vector_pools.mode` | string | `single` | 向量池模式：`single`（单池，零行为变化） / `dual`（段落向量与图谱向量分离，需先跑迁移脚本） |
+| `retrieval.vector_pools.mode` | string | `dual` | 向量池模式：`dual` 与上游默认对齐；缺少 `dual_ready.json` 时运行时降级为 `single` |
 
 ### 记忆维护（memory）
 
@@ -353,9 +367,10 @@ data/plugin_data/astrbot_plugin_memorix/scopes/<scope_key>/
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `integration.fuzzy_modify.enabled` | bool | `false` | 启用记忆模糊修正功能；默认关闭 |
+| `integration.fuzzy_modify.enabled` | bool | `true` | 启用记忆模糊修正功能；默认与上游 A_memorix 对齐 |
 | `integration.fuzzy_modify.auto_execute_enabled` | bool | `false` | 是否允许跳过显式确认直接执行；默认必须显式 confirmed |
 | `integration.fuzzy_modify.confirm_threshold` | float | `0.85` | 计划确认阈值，低于该阈值需人工复核 |
+| `integration.fuzzy_modify.max_targets` | int | `5` | 单个计划允许修改的目标上限 |
 | `integration.fuzzy_modify.allow_global_scope` | bool | `false` | 是否允许跨作用域的全局修改；默认禁止 |
 
 </details>
@@ -382,7 +397,7 @@ data/plugin_data/astrbot_plugin_memorix/scopes/<scope_key>/
 <details>
 <summary>没有配置 Embedding API 能用吗？</summary>
 
-可以。`embedding.enabled=false`（默认值）时，插件使用本地确定性向量回退，所有功能正常加载。配置 `embedding.openapi` 后检索效果会显著提升。
+可以。`embedding.enabled=false`（默认值）时，插件使用本地确定性向量回退，所有功能正常加载。启用远程 embedding 后必须在插件配置中填写 `embedding.openapi.base_url` 和 `embedding.openapi.model`；插件不会从 `OPENAPI_*` / `OPENAI_*` 环境变量兜底读取。
 
 </details>
 
