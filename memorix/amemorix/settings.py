@@ -270,6 +270,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "feedback_correction_episode_query_block_enabled": True,
         "feedback_correction_reconcile_interval_minutes": 5,
         "feedback_correction_reconcile_batch_size": 20,
+        # 记忆模糊修正：默认关闭，需显式确认
+        "fuzzy_modify": {
+            "enabled": False,
+            "candidate_limit": 20,
+            "confirm_threshold": 0.85,
+            "auto_execute_enabled": False,
+            "max_targets": 10,
+            "allow_global_scope": False,
+        },
     },
 }
 

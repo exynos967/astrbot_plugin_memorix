@@ -157,6 +157,14 @@ class FeedbackAdminRequest(BaseModel):
     payload: Dict[str, Any] = Field(default_factory=dict)
 
 
+class FuzzyModifyAdminRequest(BaseModel):
+    # 镜像 FeedbackAdminRequest：action 决定调度分支，可变参数走 payload 透传
+    # payload 支持 request_text / plan_id / person_id / person_keyword / chat_id /
+    # limit / confirmed / requested_by / reason / status 等字段
+    action: str
+    payload: Dict[str, Any] = Field(default_factory=dict)
+
+
 def _ctx(request: Request):
     return request.app.state.context
 
@@ -660,5 +668,15 @@ async def feedback_admin(request: Request, body: FeedbackAdminRequest):
     scope = _scope_key(request)
     try:
         return await service.feedback_admin(scope_key=scope, action=body.action, **(body.payload or {}))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/fuzzy_modify")
+async def fuzzy_modify_admin(request: Request, body: FuzzyModifyAdminRequest):
+    service = _admin_service(request)
+    scope = _scope_key(request)
+    try:
+        return await service.fuzzy_modify_admin(scope_key=scope, action=body.action, **(body.payload or {}))
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

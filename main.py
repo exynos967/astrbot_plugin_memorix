@@ -40,6 +40,7 @@ from .memorix.services import (
     SummaryService,
 )
 from .memorix.amemorix.services.feedback_service import FeedbackService
+from .memorix.amemorix.services.fuzzy_modify_service import FuzzyModifyService
 from .memorix.tools import _format_search_result_for_llm, build_memorix_tools
 from .memorix.utils.message_formatting import (
     format_astrbot_event_message,
@@ -84,7 +85,13 @@ class MemorixPlugin(Star):
             self.config,
             ingest_service=self.ingest_service,
         )
-        self.admin_service = AdminService(self.runtime_manager, feedback_service=self.feedback_service)
+        # 模糊修正服务：无后台 loop，按需触发 preview/execute/rollback/reconcile
+        self.fuzzy_modify_service = FuzzyModifyService(self.runtime_manager, self.config)
+        self.admin_service = AdminService(
+            self.runtime_manager,
+            feedback_service=self.feedback_service,
+            fuzzy_modify_service=self.fuzzy_modify_service,
+        )
         self.webui_page_bridge = PluginPageWebUIBridge(
             runtime_manager=self.runtime_manager,
             scope_resolver=self._resolve_dashboard_webui_scope,

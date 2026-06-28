@@ -77,9 +77,16 @@ class _TuningPluginAdapter:
 
 
 class AdminService:
-    def __init__(self, runtime_manager: ScopeRuntimeManager, *, feedback_service: Any = None):
+    def __init__(
+        self,
+        runtime_manager: ScopeRuntimeManager,
+        *,
+        feedback_service: Any = None,
+        fuzzy_modify_service: Any = None,
+    ):
         self.runtime_manager = runtime_manager
         self.feedback_service = feedback_service
+        self.fuzzy_modify_service = fuzzy_modify_service
         self._import_managers: dict[str, ImportTaskManager] = {}
         self._tuning_managers: dict[str, RetrievalTuningManager] = {}
 
@@ -388,6 +395,27 @@ class AdminService:
         if act in {"reconcile", "trigger_reconcile"}:
             return {"success": True, "result": await self.feedback_service.trigger_reconcile(scope_key)}
         return self._unsupported("feedback", act)
+
+    async def fuzzy_modify_admin(self, *, scope_key: str, action: str, **kwargs) -> Dict[str, Any]:
+        # 模糊修改服务调度入口，镜像 feedback_admin 的 ctx 获取与 action 归一化方式
+        if self.fuzzy_modify_service is None:
+            return self._err("模糊修改服务未启用")
+        runtime = await self.runtime_manager.get_runtime(scope_key)
+        ctx = runtime.context
+        act = self._action(action)
+        if act == "preview":
+            return await self.fuzzy_modify_service.preview(ctx, scope=scope_key, **kwargs)
+        if act == "execute":
+            return await self.fuzzy_modify_service.execute(ctx, **kwargs)
+        if act == "get":
+            return await self.fuzzy_modify_service.get(ctx, **kwargs)
+        if act == "list":
+            return await self.fuzzy_modify_service.list(ctx, scope=scope_key, **kwargs)
+        if act == "rollback":
+            return await self.fuzzy_modify_service.rollback(ctx, **kwargs)
+        if act == "reconcile":
+            return await self.fuzzy_modify_service.reconcile(ctx)
+        return self._unsupported("fuzzy_modify", act)
 
     async def v5_admin(self, *, scope_key: str, action: str, **kwargs) -> Dict[str, Any]:
         runtime = await self.runtime_manager.get_runtime(scope_key)

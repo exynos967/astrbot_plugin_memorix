@@ -876,6 +876,41 @@ class MemorixDeleteAdminTool(MemorixAdminToolBase):
         return await self._call_admin(context, **kwargs)
 
 
+@dataclass
+class MemorixFuzzyModifyAdminTool(MemorixAdminToolBase):
+    name: str = "memory_fuzzy_modify_admin"
+    description: str = "记忆模糊修正管理：基于自然语言请求预览/执行/回滚对记忆的模糊修改计划。"
+    admin_method: str = "fuzzy_modify_admin"
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "scope_key": {"type": "string", "description": "作用域 key"},
+                "action": {
+                    "type": "string",
+                    "enum": ["preview", "execute", "get", "list", "rollback", "reconcile"],
+                    "description": "操作类型",
+                },
+                "request_text": {"type": "string", "description": "preview: 用户的自然语言修改请求"},
+                "plan_id": {"type": "string", "description": "execute/get/rollback: 计划 id"},
+                "person_id": {"type": "string"},
+                "person_keyword": {"type": "string"},
+                "chat_id": {"type": "string"},
+                "limit": {"type": "integer"},
+                "confirmed": {"type": "boolean"},
+                "status": {"type": "string"},
+                "requested_by": {"type": "string"},
+                "reason": {"type": "string"},
+            },
+            "required": ["scope_key", "action"],
+            "additionalProperties": True,
+        }
+    )
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
+        return await self._call_admin(context, **kwargs)
+
+
 def build_memorix_tools(plugin: Any) -> list[FunctionTool[AstrAgentContext]]:
     return [
         MemorixSearchTool(plugin=plugin),
@@ -894,4 +929,5 @@ def build_memorix_tools(plugin: Any) -> list[FunctionTool[AstrAgentContext]]:
         MemorixFeedbackAdminTool(plugin=plugin),
         MemorixV5AdminTool(plugin=plugin),
         MemorixDeleteAdminTool(plugin=plugin),
+        MemorixFuzzyModifyAdminTool(plugin=plugin),
     ]

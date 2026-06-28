@@ -172,6 +172,7 @@ EXPECTED_TOOL_NAMES = [
     "memory_feedback_admin",
     "memory_v5_admin",
     "memory_delete_admin",
+    "memory_fuzzy_modify_admin",
 ]
 
 
