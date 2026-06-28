@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import pickle
 from pathlib import Path
 from typing import Any, Dict
@@ -46,6 +47,31 @@ def _safe_float(value: Any, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _dual_vector_ready(data_dir: Path, *, expected_dimension: int) -> bool:
+    """检测双池 ready manifest 是否就绪，并校验段落/图谱子池目录存在。"""
+    manifest_path = data_dir / "vectors" / "dual_ready.json"
+    if not manifest_path.exists():
+        return False
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("读取双池 ready manifest 失败: %s", exc)
+        return False
+    if not isinstance(payload, dict) or payload.get("status") != "ready":
+        return False
+    manifest_dimension = int(payload.get("dimension", 0) or 0)
+    if manifest_dimension not in {0, int(expected_dimension)}:
+        logger.warning(
+            "双池 ready manifest 维度不匹配: expected=%s, manifest=%s",
+            expected_dimension,
+            manifest_dimension,
+        )
+        return False
+    return (data_dir / "vectors" / "paragraph").exists() and (
+        data_dir / "vectors" / "graph"
+    ).exists()
 
 
 def _resolve_vector_dimension(settings: AppSettings, vectors_dir: Path) -> int:
@@ -136,6 +162,40 @@ def build_context(settings: AppSettings) -> AppContext:
         data_dir=vectors_dir,
     )
     vector_store.min_train_threshold = _safe_int(settings.get("embedding.min_train_threshold", 40), 40)
+
+    # 双池子存储：始终构造（即使最终降级为 single，对象存在以备升级与回滚安全）。
+    paragraph_vectors_dir = vectors_dir / "paragraph"
+    graph_vectors_dir = vectors_dir / "graph"
+    paragraph_vectors_dir.mkdir(parents=True, exist_ok=True)
+    graph_vectors_dir.mkdir(parents=True, exist_ok=True)
+    paragraph_vector_store = VectorStore(
+        dimension=vector_dim,
+        quantization_type=quantization_type,
+        data_dir=paragraph_vectors_dir,
+    )
+    paragraph_vector_store.min_train_threshold = vector_store.min_train_threshold
+    graph_vector_store = VectorStore(
+        dimension=vector_dim,
+        quantization_type=quantization_type,
+        data_dir=graph_vectors_dir,
+    )
+    graph_vector_store.min_train_threshold = vector_store.min_train_threshold
+
+    # 读取双池模式：dual 需 ready manifest 就绪，否则降级为 single（零行为变化保证）。
+    vector_pools_cfg = settings.get("retrieval.vector_pools", {}) or {}
+    vector_pool_mode = (
+        str(vector_pools_cfg.get("mode", "single") if isinstance(vector_pools_cfg, dict) else "single")
+        .strip()
+        .lower()
+    )
+    dual_vector_pools_ready = False
+    if vector_pool_mode == "dual":
+        if _dual_vector_ready(data_dir, expected_dimension=vector_dim):
+            dual_vector_pools_ready = True
+        else:
+            logger.warning(
+                "双池配置已开启，但 ready manifest 不可用，当前按单池检索与写入运行"
+            )
 
     matrix_format_map = {
         "csr": SparseMatrixFormat.CSR,
@@ -306,6 +366,9 @@ def build_context(settings: AppSettings) -> AppContext:
         llm_client=llm_client,
         data_dir=data_dir,
         config=settings.config,
+        paragraph_vector_store=paragraph_vector_store,
+        graph_vector_store=graph_vector_store,
+        _dual_vector_pools_ready=dual_vector_pools_ready,
     )
     # 本土化回填：segmentation_service 构造时 ctx 尚未成型，此处补齐引用，
     # 使 segment() 经 generate_text -> resolve_llm_client 走到 provider_bridge；

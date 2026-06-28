@@ -48,6 +48,10 @@ class AppContext:
     _request_dedup_cache: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     _request_dedup_inflight: Dict[str, asyncio.Future] = field(default_factory=dict)
     _request_dedup_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # 双池子存储：始终构造，ready 标志决定是否启用双池检索/写入路径。
+    paragraph_vector_store: Optional[VectorStore] = None
+    graph_vector_store: Optional[VectorStore] = None
+    _dual_vector_pools_ready: bool = False
 
     def get_config(self, key: str, default: Any = None) -> Any:
         current: Any = self.config
@@ -177,10 +181,23 @@ class AppContext:
             logger.warning("Failed to reinforce relation access: %s", exc)
 
     async def save_all(self) -> None:
+        if self._dual_vector_pools_ready:
+            # 双池就绪：并行存主向量池 + 段落池 + 图谱池 + 图结构。
+            await asyncio.gather(
+                asyncio.to_thread(self.vector_store.save),
+                asyncio.to_thread(self.graph_store.save),
+                asyncio.to_thread(self.paragraph_vector_store.save),
+                asyncio.to_thread(self.graph_vector_store.save),
+            )
+            return
         await asyncio.gather(
             asyncio.to_thread(self.vector_store.save),
             asyncio.to_thread(self.graph_store.save),
         )
+
+    def _dual_vector_pools_enabled(self) -> bool:
+        """双池检索/写入路径是否就绪可用。"""
+        return self._dual_vector_pools_ready
 
     async def close(self) -> None:
         try:

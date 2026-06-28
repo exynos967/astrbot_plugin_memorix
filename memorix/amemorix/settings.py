@@ -128,6 +128,23 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "normalize_score": True,
             "normalize_method": "minmax",
         },
+        # 双池检索配置：默认 single（与上游 dual 默认不同，vendored 选择零行为变化）。
+        # mode=dual 时需 ready manifest 就绪，否则降级为 single。
+        "vector_pools": {
+            "mode": "single",
+            "paragraph_top_k": 20,
+            "graph_top_k": 40,
+            "graph_expand_paragraph_k": 80,
+            "relation_expand_per_hit": 5,
+            "entity_expand_per_hit": 8,
+            "semantic_weight": 0.65,
+            "sparse_weight": 0.20,
+            "graph_weight": 0.15,
+        },
+    },
+    "runtime": {
+        # 双池就绪标志：bootstrap 在构造时根据 manifest 探测结果回填。
+        "vector_pools_ready": False,
     },
     "threshold": {
         "min_threshold": 0.3,

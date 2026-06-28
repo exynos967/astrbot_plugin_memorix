@@ -44,6 +44,22 @@ class _TuningPluginAdapter:
     def vector_store(self) -> Any:
         return self._ctx.vector_store
 
+    # 双池向量存储透传：ctx 暂未挂载时降级为 None，供内核检索调谐探测。
+    @property
+    def paragraph_vector_store(self) -> Any:
+        return getattr(self._ctx, "paragraph_vector_store", None)
+
+    @property
+    def graph_vector_store(self) -> Any:
+        return getattr(self._ctx, "graph_vector_store", None)
+
+    def _dual_vector_pools_enabled(self) -> bool:
+        # 双保险：ctx 暴露方法则调用，否则回退读 _dual_vector_pools_ready 字段。
+        checker = getattr(self._ctx, "_dual_vector_pools_enabled", None)
+        if callable(checker):
+            return bool(checker())
+        return bool(getattr(self._ctx, "_dual_vector_pools_ready", False))
+
     @property
     def graph_store(self) -> Any:
         return self._ctx.graph_store
