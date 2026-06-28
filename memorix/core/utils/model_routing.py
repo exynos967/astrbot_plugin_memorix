@@ -12,7 +12,7 @@ provider（``ctx.provider_bridge`` → ``AstrBotLLMClient``），降级到环境
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 from ...amemorix.common.logging import get_logger
 
@@ -52,6 +52,130 @@ class ResolvedLLMModel:
 def is_text_generation_task_name(task_name: str) -> bool:
     """判断任务名是否适合 A_Memorix 的普通文本生成调用。"""
     return str(task_name or "").strip().lower() not in NON_TEXT_GENERATION_TASK_NAMES
+
+
+# A_Memorix 文本生成任务优先级（与上游一致，供 pick_text_generation_task 默认偏好）。
+A_MEMORIX_TEXT_TASK_PRIORITY = (
+    "memory",
+    "utils",
+    "lpmm_entity_extract",
+    "lpmm_rdf_build",
+    "planner",
+    "replyer",
+    "learner",
+    "emoji",
+    "tool_use",
+)
+
+
+def task_has_model_list(task_config: Any) -> bool:
+    """判断任务配置是否有可用模型候选。"""
+
+    model_list = getattr(task_config, "model_list", [])
+    return any(str(model_name).strip() for model_name in (model_list or []))
+
+
+def get_text_generation_model_tasks(llm_api: Any, *, include_empty: bool = False) -> Dict[str, Any]:
+    """从宿主 LLM API 中读取 A_Memorix 可用的文本生成任务配置。
+
+    本土化兼容入口：插件单模型下 ``llm_api`` 为软导入桩（可能为 None 或 RecursiveStub），
+    非真实宿主服务时返回空 dict，由调用方决定降级（如 web_import_manager._select_model
+    抛 RuntimeError 或回退到 generate_text(ctx, prompt) 路径）。
+    """
+
+    if llm_api is None:
+        return {}
+    get_available_models = getattr(llm_api, "get_available_models", None)
+    if not callable(get_available_models):
+        return {}
+    try:
+        models = get_available_models() or {}
+    except Exception:  # pragma: no cover - 桩对象调用兜底
+        return {}
+    if not isinstance(models, dict):
+        return {}
+    return {
+        task_name: task_config
+        for task_name, task_config in models.items()
+        if is_text_generation_task_name(task_name)
+        and (include_empty or task_has_model_list(task_config))
+    }
+
+
+def _iter_preferred_task_names(
+    available_tasks: Dict[str, Any], preferred: Iterable[str]
+) -> Iterable[str]:
+    yielded: set[str] = set()
+    for task_name in preferred:
+        if task_name in available_tasks:
+            yielded.add(task_name)
+            yield task_name
+    for task_name in available_tasks:
+        if task_name not in yielded:
+            yield task_name
+
+
+def pick_text_generation_task(
+    available_tasks: Dict[str, Any],
+    preferred: Iterable[str] = A_MEMORIX_TEXT_TASK_PRIORITY,
+) -> Tuple[Optional[str], Optional[Any]]:
+    """按 A_Memorix 优先级选择文本生成任务。"""
+
+    for task_name in _iter_preferred_task_names(available_tasks, preferred):
+        task_config = available_tasks.get(task_name)
+        if task_has_model_list(task_config):
+            return task_name, task_config
+    return None, None
+
+
+def find_text_generation_task_for_model(
+    available_tasks: Dict[str, Any], model_name: str
+) -> Tuple[Optional[str], Optional[Any]]:
+    """按模型名查找其所属的文本生成任务。"""
+
+    normalized_model_name = str(model_name or "").strip()
+    if not normalized_model_name:
+        return None, None
+    for task_name, task_config in available_tasks.items():
+        model_list = getattr(task_config, "model_list", []) or []
+        task_models = [str(item).strip() for item in model_list if str(item).strip()]
+        if normalized_model_name in task_models:
+            return task_name, task_config
+    return None, None
+
+
+def build_single_model_task(model_name: str, template: Any) -> Any:
+    """基于现有任务模板构造只包含单个文本生成模型的任务配置。"""
+
+    return type(template)(
+        model_list=[model_name],
+        max_tokens=template.max_tokens,
+        temperature=template.temperature,
+        slow_threshold=template.slow_threshold,
+        selection_strategy=template.selection_strategy,
+        hard_timeout=template.hard_timeout,
+    )
+
+
+def resolve_text_generation_model_selector(
+    available_tasks: Dict[str, Any], selector: str
+) -> Tuple[Optional[str], Optional[Any], str]:
+    """解析任务名或具体模型名选择器。"""
+
+    normalized_selector = str(selector or "").strip()
+    if not normalized_selector or normalized_selector.lower() == "auto":
+        return None, None, ""
+
+    task_config = available_tasks.get(normalized_selector)
+    if task_has_model_list(task_config):
+        return normalized_selector, task_config, ""
+
+    task_name, task_config = find_text_generation_task_for_model(
+        available_tasks, normalized_selector
+    )
+    if task_name and task_config:
+        return task_name, build_single_model_task(normalized_selector, task_config), normalized_selector
+    return None, None, ""
 
 
 def resolve_llm_client(ctx: Any) -> Any:

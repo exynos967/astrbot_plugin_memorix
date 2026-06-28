@@ -20,6 +20,7 @@ from ..retrieval import (
     FusionConfig,
     RetrievalStrategy,
     SparseBM25Config,
+    VectorPoolsConfig,
 )
 from ..storage import GraphStore, MetadataStore, VectorStore
 
@@ -32,6 +33,8 @@ class PersonProfileService:
         metadata_store: MetadataStore,
         graph_store: Optional[GraphStore] = None,
         vector_store: Optional[VectorStore] = None,
+        paragraph_vector_store: Optional[VectorStore] = None,
+        graph_vector_store: Optional[VectorStore] = None,
         embedding_manager: Optional[EmbeddingAPIAdapter] = None,
         sparse_index: Any = None,
         plugin_config: Optional[dict] = None,
@@ -40,6 +43,9 @@ class PersonProfileService:
         self.metadata_store = metadata_store
         self.graph_store = graph_store
         self.vector_store = vector_store
+        # 双池检索：未提供时回退到 vector_store，保证降级安全
+        self.paragraph_vector_store = paragraph_vector_store
+        self.graph_vector_store = graph_vector_store
         self.embedding_manager = embedding_manager
         self.sparse_index = sparse_index
         self.plugin_config = plugin_config or {}
@@ -68,11 +74,30 @@ class PersonProfileService:
         try:
             sparse_cfg_raw = self._cfg("retrieval.sparse", {}) or {}
             fusion_cfg_raw = self._cfg("retrieval.fusion", {}) or {}
+            vector_pools_cfg_raw = self._cfg("retrieval.vector_pools", {}) or {}
             if not isinstance(sparse_cfg_raw, dict):
                 sparse_cfg_raw = {}
             if not isinstance(fusion_cfg_raw, dict):
                 fusion_cfg_raw = {}
+            if not isinstance(vector_pools_cfg_raw, dict):
+                vector_pools_cfg_raw = {}
 
+            # 双池就绪判定：runtime 配置显式指定优先，否则依赖两个独立向量池实例
+            runtime_cfg = self._cfg("runtime", {}) or {}
+            if isinstance(runtime_cfg, dict) and "vector_pools_ready" in runtime_cfg:
+                vector_pools_ready = bool(runtime_cfg.get("vector_pools_ready", False))
+            else:
+                vector_pools_ready = (
+                    self.paragraph_vector_store is not None
+                    and self.graph_vector_store is not None
+                )
+            # mode=dual 但双池未就绪时降级 single，避免运行期崩溃
+            configured_mode = str(vector_pools_cfg_raw.get("mode", "dual") or "dual").strip().lower()
+            if configured_mode == "dual" and not vector_pools_ready:
+                vector_pools_cfg_raw = dict(vector_pools_cfg_raw)
+                vector_pools_cfg_raw["mode"] = "single"
+
+            vector_pools_cfg = VectorPoolsConfig(**vector_pools_cfg_raw)
             config = DualPathRetrieverConfig(
                 top_k_paragraphs=int(self._cfg("retrieval.top_k_paragraphs", 20)),
                 top_k_relations=int(self._cfg("retrieval.top_k_relations", 10)),
@@ -86,9 +111,12 @@ class PersonProfileService:
                 debug=bool(self._cfg("advanced.debug", False)),
                 sparse=SparseBM25Config(**sparse_cfg_raw),
                 fusion=FusionConfig(**fusion_cfg_raw),
+                vector_pools=vector_pools_cfg,
             )
             return DualPathRetriever(
                 vector_store=self.vector_store,
+                paragraph_vector_store=self.paragraph_vector_store or self.vector_store,
+                graph_vector_store=self.graph_vector_store or self.vector_store,
                 graph_store=self.graph_store,
                 metadata_store=self.metadata_store,
                 embedding_manager=self.embedding_manager,

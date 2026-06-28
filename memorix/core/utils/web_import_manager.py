@@ -10,7 +10,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import asyncio
 import hashlib
 import json
@@ -56,6 +56,7 @@ from ..utils.model_routing import (
     pick_text_generation_task,
     resolve_text_generation_model_selector,
 )
+from ..utils.relation_write_service import RelationWriteService
 from ..utils.runtime_self_check import ensure_runtime_self_check
 from ..utils.time_parser import normalize_time_meta
 
@@ -455,6 +456,61 @@ class ImportTaskManager:
     def _cfg(self, key: str, default: Any) -> Any:
         return self.plugin.get_config(key, default)
 
+    def _vector_pool_mode(self) -> str:
+        mode = str(self._cfg("retrieval.vector_pools.mode", "dual") or "dual").strip().lower()
+        return mode if mode in {"single", "dual"} else "single"
+
+    def _dual_vector_pools_enabled(self) -> bool:
+        checker = getattr(self.plugin, "_dual_vector_pools_enabled", None)
+        if callable(checker):
+            return bool(checker())
+        return self._vector_pool_mode() == "dual"
+
+    def _paragraph_vector_store(self) -> Any:
+        if self._dual_vector_pools_enabled():
+            return getattr(self.plugin, "paragraph_vector_store", None) or getattr(self.plugin, "vector_store", None)
+        return getattr(self.plugin, "vector_store", None)
+
+    def _graph_vector_store(self) -> Any:
+        if self._dual_vector_pools_enabled():
+            return getattr(self.plugin, "graph_vector_store", None) or getattr(self.plugin, "vector_store", None)
+        return getattr(self.plugin, "vector_store", None)
+
+    def _graph_vector_id(self, target_type: str, hash_value: str) -> str:
+        token = str(hash_value or "").strip()
+        if not token or not self._dual_vector_pools_enabled():
+            return token
+        return f"{target_type}:{token}"
+
+    def _vector_stores_for_persistence(self) -> List[Any]:
+        stores: List[Any] = []
+        if self._dual_vector_pools_enabled():
+            stores.extend(
+                [
+                    getattr(self.plugin, "paragraph_vector_store", None),
+                    getattr(self.plugin, "graph_vector_store", None),
+                ]
+            )
+        else:
+            stores.append(getattr(self.plugin, "vector_store", None))
+
+        seen: Set[int] = set()
+        unique_stores: List[Any] = []
+        for store in stores:
+            if store is None:
+                continue
+            store_id = id(store)
+            if store_id in seen:
+                continue
+            seen.add(store_id)
+            unique_stores.append(store)
+        return unique_stores
+
+    def _save_runtime_stores_locked(self) -> None:
+        for store in self._vector_stores_for_persistence():
+            store.save()
+        self.plugin.graph_store.save()
+
     def _cfg_int(self, key: str, default: int) -> int:
         return _coerce_int(self._cfg(key, default), default)
 
@@ -551,7 +607,8 @@ class ImportTaskManager:
                 "detail": "invalid_paragraph_input",
             }
 
-        if self.plugin.vector_store is None or self.plugin.embedding_manager is None:
+        target_store = self._paragraph_vector_store()
+        if target_store is None or self.plugin.embedding_manager is None:
             if not self._allow_metadata_only_write():
                 raise RuntimeError("向量写入依赖未初始化")
             await self._enqueue_paragraph_backfill_locked(token, error="vector_runtime_components_missing")
@@ -575,7 +632,7 @@ class ImportTaskManager:
                 "detail": "embedding_degraded",
             }
 
-        if token in self.plugin.vector_store:
+        if token in target_store:
             return {
                 "success": True,
                 "vector_written": True,
@@ -588,7 +645,7 @@ class ImportTaskManager:
             emb = await self.plugin.embedding_manager.encode(text)
             if getattr(emb, "ndim", 1) == 1:
                 emb = emb.reshape(1, -1)
-            if token in self.plugin.vector_store:
+            if token in target_store:
                 return {
                     "success": True,
                     "vector_written": True,
@@ -596,7 +653,7 @@ class ImportTaskManager:
                     "warning": "",
                     "detail": "vector_already_exists_after_encode",
                 }
-            added_count = self.plugin.vector_store.add(emb, [token])
+            added_count = target_store.add(emb, [token])
             if added_count == 0:
                 return {
                     "success": True,
@@ -2358,11 +2415,12 @@ class ImportTaskManager:
 
     async def _reload_stores_after_external_migration(self) -> None:
         async with self._storage_lock:
-            try:
-                if self.plugin.vector_store and self.plugin.vector_store.has_data():
-                    self.plugin.vector_store.load()
-            except Exception as e:
-                logger.warning(f"迁移后重载 VectorStore 失败: {e}")
+            for store in self._vector_stores_for_persistence():
+                try:
+                    if store.has_data():
+                        store.load()
+                except Exception as e:
+                    logger.warning(f"迁移后重载 VectorStore 失败: {e}")
             try:
                 if self.plugin.graph_store and self.plugin.graph_store.has_data():
                     self.plugin.graph_store.load()
@@ -3006,8 +3064,7 @@ class ImportTaskManager:
 
         await self._set_file_state(task_id, file_record.file_id, "saving", "saving")
         async with self._storage_lock:
-            self.plugin.vector_store.save()
-            self.plugin.graph_store.save()
+            self._save_runtime_stores_locked()
 
         async with self._lock:
             task = self._tasks.get(task_id)
@@ -3151,8 +3208,7 @@ class ImportTaskManager:
 
         await self._set_file_state(task_id, file_record.file_id, "saving", "saving")
         async with self._storage_lock:
-            self.plugin.vector_store.save()
-            self.plugin.graph_store.save()
+            self._save_runtime_stores_locked()
 
         async with self._lock:
             task = self._tasks.get(task_id)
@@ -3551,13 +3607,17 @@ class ImportTaskManager:
         async with self._storage_lock:
             hash_value = self.plugin.metadata_store.add_entity(name=name_token, source_paragraph=source_paragraph)
             self.plugin.graph_store.add_nodes([name_token])
-            vector_exists = hash_value in self.plugin.vector_store
+            target_store = self._graph_vector_store()
+            vector_id = self._graph_vector_id("entity", hash_value)
+            vector_exists = target_store is not None and vector_id in target_store
         if not vector_exists:
             try:
+                if target_store is None:
+                    raise RuntimeError("graph_vector_store_missing")
                 if self._is_embedding_degraded():
                     raise RuntimeError("embedding_degraded")
                 emb = await self.plugin.embedding_manager.encode(name_token)
-                self.plugin.vector_store.add(emb.reshape(1, -1), [hash_value])
+                target_store.add(emb.reshape(1, -1), [vector_id])
             except Exception as exc:
                 if not self._allow_metadata_only_write():
                     raise
@@ -3598,28 +3658,32 @@ class ImportTaskManager:
                 except Exception:
                     pass
                 return rel_hash
-            vector_exists = rel_hash in self.plugin.vector_store
+            target_store = self._graph_vector_store()
+            vector_id = self._graph_vector_id("relation", rel_hash)
+            vector_exists = target_store is not None and vector_id in target_store
             self.plugin.metadata_store.set_relation_vector_state(rel_hash, "ready" if vector_exists else "pending")
 
         if vector_exists:
             return rel_hash
 
         try:
-            relation_service = getattr(self.plugin, "relation_write_service", None)
-            if relation_service is not None:
-                vector_text = relation_service.build_relation_vector_text(subject_token, predicate_token, object_token)
-            else:
-                vector_text = f"{subject_token} {predicate_token} {object_token}\n{subject_token}和{object_token}的关系是{predicate_token}"
+            if target_store is None:
+                raise RuntimeError("graph_vector_store_missing")
+            vector_text = RelationWriteService.build_relation_vector_text(
+                subject_token,
+                predicate_token,
+                object_token,
+            )
             emb = await self.plugin.embedding_manager.encode(vector_text)
-            if rel_hash in self.plugin.vector_store:
+            if vector_id in target_store:
                 await self._set_relation_vector_state_locked(rel_hash, "ready")
                 return rel_hash
-            added_count = self.plugin.vector_store.add(emb.reshape(1, -1), [rel_hash])
-            if added_count == 0 and rel_hash not in self.plugin.vector_store:
+            added_count = target_store.add(emb.reshape(1, -1), [vector_id])
+            if added_count == 0 and vector_id not in target_store:
                 raise RuntimeError("relation vector add returned 0 without existing vector")
             await self._set_relation_vector_state_locked(rel_hash, "ready")
         except ValueError as exc:
-            if rel_hash in self.plugin.vector_store:
+            if target_store is not None and vector_id in target_store:
                 await self._set_relation_vector_state_locked(rel_hash, "ready")
             else:
                 await self._set_relation_vector_state_locked(rel_hash, "failed", error=str(exc), bump_retry=True)

@@ -1465,10 +1465,19 @@ class RetrievalTuningManager:
         # 调优评估阶段关闭 PPR，规避 PageRank 线程计算偶发阻塞导致整轮卡死。
         _nested_set(merged, "retrieval.enable_ppr", False)
         merged["vector_store"] = getattr(self.plugin, "vector_store", None)
+        # 双池配置注入：paragraph / graph 各自独立向量池，缺省 None 走单池回退。
+        merged["paragraph_vector_store"] = getattr(self.plugin, "paragraph_vector_store", None)
+        merged["graph_vector_store"] = getattr(self.plugin, "graph_vector_store", None)
         merged["graph_store"] = getattr(self.plugin, "graph_store", None)
         merged["metadata_store"] = getattr(self.plugin, "metadata_store", None)
         merged["embedding_manager"] = getattr(self.plugin, "embedding_manager", None)
         merged["sparse_index"] = getattr(self.plugin, "sparse_index", None)
+        # 双池就绪探针：plugin 未实现 _dual_vector_pools_enabled 时安全降级为 False。
+        checker = getattr(self.plugin, "_dual_vector_pools_enabled", None)
+        vector_pools_ready = bool(checker()) if callable(checker) else False
+        runtime_cfg = merged.get("runtime")
+        merged["runtime"] = dict(runtime_cfg) if isinstance(runtime_cfg, dict) else {}
+        merged["runtime"]["vector_pools_ready"] = vector_pools_ready
         merged["plugin_instance"] = self.plugin
         return merged
 

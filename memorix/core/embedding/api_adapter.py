@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from typing import Any, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import httpx
 import numpy as np
@@ -340,6 +340,14 @@ class EmbeddingAPIAdapter:
         if self._dimension is not None:
             return int(self._dimension)
         return int(self.default_dimension)
+
+    def get_embedding_fingerprint(self, *, dimension: Optional[int] = None) -> Dict[str, Any]:
+        """embedding 指纹校验暂未启用（本期 vendored 无消费者），返回空 dict 降级。
+
+        上游用此指纹做向量池 embedding 一致性校验；vendored 重写为 AsyncOpenAI+httpx
+        无 provider，且 dual-pool 不依赖指纹，留接口空位待后续启用。
+        """
+        return {}
 
     def get_model_info(self) -> dict:
         avg_time = self._total_time / self._total_encoded if self._total_encoded > 0 else 0.0
