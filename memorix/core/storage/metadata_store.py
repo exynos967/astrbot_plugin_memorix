@@ -41,7 +41,7 @@ except Exception:
 logger = get_logger("A_Memorix.MetadataStore")
 
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 15
 RUNTIME_AUTO_MIGRATION_MIN_SCHEMA_VERSION = 9
 
 
@@ -207,6 +207,56 @@ class MetadataStore:
                     cursor.execute(sql)
                 except sqlite3.OperationalError as e:
                     logger.warning(f"Schema迁移失败 (memory_feedback_tasks.{col}): {e}")
+
+    def _ensure_paragraph_stale_relation_mark_columns(self, cursor: sqlite3.Cursor) -> None:
+        """补齐段落陈旧关系标记的来源追踪列。"""
+        cursor.execute("PRAGMA table_info(paragraph_stale_relation_marks)")
+        stale_mark_columns = {row[1] for row in cursor.fetchall()}
+        stale_mark_migrations = {
+            "source_type": "ALTER TABLE paragraph_stale_relation_marks ADD COLUMN source_type TEXT",
+            "source_id": "ALTER TABLE paragraph_stale_relation_marks ADD COLUMN source_id TEXT",
+            "source_operation_id": "ALTER TABLE paragraph_stale_relation_marks ADD COLUMN source_operation_id TEXT",
+        }
+        for col, sql in stale_mark_migrations.items():
+            if col not in stale_mark_columns:
+                try:
+                    cursor.execute(sql)
+                except sqlite3.OperationalError as e:
+                    logger.warning(f"Schema迁移失败 (paragraph_stale_relation_marks.{col}): {e}")
+
+    def _ensure_fuzzy_modify_plan_tables(self, cursor: sqlite3.Cursor) -> None:
+        """补齐模糊修改计划表，用于预览、确认、执行和追溯。"""
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS memory_fuzzy_modify_plans (
+                plan_id TEXT PRIMARY KEY,
+                request_text TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                target_person_id TEXT,
+                target_chat_id TEXT,
+                status TEXT NOT NULL,
+                confidence REAL DEFAULT 0,
+                plan_json TEXT NOT NULL,
+                preview_json TEXT,
+                execution_json TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                executed_at REAL,
+                requested_by TEXT,
+                reason TEXT
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_memory_fuzzy_modify_plans_created
+            ON memory_fuzzy_modify_plans(created_at DESC)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_memory_fuzzy_modify_plans_status_updated
+            ON memory_fuzzy_modify_plans(status, updated_at DESC)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_memory_fuzzy_modify_plans_target
+            ON memory_fuzzy_modify_plans(target_person_id, target_chat_id)
+        """)
 
     def close(self) -> None:
         """关闭数据库连接"""
@@ -631,6 +681,9 @@ class MetadataStore:
                 query_tool_id TEXT,
                 task_id INTEGER,
                 reason TEXT,
+                source_type TEXT,
+                source_id TEXT,
+                source_operation_id TEXT,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
                 PRIMARY KEY (paragraph_hash, relation_hash),
@@ -650,6 +703,11 @@ class MetadataStore:
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_paragraph_stale_relation_marks_updated
             ON paragraph_stale_relation_marks(updated_at DESC)
+        """)
+        self._ensure_paragraph_stale_relation_mark_columns(cursor)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_paragraph_stale_relation_marks_source
+            ON paragraph_stale_relation_marks(source_type, source_id, updated_at DESC)
         """)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS person_profile_refresh_queue (
@@ -742,6 +800,7 @@ class MetadataStore:
             CREATE INDEX IF NOT EXISTS idx_delete_operation_items_hash
             ON delete_operation_items(item_hash)
         """)
+        self._ensure_fuzzy_modify_plan_tables(cursor)
         self._create_performance_indexes()
         # 新版 schema 包含完整字段，直接写入版本信息
         cursor.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)", (SCHEMA_VERSION, datetime.now().timestamp()))
@@ -927,6 +986,9 @@ class MetadataStore:
                 query_tool_id TEXT,
                 task_id INTEGER,
                 reason TEXT,
+                source_type TEXT,
+                source_id TEXT,
+                source_operation_id TEXT,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
                 PRIMARY KEY (paragraph_hash, relation_hash),
@@ -946,6 +1008,11 @@ class MetadataStore:
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_paragraph_stale_relation_marks_updated
             ON paragraph_stale_relation_marks(updated_at DESC)
+        """)
+        self._ensure_paragraph_stale_relation_mark_columns(cursor)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_paragraph_stale_relation_marks_source
+            ON paragraph_stale_relation_marks(source_type, source_id, updated_at DESC)
         """)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS person_profile_refresh_queue (
@@ -1038,6 +1105,7 @@ class MetadataStore:
             CREATE INDEX IF NOT EXISTS idx_delete_operation_items_hash
             ON delete_operation_items(item_hash)
         """)
+        self._ensure_fuzzy_modify_plan_tables(cursor)
         
         # 检查paragraphs表是否有knowledge_type列
         cursor.execute("PRAGMA table_info(paragraphs)")
@@ -2932,6 +3000,47 @@ class MetadataStore:
             return self._row_to_dict(row, "relation")
         return None
 
+    def update_relation_metadata(
+        self,
+        relation_hash: str,
+        patch: Dict[str, Any],
+        *,
+        merge: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """更新关系 metadata，并返回更新后的 metadata。"""
+        hash_token = str(relation_hash or "").strip()
+        if not hash_token:
+            raise ValueError("relation_hash 不能为空")
+        if not isinstance(patch, dict):
+            raise TypeError("patch 必须是 dict")
+
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            SELECT metadata
+            FROM relations
+            WHERE hash = ?
+            LIMIT 1
+            """,
+            (hash_token,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+
+        metadata = self._decode_metadata(row["metadata"])
+        updated = self._deep_merge_dict(metadata, patch) if merge else dict(patch)
+        cursor.execute(
+            """
+            UPDATE relations
+            SET metadata = ?
+            WHERE hash = ?
+            """,
+            (pickle.dumps(updated), hash_token),
+        )
+        self._conn.commit()
+        return updated
+
     def get_relations_by_hashes(
         self,
         hash_values: Sequence[str],
@@ -3093,6 +3202,70 @@ class MetadataStore:
         """, (entity_hash,))
 
         return [self._row_to_dict(row, "paragraph") for row in cursor.fetchall()]
+
+    def get_paragraph_hashes_by_entity_hashes(
+        self,
+        entity_hashes: Sequence[str],
+    ) -> Dict[str, List[str]]:
+        """批量获取实体支撑段落 hash，返回 entity_hash -> paragraph_hashes。"""
+        normalized = self._normalize_hash_sequence(entity_hashes)
+        if not normalized:
+            return {}
+
+        grouped: Dict[str, List[str]] = {hash_value: [] for hash_value in normalized}
+        cursor = self._conn.cursor()
+        for batch in self._iter_sql_batches(normalized):
+            placeholders = ",".join(["?"] * len(batch))
+            cursor.execute(
+                f"""
+                SELECT pe.entity_hash, pe.paragraph_hash
+                FROM paragraph_entities pe
+                JOIN paragraphs p ON p.hash = pe.paragraph_hash
+                WHERE pe.entity_hash IN ({placeholders})
+                  AND (p.is_deleted IS NULL OR p.is_deleted = 0)
+                ORDER BY pe.entity_hash ASC, p.updated_at DESC, p.created_at DESC, pe.paragraph_hash ASC
+                """,
+                tuple(batch),
+            )
+            for row in cursor.fetchall():
+                entity_hash = str(row["entity_hash"] or "").strip()
+                paragraph_hash = str(row["paragraph_hash"] or "").strip()
+                if not entity_hash or not paragraph_hash:
+                    continue
+                if paragraph_hash not in grouped.setdefault(entity_hash, []):
+                    grouped[entity_hash].append(paragraph_hash)
+        return grouped
+
+    def get_paragraphs_by_entity_hashes(
+        self,
+        entity_hashes: Sequence[str],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """批量获取实体支撑段落，返回 entity_hash -> paragraphs。"""
+        normalized = self._normalize_hash_sequence(entity_hashes)
+        if not normalized:
+            return {}
+
+        grouped: Dict[str, List[Dict[str, Any]]] = {hash_value: [] for hash_value in normalized}
+        cursor = self._conn.cursor()
+        for batch in self._iter_sql_batches(normalized):
+            placeholders = ",".join(["?"] * len(batch))
+            cursor.execute(
+                f"""
+                SELECT pe.entity_hash, p.*
+                FROM paragraph_entities pe
+                JOIN paragraphs p ON p.hash = pe.paragraph_hash
+                WHERE pe.entity_hash IN ({placeholders})
+                  AND (p.is_deleted IS NULL OR p.is_deleted = 0)
+                ORDER BY pe.entity_hash ASC, p.updated_at DESC, p.created_at DESC, pe.paragraph_hash ASC
+                """,
+                tuple(batch),
+            )
+            for row in cursor.fetchall():
+                entity_hash = str(row["entity_hash"] or "").strip()
+                if not entity_hash:
+                    continue
+                grouped.setdefault(entity_hash, []).append(self._row_to_dict(row, "paragraph"))
+        return grouped
 
     def get_relations(
         self,
@@ -3690,6 +3863,27 @@ class MetadataStore:
         except Exception:
             return default
 
+    @staticmethod
+    def _decode_metadata(value: Any) -> Dict[str, Any]:
+        if value in {None, ""}:
+            return {}
+        if isinstance(value, dict):
+            return dict(value)
+        decoded = pickle.loads(value)
+        if not isinstance(decoded, dict):
+            raise TypeError("metadata 字段必须解码为 dict")
+        return decoded
+
+    @classmethod
+    def _deep_merge_dict(cls, base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
+        merged = dict(base)
+        for key, value in patch.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key] = cls._deep_merge_dict(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+
     def list_external_memory_refs_by_paragraphs(self, paragraph_hashes: List[str]) -> List[Dict[str, Any]]:
         hashes = [str(item or "").strip() for item in (paragraph_hashes or []) if str(item or "").strip()]
         if not hashes:
@@ -3710,20 +3904,6 @@ class MetadataStore:
             payload = dict(row)
             payload["metadata"] = self._json_loads(payload.get("metadata_json"), {})
             items.append(payload)
-        return items
-
-    def delete_external_memory_refs_by_paragraphs(self, paragraph_hashes: List[str]) -> List[Dict[str, Any]]:
-        items = self.list_external_memory_refs_by_paragraphs(paragraph_hashes)
-        hashes = [str(item or "").strip() for item in (paragraph_hashes or []) if str(item or "").strip()]
-        if not hashes:
-            return items
-        placeholders = ",".join(["?"] * len(hashes))
-        cursor = self._conn.cursor()
-        cursor.execute(
-            f"DELETE FROM external_memory_refs WHERE paragraph_hash IN ({placeholders})",
-            tuple(hashes),
-        )
-        self._conn.commit()
         return items
 
     def soft_delete_paragraphs(self, paragraph_hashes: List[str]) -> Dict[str, Any]:
@@ -3758,6 +3938,20 @@ class MetadataStore:
             "paragraph_rows": paragraph_rows,
             "deleted_external_refs": deleted_external_refs,
         }
+
+    def delete_external_memory_refs_by_paragraphs(self, paragraph_hashes: List[str]) -> List[Dict[str, Any]]:
+        items = self.list_external_memory_refs_by_paragraphs(paragraph_hashes)
+        hashes = [str(item or "").strip() for item in (paragraph_hashes or []) if str(item or "").strip()]
+        if not hashes:
+            return items
+        placeholders = ",".join(["?"] * len(hashes))
+        cursor = self._conn.cursor()
+        cursor.execute(
+            f"DELETE FROM external_memory_refs WHERE paragraph_hash IN ({placeholders})",
+            tuple(hashes),
+        )
+        self._conn.commit()
+        return items
 
     def restore_external_memory_refs(self, refs: List[Dict[str, Any]]) -> int:
         count = 0
@@ -3834,6 +4028,189 @@ class MetadataStore:
             ),
         )
         self._conn.commit()
+        return payload
+
+    def create_fuzzy_modify_plan(
+        self,
+        *,
+        request_text: str,
+        scope: str,
+        plan: Dict[str, Any],
+        preview: Optional[Dict[str, Any]] = None,
+        target_person_id: str = "",
+        target_chat_id: str = "",
+        status: str = "awaiting_confirmation",
+        confidence: float = 0.0,
+        requested_by: str = "",
+        reason: str = "",
+        plan_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        op_id = str(plan_id or f"fuzzy_{uuid.uuid4().hex}").strip()
+        now = datetime.now().timestamp()
+        payload = {
+            "plan_id": op_id,
+            "request_text": str(request_text or "").strip(),
+            "scope": str(scope or "").strip(),
+            "target_person_id": str(target_person_id or "").strip(),
+            "target_chat_id": str(target_chat_id or "").strip(),
+            "status": str(status or "awaiting_confirmation").strip(),
+            "confidence": float(confidence or 0.0),
+            "plan": plan or {},
+            "preview": preview or {},
+            "execution": {},
+            "created_at": now,
+            "updated_at": now,
+            "executed_at": None,
+            "requested_by": str(requested_by or "").strip(),
+            "reason": str(reason or "").strip(),
+        }
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO memory_fuzzy_modify_plans (
+                plan_id, request_text, scope, target_person_id, target_chat_id,
+                status, confidence, plan_json, preview_json, execution_json,
+                created_at, updated_at, executed_at, requested_by, reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+            """,
+            (
+                payload["plan_id"],
+                payload["request_text"],
+                payload["scope"],
+                payload["target_person_id"] or None,
+                payload["target_chat_id"] or None,
+                payload["status"],
+                payload["confidence"],
+                self._json_dumps(payload["plan"]),
+                self._json_dumps(payload["preview"]),
+                self._json_dumps(payload["execution"]),
+                payload["created_at"],
+                payload["updated_at"],
+                payload["requested_by"] or None,
+                payload["reason"] or None,
+            ),
+        )
+        self._conn.commit()
+        return self.get_fuzzy_modify_plan(op_id) or payload
+
+    def update_fuzzy_modify_plan(
+        self,
+        plan_id: str,
+        *,
+        status: Optional[str] = None,
+        plan: Optional[Dict[str, Any]] = None,
+        preview: Optional[Dict[str, Any]] = None,
+        execution: Optional[Dict[str, Any]] = None,
+        confidence: Optional[float] = None,
+        executed_at: Optional[float] = None,
+        reason: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        token = str(plan_id or "").strip()
+        if not token:
+            return None
+
+        assignments: List[str] = ["updated_at = ?"]
+        params: List[Any] = [datetime.now().timestamp()]
+        if status is not None:
+            assignments.append("status = ?")
+            params.append(str(status or "").strip())
+        if plan is not None:
+            assignments.append("plan_json = ?")
+            params.append(self._json_dumps(plan))
+        if preview is not None:
+            assignments.append("preview_json = ?")
+            params.append(self._json_dumps(preview))
+        if execution is not None:
+            assignments.append("execution_json = ?")
+            params.append(self._json_dumps(execution))
+        if confidence is not None:
+            assignments.append("confidence = ?")
+            params.append(float(confidence))
+        if executed_at is not None:
+            assignments.append("executed_at = ?")
+            params.append(float(executed_at))
+        if reason is not None:
+            assignments.append("reason = ?")
+            params.append(str(reason or "").strip() or None)
+        params.append(token)
+
+        cursor = self._conn.cursor()
+        cursor.execute(
+            f"""
+            UPDATE memory_fuzzy_modify_plans
+            SET {", ".join(assignments)}
+            WHERE plan_id = ?
+            """,
+            tuple(params),
+        )
+        self._conn.commit()
+        if cursor.rowcount <= 0:
+            return None
+        return self.get_fuzzy_modify_plan(token)
+
+    def list_fuzzy_modify_plans(
+        self,
+        *,
+        limit: int = 50,
+        statuses: Optional[Sequence[str]] = None,
+        scope: str = "",
+    ) -> List[Dict[str, Any]]:
+        normalized_statuses = [
+            str(item or "").strip()
+            for item in (statuses or [])
+            if str(item or "").strip()
+        ]
+        where: List[str] = []
+        params: List[Any] = []
+        if normalized_statuses:
+            placeholders = ",".join(["?"] * len(normalized_statuses))
+            where.append(f"status IN ({placeholders})")
+            params.extend(normalized_statuses)
+        scope_token = str(scope or "").strip()
+        if scope_token:
+            where.append("scope = ?")
+            params.append(scope_token)
+        params.append(max(1, int(limit or 50)))
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+        cursor = self._conn.cursor()
+        cursor.execute(
+            f"""
+            SELECT *
+            FROM memory_fuzzy_modify_plans
+            {where_sql}
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            tuple(params),
+        )
+        return [self._fuzzy_modify_plan_row_to_dict(row) for row in cursor.fetchall()]
+
+    def get_fuzzy_modify_plan(self, plan_id: str) -> Optional[Dict[str, Any]]:
+        token = str(plan_id or "").strip()
+        if not token:
+            return None
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            SELECT *
+            FROM memory_fuzzy_modify_plans
+            WHERE plan_id = ?
+            LIMIT 1
+            """,
+            (token,),
+        )
+        row = cursor.fetchone()
+        return self._fuzzy_modify_plan_row_to_dict(row) if row is not None else None
+
+    def _fuzzy_modify_plan_row_to_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
+        payload = dict(row)
+        payload["plan"] = self._json_loads(payload.pop("plan_json", None), {})
+        payload["preview"] = self._json_loads(payload.pop("preview_json", None), {})
+        payload["execution"] = self._json_loads(payload.pop("execution_json", None), {})
+        payload["target_person_id"] = str(payload.get("target_person_id") or "")
+        payload["target_chat_id"] = str(payload.get("target_chat_id") or "")
+        payload["requested_by"] = str(payload.get("requested_by") or "")
+        payload["reason"] = str(payload.get("reason") or "")
         return payload
 
     def create_delete_operation(
@@ -3941,6 +4318,51 @@ class MetadataStore:
         )
         self._conn.commit()
         return cursor.rowcount > 0
+
+    def update_paragraph_metadata(
+        self,
+        paragraph_hash: str,
+        patch: Dict[str, Any],
+        *,
+        merge: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """更新段落 metadata，并返回更新后的 metadata。"""
+        hash_token = str(paragraph_hash or "").strip()
+        if not hash_token:
+            raise ValueError("paragraph_hash 不能为空")
+        if not isinstance(patch, dict):
+            raise TypeError("patch 必须是 dict")
+
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            SELECT metadata, is_deleted
+            FROM paragraphs
+            WHERE hash = ?
+            LIMIT 1
+            """,
+            (hash_token,),
+        )
+        row = cursor.fetchone()
+        if row is None or bool(row["is_deleted"]):
+            return None
+
+        metadata = self._decode_metadata(row["metadata"])
+        updated = self._deep_merge_dict(metadata, patch) if merge else dict(patch)
+        cursor.execute(
+            """
+            UPDATE paragraphs
+            SET metadata = ?, updated_at = ?
+            WHERE hash = ?
+            """,
+            (pickle.dumps(updated), datetime.now().timestamp(), hash_token),
+        )
+        self._conn.commit()
+        self._enqueue_episode_source_rebuilds(
+            self._get_sources_for_paragraph_hashes([hash_token], include_deleted=True),
+            reason="paragraph_metadata_updated",
+        )
+        return updated
 
     def list_delete_operations(self, *, limit: int = 50, mode: str = "") -> List[Dict[str, Any]]:
         cursor = self._conn.cursor()
@@ -6915,6 +7337,9 @@ class MetadataStore:
         query_tool_id: str = "",
         task_id: Optional[int] = None,
         reason: str = "",
+        source_type: str = "",
+        source_id: str = "",
+        source_operation_id: str = "",
     ) -> Optional[Dict[str, Any]]:
         paragraph_token = str(paragraph_hash or "").strip()
         relation_token = str(relation_hash or "").strip()
@@ -6926,12 +7351,16 @@ class MetadataStore:
         cursor.execute(
             """
             INSERT INTO paragraph_stale_relation_marks (
-                paragraph_hash, relation_hash, query_tool_id, task_id, reason, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                paragraph_hash, relation_hash, query_tool_id, task_id, reason,
+                source_type, source_id, source_operation_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(paragraph_hash, relation_hash) DO UPDATE SET
                 query_tool_id = excluded.query_tool_id,
                 task_id = excluded.task_id,
                 reason = excluded.reason,
+                source_type = excluded.source_type,
+                source_id = excluded.source_id,
+                source_operation_id = excluded.source_operation_id,
                 updated_at = excluded.updated_at
             """,
             (
@@ -6940,19 +7369,41 @@ class MetadataStore:
                 str(query_tool_id or "").strip() or None,
                 int(task_id) if int(task_id or 0) > 0 else None,
                 str(reason or "").strip() or None,
+                str(source_type or "").strip() or None,
+                str(source_id or "").strip() or None,
+                str(source_operation_id or "").strip() or None,
                 now,
                 now,
             ),
         )
         self._conn.commit()
-        return {
-            "paragraph_hash": paragraph_token,
-            "relation_hash": relation_token,
-            "query_tool_id": str(query_tool_id or "").strip(),
-            "task_id": int(task_id or 0) if int(task_id or 0) > 0 else None,
-            "reason": str(reason or "").strip(),
-            "updated_at": now,
-        }
+        return self.get_paragraph_stale_relation_mark(
+            paragraph_hash=paragraph_token,
+            relation_hash=relation_token,
+        )
+
+    def get_paragraph_stale_relation_mark(
+        self,
+        *,
+        paragraph_hash: str,
+        relation_hash: str,
+    ) -> Optional[Dict[str, Any]]:
+        paragraph_token = str(paragraph_hash or "").strip()
+        relation_token = str(relation_hash or "").strip()
+        if not paragraph_token or not relation_token:
+            return None
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            SELECT paragraph_hash, relation_hash, query_tool_id, task_id, reason,
+                   source_type, source_id, source_operation_id, created_at, updated_at
+            FROM paragraph_stale_relation_marks
+            WHERE paragraph_hash = ? AND relation_hash = ?
+            """,
+            (paragraph_token, relation_token),
+        )
+        row = cursor.fetchone()
+        return self._paragraph_stale_relation_mark_row_to_dict(row)
 
     def get_paragraph_stale_relation_marks_batch(
         self,
@@ -6973,7 +7424,8 @@ class MetadataStore:
         cursor = self._conn.cursor()
         cursor.execute(
             f"""
-            SELECT paragraph_hash, relation_hash, query_tool_id, task_id, reason, created_at, updated_at
+            SELECT paragraph_hash, relation_hash, query_tool_id, task_id, reason,
+                   source_type, source_id, source_operation_id, created_at, updated_at
             FROM paragraph_stale_relation_marks
             WHERE paragraph_hash IN ({placeholders})
             ORDER BY updated_at DESC, paragraph_hash ASC, relation_hash ASC
@@ -6982,15 +7434,9 @@ class MetadataStore:
         )
         grouped: Dict[str, List[Dict[str, Any]]] = {token: [] for token in normalized}
         for row in cursor.fetchall():
-            payload = {
-                "paragraph_hash": str(row["paragraph_hash"] or "").strip(),
-                "relation_hash": str(row["relation_hash"] or "").strip(),
-                "query_tool_id": str(row["query_tool_id"] or "").strip(),
-                "task_id": int(row["task_id"] or 0) if row["task_id"] is not None else None,
-                "reason": str(row["reason"] or "").strip(),
-                "created_at": self._as_optional_float(row["created_at"]),
-                "updated_at": self._as_optional_float(row["updated_at"]),
-            }
+            payload = self._paragraph_stale_relation_mark_row_to_dict(row)
+            if payload is None:
+                continue
             grouped.setdefault(payload["paragraph_hash"], []).append(payload)
         return grouped
 
@@ -7032,6 +7478,146 @@ class MetadataStore:
             deleted += int(cursor.rowcount or 0)
         self._conn.commit()
         return deleted
+
+    def rollback_paragraph_stale_relation_mark(
+        self,
+        *,
+        paragraph_hash: str,
+        relation_hash: str,
+        expected_source_type: str,
+        expected_source_id: str,
+        expected_source_operation_id: str,
+        previous_mark: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        paragraph_token = str(paragraph_hash or "").strip()
+        relation_token = str(relation_hash or "").strip()
+        expected_type = str(expected_source_type or "").strip()
+        expected_id = str(expected_source_id or "").strip()
+        expected_operation_id = str(expected_source_operation_id or "").strip()
+        if not paragraph_token or not relation_token:
+            return {
+                "success": False,
+                "action": "invalid_target",
+                "paragraph_hash": paragraph_token,
+                "relation_hash": relation_token,
+                "error": "paragraph_hash 和 relation_hash 不能为空",
+            }
+
+        current = self.get_paragraph_stale_relation_mark(
+            paragraph_hash=paragraph_token,
+            relation_hash=relation_token,
+        )
+        if current is None:
+            return {
+                "success": True,
+                "action": "already_missing",
+                "paragraph_hash": paragraph_token,
+                "relation_hash": relation_token,
+            }
+
+        current_source = (
+            str(current.get("source_type", "") or "").strip(),
+            str(current.get("source_id", "") or "").strip(),
+            str(current.get("source_operation_id", "") or "").strip(),
+        )
+        expected_source = (expected_type, expected_id, expected_operation_id)
+        if current_source != expected_source:
+            return {
+                "success": True,
+                "action": "skipped_due_to_source_mismatch",
+                "paragraph_hash": paragraph_token,
+                "relation_hash": relation_token,
+                "current": current,
+                "expected_source": {
+                    "source_type": expected_type,
+                    "source_id": expected_id,
+                    "source_operation_id": expected_operation_id,
+                },
+            }
+
+        before = current
+        if isinstance(previous_mark, dict):
+            restored = self._restore_paragraph_stale_relation_mark(previous_mark)
+            return {
+                "success": restored is not None,
+                "action": "restored" if restored is not None else "restore_failed",
+                "paragraph_hash": paragraph_token,
+                "relation_hash": relation_token,
+                "before": before,
+                "after": restored,
+            }
+
+        deleted = self.delete_paragraph_stale_relation_marks([(paragraph_token, relation_token)])
+        return {
+            "success": True,
+            "action": "deleted" if deleted > 0 else "already_missing",
+            "paragraph_hash": paragraph_token,
+            "relation_hash": relation_token,
+            "before": before,
+        }
+
+    def _restore_paragraph_stale_relation_mark(self, snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        paragraph_token = str(snapshot.get("paragraph_hash", "") or "").strip()
+        relation_token = str(snapshot.get("relation_hash", "") or "").strip()
+        if not paragraph_token or not relation_token:
+            return None
+
+        created_at = self._as_optional_float(snapshot.get("created_at")) or datetime.now().timestamp()
+        updated_at = self._as_optional_float(snapshot.get("updated_at")) or created_at
+        task_id_raw = snapshot.get("task_id")
+        task_id = int(task_id_raw) if int(task_id_raw or 0) > 0 else None
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO paragraph_stale_relation_marks (
+                paragraph_hash, relation_hash, query_tool_id, task_id, reason,
+                source_type, source_id, source_operation_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(paragraph_hash, relation_hash) DO UPDATE SET
+                query_tool_id = excluded.query_tool_id,
+                task_id = excluded.task_id,
+                reason = excluded.reason,
+                source_type = excluded.source_type,
+                source_id = excluded.source_id,
+                source_operation_id = excluded.source_operation_id,
+                created_at = excluded.created_at,
+                updated_at = excluded.updated_at
+            """,
+            (
+                paragraph_token,
+                relation_token,
+                str(snapshot.get("query_tool_id", "") or "").strip() or None,
+                task_id,
+                str(snapshot.get("reason", "") or "").strip() or None,
+                str(snapshot.get("source_type", "") or "").strip() or None,
+                str(snapshot.get("source_id", "") or "").strip() or None,
+                str(snapshot.get("source_operation_id", "") or "").strip() or None,
+                created_at,
+                updated_at,
+            ),
+        )
+        self._conn.commit()
+        return self.get_paragraph_stale_relation_mark(
+            paragraph_hash=paragraph_token,
+            relation_hash=relation_token,
+        )
+
+    @staticmethod
+    def _paragraph_stale_relation_mark_row_to_dict(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
+        if row is None:
+            return None
+        payload = dict(row)
+        payload["paragraph_hash"] = str(payload.get("paragraph_hash", "") or "").strip()
+        payload["relation_hash"] = str(payload.get("relation_hash", "") or "").strip()
+        payload["query_tool_id"] = str(payload.get("query_tool_id", "") or "").strip()
+        payload["task_id"] = int(payload.get("task_id") or 0) if payload.get("task_id") is not None else None
+        payload["reason"] = str(payload.get("reason", "") or "").strip()
+        payload["source_type"] = str(payload.get("source_type", "") or "").strip()
+        payload["source_id"] = str(payload.get("source_id", "") or "").strip()
+        payload["source_operation_id"] = str(payload.get("source_operation_id", "") or "").strip()
+        payload["created_at"] = MetadataStore._as_optional_float(payload.get("created_at"))
+        payload["updated_at"] = MetadataStore._as_optional_float(payload.get("updated_at"))
+        return payload
 
     @staticmethod
     def _person_profile_refresh_row_to_dict(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
@@ -7919,10 +8505,6 @@ class MetadataStore:
         if self.data_dir is None:
             return False
         return (self.data_dir / self.db_name).exists()
-
-    # ------------------------------------------------------------------
-    # 插件本地 schema（开闭原则：上游 _migrate_schema 不动，插件表在此收口）
-    # ------------------------------------------------------------------
 
     def _ensure_plugin_local_schema(self) -> None:
         """插件本地表与列补丁。
