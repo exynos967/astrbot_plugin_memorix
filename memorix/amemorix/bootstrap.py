@@ -29,7 +29,6 @@ from ..core.utils.relation_write_service import RelationWriteService
 
 from .common.logging import get_logger
 from .context import AppContext
-from .llm_client import LLMClient
 from .settings import AppSettings, resolve_openapi_endpoint_config
 
 logger = get_logger("A_Memorix.Bootstrap")
@@ -181,10 +180,10 @@ def build_context(settings: AppSettings) -> AppContext:
     )
     graph_vector_store.min_train_threshold = vector_store.min_train_threshold
 
-    # 读取双池模式：dual 需 ready manifest 就绪，否则降级为 single（零行为变化保证）。
+    # 读取双池模式：默认 dual；ready manifest 缺失时降级为 single。
     vector_pools_cfg = settings.get("retrieval.vector_pools", {}) or {}
     vector_pool_mode = (
-        str(vector_pools_cfg.get("mode", "single") if isinstance(vector_pools_cfg, dict) else "single")
+        str(vector_pools_cfg.get("mode", "dual") if isinstance(vector_pools_cfg, dict) else "dual")
         .strip()
         .lower()
     )
@@ -296,19 +295,6 @@ def build_context(settings: AppSettings) -> AppContext:
         )
     )
 
-    llm_endpoint_cfg = resolve_openapi_endpoint_config(settings.config, section="embedding")
-    chat_model = str(
-        llm_endpoint_cfg.get("chat_model", "")
-        or "gpt-4o-mini"
-    )
-    llm_client = LLMClient(
-        base_url=str(llm_endpoint_cfg.get("base_url", "")),
-        api_key=str(llm_endpoint_cfg.get("api_key", "")),
-        model=chat_model,
-        timeout_seconds=_safe_float(llm_endpoint_cfg.get("timeout_seconds", 60), 60.0),
-        max_retries=_safe_int(llm_endpoint_cfg.get("max_retries", 3), 3),
-    )
-
     relation_write_service = RelationWriteService(
         metadata_store=metadata_store,
         graph_store=graph_store,
@@ -324,7 +310,7 @@ def build_context(settings: AppSettings) -> AppContext:
     service_config: Dict[str, Any] = dict(settings.config)
     service_config.update(
         {
-            "llm_client": llm_client,
+            "llm_client": None,
             "paragraph_vector_service": paragraph_vector_service,
             "relation_write_service": relation_write_service,
         }
@@ -363,7 +349,7 @@ def build_context(settings: AppSettings) -> AppContext:
         relation_write_service=relation_write_service,
         episode_service=episode_service,
         episode_retrieval_service=episode_retrieval_service,
-        llm_client=llm_client,
+        llm_client=None,
         data_dir=data_dir,
         config=settings.config,
         paragraph_vector_store=paragraph_vector_store,

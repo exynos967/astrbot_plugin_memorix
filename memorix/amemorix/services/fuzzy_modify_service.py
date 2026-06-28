@@ -580,7 +580,7 @@ class FuzzyModifyService:
 
     @classmethod
     def _fuzzy_modify_cfg_max_targets(cls, ctx: Any) -> int:
-        return max(1, int(cls._fuzzy_modify_cfg(ctx, "max_targets", 10) or 10))
+        return max(1, int(cls._fuzzy_modify_cfg(ctx, "max_targets", 5) or 5))
 
     @classmethod
     def _fuzzy_modify_cfg_allow_global_scope(cls, ctx: Any) -> bool:
@@ -1527,7 +1527,7 @@ class FuzzyModifyService:
                 warnings.append(f"entity_write_failed: {exc}")
 
         relation_hashes: List[str] = []
-        write_relation_vectors = bool(ctx.get_config("retrieval.relation_vectorization.enabled", True))
+        write_relation_vectors = bool(ctx.get_config("retrieval.relation_vectorization.enabled", False))
         relation_service = getattr(ctx, "relation_write_service", None)
         if relation_service is not None:
             for row in relation_rows:

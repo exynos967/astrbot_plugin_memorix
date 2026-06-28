@@ -27,6 +27,8 @@ except Exception:  # pragma: no cover - only used by lightweight unit-test stubs
             return data
 
 from .memorix.adapters.astrbot_event_adapter import AstrbotEventAdapter, MemorixEvent
+from .memorix.amemorix.services.feedback_service import FeedbackService
+from .memorix.amemorix.services.fuzzy_modify_service import FuzzyModifyService
 from .memorix.app_context import ScopeRuntimeManager
 from .memorix.scope_router import ScopeRouter
 from .memorix.services import (
@@ -39,8 +41,6 @@ from .memorix.services import (
     QueryService,
     SummaryService,
 )
-from .memorix.amemorix.services.feedback_service import FeedbackService
-from .memorix.amemorix.services.fuzzy_modify_service import FuzzyModifyService
 from .memorix.tools import _format_search_result_for_llm, build_memorix_tools
 from .memorix.utils.message_formatting import (
     format_astrbot_event_message,

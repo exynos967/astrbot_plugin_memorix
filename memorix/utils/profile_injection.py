@@ -59,7 +59,7 @@ def build_profile_injection_text(
     recent_limit: int = 2,
     uncertain_fallback_limit: int = 1,
 ) -> str:
-    """Build a compact injection view from MaiBot-style structured profile text.
+    """Build a compact injection view from structured profile text.
 
     Unstructured profile text is returned unchanged for compatibility with the
     current AstrBot Memorix profile generator.

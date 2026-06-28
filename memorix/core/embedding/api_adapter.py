@@ -1,14 +1,13 @@
 """
 OpenAI-compatible embedding adapter.
 
-This adapter keeps the old EmbeddingAPIAdapter interface while removing MaiBot
+This adapter keeps the old EmbeddingAPIAdapter interface while removing host
 runtime dependencies.
 """
 
 from __future__ import annotations
 
 import asyncio
-import os
 import time
 from typing import Any, Dict, List, Optional, Union
 
@@ -19,14 +18,6 @@ from openai import AsyncOpenAI
 from ...amemorix.common.logging import get_logger
 
 logger = get_logger("A_Memorix.EmbeddingAPIAdapter")
-
-
-def _first_env(*keys: str) -> str:
-    for key in keys:
-        value = str(os.getenv(key, "") or "").strip()
-        if value:
-            return value
-    return ""
 
 
 def _normalize_openai_base_url(raw: str) -> str:
@@ -107,22 +98,14 @@ class EmbeddingAPIAdapter:
         self.timeout_seconds = float(timeout_seconds or 30.0)
         self.max_retries = max(1, int(max_retries))
 
-        self.base_url = _normalize_openai_base_url(base_url or _first_env("OPENAPI_BASE_URL", "OPENAI_BASE_URL"))
-        self.api_key = str(api_key or _first_env("OPENAPI_API_KEY", "OPENAI_API_KEY")).strip()
+        self.base_url = _normalize_openai_base_url(base_url)
+        self.api_key = str(api_key or "").strip()
         if openai_model:
             self.openai_model = str(openai_model).strip()
         elif self.model_name and self.model_name.lower() != "auto":
             self.openai_model = self.model_name
         else:
-            self.openai_model = str(
-                _first_env(
-                    "OPENAPI_EMBEDDING_MODEL",
-                    "OPENAI_EMBEDDING_MODEL",
-                    "OPENAPI_MODEL",
-                    "OPENAI_MODEL",
-                )
-                or "text-embedding-3-large"
-            ).strip()
+            self.openai_model = ""
 
         self.retry_config = retry_config or {}
         # `embedding.openapi.max_retries` is exposed in AstrBot UI; cap the
@@ -145,10 +128,14 @@ class EmbeddingAPIAdapter:
             "Embedding adapter initialized: model=%s, default_dim=%s, base_url=%s",
             self.openai_model,
             self.default_dimension,
-            self.base_url or "<default>",
+            self.base_url or "<not-configured>",
         )
 
     def _get_client(self) -> AsyncOpenAI:
+        if not self.base_url:
+            raise RuntimeError("Embedding API base_url is not configured")
+        if not self.openai_model:
+            raise RuntimeError("Embedding API model is not configured")
         if self._client is None:
             kwargs = {
                 "api_key": self.api_key or "EMPTY",

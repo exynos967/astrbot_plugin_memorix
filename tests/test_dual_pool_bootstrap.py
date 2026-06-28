@@ -50,10 +50,40 @@ def test_dual_vector_ready_false_when_status_not_ready(tmp_path: Path) -> None:
     assert _dual_vector_ready(tmp_path, expected_dimension=128) is False
 
 
-def test_default_config_dual_pool_defaults_to_single() -> None:
-    """DEFAULT_CONFIG 默认 single 模式，runtime 就绪标志为 False。"""
-    assert DEFAULT_CONFIG["retrieval"]["vector_pools"]["mode"] == "single"
+def test_default_config_dual_pool_defaults_align_with_maibot() -> None:
+    """DEFAULT_CONFIG 默认 dual，与上游 A_memorix 对齐；runtime 就绪标志为 False。"""
+    vector_pools = DEFAULT_CONFIG["retrieval"]["vector_pools"]
+    assert vector_pools["mode"] == "dual"
+    assert vector_pools["relation_evidence_weight"] == 1.0
+    assert vector_pools["entity_evidence_weight"] == 0.55
+    assert vector_pools["relation_intent"]["graph_top_k"] == 80
+    assert vector_pools["relation_intent"]["semantic_weight"] == 0.45
+    assert vector_pools["relation_intent"]["sparse_weight"] == 0.15
+    assert vector_pools["relation_intent"]["graph_weight"] == 0.40
+    assert vector_pools["relation_intent"]["return_relation_items"] is False
+    relation_vectorization = DEFAULT_CONFIG["retrieval"]["relation_vectorization"]
+    assert relation_vectorization["enabled"] is False
+    assert relation_vectorization["backfill_enabled"] is False
+    assert relation_vectorization["write_on_import"] is True
     assert DEFAULT_CONFIG["runtime"]["vector_pools_ready"] is False
+
+
+def test_conf_schema_exposes_dual_pool_config() -> None:
+    """AstrBot Dashboard schema 应暴露 dual-pool 配置树。"""
+    schema_path = Path(__file__).resolve().parents[1] / "_conf_schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    vector_pools = schema["retrieval"]["items"]["vector_pools"]
+    assert vector_pools["type"] == "object"
+    assert vector_pools["items"]["mode"]["default"] == "dual"
+    assert vector_pools["items"]["mode"]["options"] == ["single", "dual"]
+    assert vector_pools["items"]["relation_evidence_weight"]["default"] == 1.0
+    assert vector_pools["items"]["entity_evidence_weight"]["default"] == 0.55
+    relation_intent = vector_pools["items"]["relation_intent"]["items"]
+    assert relation_intent["graph_top_k"]["default"] == 80
+    assert relation_intent["semantic_weight"]["default"] == 0.45
+    assert relation_intent["sparse_weight"]["default"] == 0.15
+    assert relation_intent["graph_weight"]["default"] == 0.4
+    assert relation_intent["return_relation_items"]["default"] is False
 
 
 def test_appcontext_has_dual_pool_fields_and_method() -> None:

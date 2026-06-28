@@ -443,7 +443,7 @@ class SummaryImporter:
                     obj=o,
                     confidence=1.0,
                     source_paragraph=hash_value,
-                    write_vector=bool(self._cfg("retrieval.relation_vectorization.enabled", True)),
+                    write_vector=bool(self._cfg("retrieval.relation_vectorization.enabled", False)),
                 )
             else:
                 rel_hash = self.metadata_store.add_relation(

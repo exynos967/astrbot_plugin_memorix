@@ -8,7 +8,7 @@ episode 重建与人物画像刷新入队。整个过程可回滚：保留 rollb
 架构上与 ``IngestService`` 一致——跨作用域，依赖 ``ScopeRuntimeManager`` 遍历各
 scope 的 ``AppContext``；每个 scope 独立 metadata_store，故 feedback 任务表、
 reconcile 队列均按 scope 隔离。LLM 调用统一经 ``generate_text(ctx, prompt)``，
-优先复用 AstrBot provider bridge，降级到环境变量。
+复用 AstrBot provider bridge。
 """
 
 from __future__ import annotations

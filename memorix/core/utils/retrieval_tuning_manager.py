@@ -252,7 +252,7 @@ class RetrievalTuningManager:
     ):
         self.plugin = plugin
         self._import_write_blocked_provider = import_write_blocked_provider
-        # 后台调优任务运行时才取 ctx，借此拿 provider_bridge；缺失则降级 env LLMClient。
+        # 后台调优任务运行时才取 ctx，借此拿 provider_bridge。
         self._ctx_provider = ctx_provider
 
         self._lock = asyncio.Lock()

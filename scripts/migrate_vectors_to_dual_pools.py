@@ -22,10 +22,10 @@ memorix vendored core 升级支持双池向量检索后，运行时默认仍以 
 
 用法
 ----
-    python scripts/migrate_vectors_to_dual_pools.py --data-dir /path/to/scope
-    python scripts/migrate_vectors_to_dual_pools.py --data-dir /path/to/scope --dry-run
-    python scripts/migrate_vectors_to_dual_pools.py --data-dir /path/to/scope --force
-    python scripts/migrate_vectors_to_dual_pools.py --data-dir /path/to/scope --batch-size 2048
+    uv run python scripts/migrate_vectors_to_dual_pools.py --data-dir /path/to/scope
+    uv run python scripts/migrate_vectors_to_dual_pools.py --data-dir /path/to/scope --dry-run
+    uv run python scripts/migrate_vectors_to_dual_pools.py --data-dir /path/to/scope --force
+    uv run python scripts/migrate_vectors_to_dual_pools.py --data-dir /path/to/scope --batch-size 2048
 """
 
 from __future__ import annotations
@@ -33,12 +33,10 @@ from __future__ import annotations
 import argparse
 import json
 import pickle
-import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
+from typing import Any, Dict, List, Optional
 
 # --------------------------------------------------------------------------- #
 # 模块导入：复用 vendored VectorStore，不引入任何外部运行时依赖。
@@ -109,7 +107,7 @@ def _read_dimension(vectors_dir: Path) -> int:
     try:
         with meta_path.open("rb") as f:
             meta = pickle.load(f)
-    except Exception as exc:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
         return 0
     if isinstance(meta, dict):
         try:
@@ -323,8 +321,8 @@ def _migrate(
 
 def _copy_vectors(
     *,
-    source: "VectorStore",  # type: ignore[name-defined]
-    target: "VectorStore",  # type: ignore[name-defined]
+    source: Any,
+    target: Any,
     ids: List[str],
     batch_size: int,
     label: str,

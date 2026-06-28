@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict
 
 import pytest
-
 from astrbot_plugin_memorix.memorix.amemorix.services import fuzzy_modify_service
 from astrbot_plugin_memorix.memorix.amemorix.services.fuzzy_modify_service import (
     FuzzyModifyService,
@@ -24,7 +24,7 @@ def _build_config(*, enabled: bool) -> Dict[str, Any]:
                 "candidate_limit": 20,
                 "confirm_threshold": 0.85,
                 "auto_execute_enabled": False,
-                "max_targets": 10,
+                "max_targets": 5,
                 "allow_global_scope": False,
             }
         },
@@ -219,11 +219,21 @@ def test_fuzzy_modify_service_public_methods_exist():
 
 
 def test_fuzzy_modify_default_config_values():
-    """fuzzy_modify 默认安全值应满足硬性约束。"""
+    """fuzzy_modify 默认值应与上游对齐，执行路径保持保守。"""
     from astrbot_plugin_memorix.memorix.amemorix.settings import DEFAULT_CONFIG
 
     fuzzy_cfg = DEFAULT_CONFIG["integration"]["fuzzy_modify"]
-    assert fuzzy_cfg["enabled"] is False
+    assert fuzzy_cfg["enabled"] is True
     assert fuzzy_cfg["auto_execute_enabled"] is False
     assert fuzzy_cfg["confirm_threshold"] == 0.85
+    assert fuzzy_cfg["max_targets"] == 5
     assert fuzzy_cfg["allow_global_scope"] is False
+
+    schema_path = Path(__file__).resolve().parents[1] / "_conf_schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    schema_cfg = schema["integration"]["items"]["fuzzy_modify"]["items"]
+    assert schema_cfg["enabled"]["default"] is True
+    assert schema_cfg["auto_execute_enabled"]["default"] is False
+    assert schema_cfg["confirm_threshold"]["default"] == 0.85
+    assert schema_cfg["max_targets"]["default"] == 5
+    assert schema_cfg["allow_global_scope"]["default"] is False

@@ -242,8 +242,8 @@ class ScopeRuntimeManager:
                 logger.info(
                     "openapi embedding enabled: scope=%s base_url=%s model=%s",
                     key,
-                    str(endpoint_cfg.get("base_url", "") or "<default>"),
-                    str(endpoint_cfg.get("model", "") or "<default>"),
+                    str(endpoint_cfg.get("base_url", "") or "<not-configured>"),
+                    str(endpoint_cfg.get("model", "") or "<not-configured>"),
                 )
             else:
                 self._patch_local_embedding(runtime)

@@ -2,8 +2,8 @@
 
 # 存储模块（已实现）
 from .storage import (
-    VectorStore, 
-    GraphStore, 
+    VectorStore,
+    GraphStore,
     MetadataStore,
     ImportStrategy,
     KnowledgeType,
@@ -81,4 +81,3 @@ __all__ = [
     "RelationWriteService",
     "RelationWriteResult",
 ]
-

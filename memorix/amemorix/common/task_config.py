@@ -1,6 +1,6 @@
 """插件本地 TaskConfig 垫片。
 
-替代上游 ``src.config.model_configs.TaskConfig``。MaiBot 主线的 TaskConfig 承载
+替代上游 ``src.config.model_configs.TaskConfig``。宿主侧 TaskConfig 承载
 多模型路由（model_list / selection_strategy / slow_threshold 等）；本插件 LLM 统一走
 ``amemorix.llm_client.LLMClient``（OpenAI 兼容）或 ``AstrBotLLMClient``（astrbot
 provider 桥），不需要多模型路由，仅保留被剥离后的 core 代码用 ``getattr`` 读取的字段。

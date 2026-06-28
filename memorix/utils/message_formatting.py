@@ -1,7 +1,7 @@
 """AstrBot message normalization for Memorix ingest.
 
 Keep raw platform payloads out of long-term memory.  This module builds a
-MaiBot-like processed_plain_text from AstrBot's message chain, preserving useful
+processed_plain_text from AstrBot's message chain, preserving useful
 context while avoiding binary/raw CQ payloads.
 """
 

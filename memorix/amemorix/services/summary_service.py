@@ -11,8 +11,6 @@ from ..common.logging import get_logger
 from ...core.utils.summary_importer import SummaryImporter
 from ...providers.astrbot_provider_bridge import AstrBotLLMClient
 from ..context import AppContext
-from ..llm_client import LLMClient
-from ..settings import resolve_openapi_endpoint_config
 
 logger = get_logger("A_Memorix.SummaryService")
 
@@ -53,22 +51,10 @@ class SummaryService:
             )
             return AstrBotLLMClient(provider_bridge=provider_bridge, max_retries=max(1, retries))
 
-        endpoint_cfg = resolve_openapi_endpoint_config(self.ctx.config, section="embedding")
-        selected_model = (
-            str(endpoint_cfg.get("chat_model", "") or "")
-            or "gpt-4o-mini"
-        )
         logger.warning(
-            "summary service fallback to OpenAI-compatible client: model=%s",
-            selected_model,
+            "summary service has no AstrBot provider bridge; LLM summary will use deterministic fallback"
         )
-        return LLMClient(
-            base_url=str(endpoint_cfg.get("base_url", "")),
-            api_key=str(endpoint_cfg.get("api_key", "")),
-            model=selected_model,
-            timeout_seconds=float(endpoint_cfg.get("timeout_seconds", 60) or 60),
-            max_retries=int(endpoint_cfg.get("max_retries", 3) or 3),
-        )
+        return None
 
     def _cfg(self, key: str, default: Any = None) -> Any:
         return self.ctx.get_config(key, default)

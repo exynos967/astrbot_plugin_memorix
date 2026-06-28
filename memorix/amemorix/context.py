@@ -18,7 +18,6 @@ from ..core.utils.person_profile_service import PersonProfileService
 from ..core.utils.relation_write_service import RelationWriteService
 
 from .common.logging import get_logger
-from .llm_client import LLMClient
 from .settings import AppSettings
 
 logger = get_logger("A_Memorix.AppContext")
@@ -39,7 +38,7 @@ class AppContext:
     relation_write_service: RelationWriteService
     episode_service: EpisodeService
     episode_retrieval_service: EpisodeRetrievalService
-    llm_client: LLMClient
+    llm_client: Optional[Any]
     data_dir: Path
     config: Dict[str, Any]
     provider_bridge: Optional[Any] = None

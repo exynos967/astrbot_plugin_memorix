@@ -1,6 +1,6 @@
 """插件本地消息 API 垫片。
 
-替代上游 A_memorix 反馈纠错链路对 MaiBot ``src.services.message_service`` 与
+替代上游 A_memorix 反馈纠错链路对宿主 ``src.services.message_service`` 与
 ``src.chat.message_receive.chat_manager`` 的依赖。两条调用点：
 
 * ``message_api.get_messages_by_time_in_chat(chat_id, start_time, end_time, limit, ...)``
@@ -8,7 +8,7 @@
 * ``chat_manager.get_existing_session_by_session_id(stream_id)`` —— 由 stream_id
   反查 group_id / user_id，对应上游 ``_retrieval_filter_context``。
 
-本插件不引入任何 MaiBot 概念，统一改读插件自有的 ``transcript_sessions`` /
+本插件不引入任何宿主消息概念，统一改读插件自有的 ``transcript_sessions`` /
 ``transcript_messages`` 表（由 ``ingest_service`` 在每条消息摄入时维护）。
 """
 
@@ -50,7 +50,7 @@ class SessionIdentity:
 class MessageAPI:
     """绑定一个 ``MetadataStore`` 的本地消息查询 API。
 
-    上游 ``message_service`` / ``chat_manager`` 在 MaiBot 主线是全局单例；
+    上游 ``message_service`` / ``chat_manager`` 在宿主侧是全局单例；
     本插件为多作用域隔离，故按作用域的 metadata_store 实例化，避免全局状态。
     """
 
@@ -81,7 +81,7 @@ class MessageAPI:
 
         对齐上游签名（``chat_id`` / ``start_time`` / ``end_time`` / ``limit`` /
         ``limit_mode`` / ``filter_mai`` / ``filter_command``），其中
-        ``filter_mai`` 在本插件无 MaiBot 消息概念，仅作参数占位。
+        ``filter_mai`` 在本插件无宿主消息概念，仅作参数占位。
         """
 
         token = str(chat_id or "").strip()
@@ -96,7 +96,7 @@ class MessageAPI:
 
         safe_limit = max(1, int(limit or 50))
         # 上游 limit_mode 目前仅用 "latest"；本实现始终取窗口内最新 N 条。
-        # filter_mai 在本插件无 MaiBot 消息概念，仅占位以对齐上游签名。
+        # filter_mai 在本插件无宿主消息概念，仅占位以对齐上游签名。
         _ = limit_mode, filter_mai
 
         cursor = self._store._conn.cursor()

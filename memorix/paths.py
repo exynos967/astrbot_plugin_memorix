@@ -1,6 +1,6 @@
 """插件本地路径解析 shim。
 
-替代上游 ``A_memorix/paths.py`` 的 repo-relative 路径模型——插件没有 MaiBot 仓库根，
+替代上游 ``A_memorix/paths.py`` 的 repo-relative 路径模型——插件没有宿主仓库根，
 所有持久化路径以插件数据目录（``AMEMORIX_DATA_DIR`` 环境变量，默认 ``./data``）为根，
 与 ``amemorix.settings.AppSettings.data_dir`` 保持一致。
 """

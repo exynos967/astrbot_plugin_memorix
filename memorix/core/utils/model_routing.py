@@ -1,8 +1,7 @@
 """A_Memorix 文本生成模型路由（插件本土化版）。
 
-插件只有单模型 LLM，统一走 ``LLMClient``。本土化策略——优先复用 AstrBot 已配置的
-provider（``ctx.provider_bridge`` → ``AstrBotLLMClient``），降级到环境变量驱动的
-``LLMClient``。
+插件文本生成统一复用 AstrBot 已配置的 provider
+（``ctx.provider_bridge`` → ``AstrBotLLMClient``）。
 
 为兼容既有消费方（episode_segmentation / retrieval_tuning / web_import_manager），
 保留 ``ResolvedLLMModel`` 占位与 ``generate_with_resolved_model`` 薄包装；新增
@@ -179,10 +178,10 @@ def resolve_text_generation_model_selector(
 
 
 def resolve_llm_client(ctx: Any) -> Any:
-    """本土化核心：优先 AstrBot provider bridge，降级到 env LLMClient。
+    """本土化核心：只走 AstrBot provider bridge。
 
     返回的对象需提供 ``async complete(prompt, *, temperature, max_tokens) -> str``，
-    ``LLMClient`` 与 ``AstrBotLLMClient`` 均满足该接口，下游零分支。
+    ``AstrBotLLMClient`` 满足该接口，下游零分支。
     """
 
     bridge = getattr(ctx, "provider_bridge", None) if ctx is not None else None
@@ -192,14 +191,10 @@ def resolve_llm_client(ctx: Any) -> Any:
 
         try:
             return AstrBotLLMClient(provider_bridge=bridge)
-        except Exception as exc:  # pragma: no cover - 降级保护
-            logger.warning(f"启用 AstrBotLLMClient 失败，降级 env LLMClient: {exc}")
-    client = getattr(ctx, "llm_client", None)
-    if client is None:
-        from ...amemorix.llm_client import LLMClient
+        except Exception as exc:  # pragma: no cover - 构造保护
+            raise RuntimeError(f"启用 AstrBotLLMClient 失败: {exc}") from exc
 
-        client = LLMClient()
-    return client
+    raise RuntimeError("AstrBot provider bridge is not available")
 
 
 async def generate_text(
@@ -241,8 +236,8 @@ async def generate_with_resolved_model(
     """兼容旧消费方的薄包装：忽略多模型编排，转调 generate_text。
 
     旧调用形态 ``generate_with_resolved_model(resolved_model, request_type, prompt,
-    temperature=..., max_tokens=...)`` 需 ctx 才能走 provider_bridge；若调用方未传
-    ctx，则降级用 env LLMClient。
+    temperature=..., max_tokens=...)`` 需 ctx 才能走 provider_bridge；调用方未传
+    ctx 时返回失败结果。
     """
 
     tag = getattr(model, "task_name", "") or ""

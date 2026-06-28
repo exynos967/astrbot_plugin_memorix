@@ -26,7 +26,7 @@ class EpisodeSegmentationService:
 
     def __init__(self, plugin_config: Optional[dict] = None, ctx: Any = None):
         self.plugin_config = plugin_config or {}
-        # 本土化命脉：segment() 调 generate_text 时据此取 provider_bridge，缺省降级 env LLMClient。
+        # 本土化命脉：segment() 调 generate_text 时据此取 provider_bridge。
         self._ctx = ctx
 
     def _cfg(self, key: str, default: Any = None) -> Any:
