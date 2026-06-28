@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""离线 schema 迁移脚本：memorix metadata.db v8 -> v13。
+"""离线 schema 迁移脚本：memorix metadata.db v8 -> 当前 SCHEMA_VERSION。
 
 用途
 ----
-插件 vendored A_memorix core 升级到 2.0.0 后，``metadata_store.SCHEMA_VERSION`` 由 8 升至 13。
+插件 vendored core 升级后，``metadata_store.SCHEMA_VERSION`` 会随内核 schema 演进。
 新版运行时自动迁移要求 ``schema_version >= RUNTIME_AUTO_MIGRATION_MIN_SCHEMA_VERSION (9)``，
 因此历史 v8 库首次启动会被 ``_assert_schema_compatible`` 直接拒绝。本脚本提供离线兜底：
-直接复用新版 ``MetadataStore._migrate_schema()``（幂等全量 DDL）把老库推到 v13。
+直接复用新版 ``MetadataStore._migrate_schema()``（幂等全量 DDL）把老库推到当前版本。
 
 何时用
 ------
@@ -15,11 +15,11 @@
 
 用法
 ----
-    python scripts/migrate_schema_v8_to_v13.py --db /path/to/metadata.db
-    python scripts/migrate_schema_v8_to_v13.py --db /path/to/metadata.db --dry-run
-    python scripts/migrate_schema_v8_to_v13.py --db /path/to/metadata.db --restore /path/to/metadata.db.v8.bak
+    uv run python scripts/migrate_schema_v8_to_v13.py --db /path/to/metadata.db
+    uv run python scripts/migrate_schema_v8_to_v13.py --db /path/to/metadata.db --dry-run
+    uv run python scripts/migrate_schema_v8_to_v13.py --db /path/to/metadata.db --restore /path/to/metadata.db.v8.bak
 
-注意：本脚本需在 vendored core 已升级到 2.0.0（SCHEMA_VERSION=13）后运行。
+注意：本脚本需在插件代码已升级到目标版本后运行，目标版本取当前 ``SCHEMA_VERSION``。
 """
 
 from __future__ import annotations
@@ -36,13 +36,19 @@ from typing import Any, Dict
 def _resolve_metadata_store():
     """延迟导入新版 MetadataStore（Phase 1 core 升级后才可用）。"""
 
+    # 直接运行本脚本时（python scripts/xxx.py），Python 仅把脚本目录加进 sys.path，
+    # 不含插件包根（memorix 的父目录）。此处显式注入包根，使 `import memorix` 可解析。
+    pkg_root = str(Path(__file__).resolve().parent.parent)
+    if pkg_root not in sys.path:
+        sys.path.insert(0, pkg_root)
+
     try:
         # 插件包内绝对导入（memorix/__init__.py 已注入 sys.path）
-        from memorix.core.storage.metadata_store import MetadataStore, SCHEMA_VERSION  # type: ignore
+        from memorix.core.storage.metadata_store import SCHEMA_VERSION, MetadataStore  # type: ignore
     except Exception as exc:  # noqa: BLE001
         print(
             f"[错误] 无法导入新版 MetadataStore: {exc}\n"
-            "请确认插件 vendored core 已升级到 2.0.0 (SCHEMA_VERSION=13)。",
+            "请确认插件 vendored core 已升级到目标版本。",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -89,14 +95,14 @@ def _migrate(db_path: Path, dry_run: bool) -> int:
     print(f"[信息] 当前 schema_version={current}, 目标={schema_version}, db={db_path}")
 
     if current == 0 and not db_path.exists():
-        print("[信息] 数据库不存在，将创建全新 v13 库。")
+        print(f"[信息] 数据库不存在，将创建全新 v{schema_version} 库。")
     elif current >= schema_version:
         print(f"[信息] 已是最新版本 (v{current})，无需迁移。")
         return 0
 
     if dry_run:
         print("[dry-run] 将执行：备份 -> _migrate_schema() -> rebuild_relation_hash_aliases() "
-              "-> normalize_paragraph_knowledge_types() -> set_schema_version(13)")
+              f"-> normalize_paragraph_knowledge_types() -> set_schema_version({schema_version})")
         return 0
 
     backup_path: Path | None = None
@@ -131,7 +137,7 @@ def _migrate(db_path: Path, dry_run: bool) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Memorix metadata.db schema 离线迁移 v8 -> v13",
+        description="Memorix metadata.db schema 离线迁移 v8 -> 当前 SCHEMA_VERSION",
     )
     parser.add_argument("--db", required=True, type=Path, help="metadata.db 文件路径")
     parser.add_argument("--dry-run", action="store_true", help="仅打印将执行的步骤，不改动数据库")

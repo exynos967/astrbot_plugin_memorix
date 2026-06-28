@@ -1,8 +1,7 @@
 import sqlite3
 
 import pytest
-
-from astrbot_plugin_memorix.memorix.core.storage.metadata_store import MetadataStore, SCHEMA_VERSION
+from astrbot_plugin_memorix.memorix.core.storage.metadata_store import SCHEMA_VERSION, MetadataStore
 
 
 def test_connect_patches_legacy_episode_position_column(tmp_path):
@@ -394,8 +393,7 @@ def test_connect_patches_037_metadata_columns_and_summary_state(tmp_path):
         store.close()
 
 
-# v8 -> v13 迁移测试：仅在 vendored core 已升级到 SCHEMA_VERSION >= 13 时激活。
-# 升级前跳过，避免误报；升级后用于校验老库平滑迁移与离线脚本兜底路径。
+# 历史 schema 迁移测试：用于校验老库平滑迁移与离线脚本兜底路径。
 _VNEXT_TABLES = (
     "episodes",
     "episode_paragraphs",
@@ -415,7 +413,7 @@ _VNEXT_TABLES = (
 
 
 @pytest.mark.skipif(SCHEMA_VERSION < 13, reason="vendored core 未升级到 2.0.0 (SCHEMA_VERSION>=13)")
-def test_v8_legacy_db_migrates_to_v13(tmp_path):
+def test_v8_legacy_db_migrates_to_current_schema(tmp_path):
     """模拟历史 v8 库，离线迁移后应出现全部 vNext 表且老数据保留。"""
 
     db_path = tmp_path / "metadata.db"
@@ -499,6 +497,85 @@ def test_v8_legacy_db_migrates_to_v13(tmp_path):
         after.close()
 
 
+def test_schema_13_db_runtime_auto_migrates_to_15(tmp_path):
+    """模拟上一版 schema=13 库，connect() 应自动迁移到当前 schema=15。"""
+
+    assert SCHEMA_VERSION == 15
+    db_path = tmp_path / "metadata.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at REAL NOT NULL);
+        INSERT INTO schema_migrations(version, applied_at) VALUES (13, 1.0);
+        CREATE TABLE paragraphs (
+            hash TEXT PRIMARY KEY,
+            content TEXT NOT NULL,
+            vector_index INTEGER,
+            created_at REAL,
+            updated_at REAL,
+            metadata TEXT,
+            source TEXT,
+            word_count INTEGER,
+            event_time REAL,
+            event_time_start REAL,
+            event_time_end REAL,
+            time_granularity TEXT,
+            time_confidence REAL DEFAULT 1.0,
+            knowledge_type TEXT DEFAULT 'mixed',
+            is_permanent BOOLEAN DEFAULT 0,
+            last_accessed REAL,
+            access_count INTEGER DEFAULT 0,
+            is_deleted INTEGER DEFAULT 0,
+            deleted_at REAL
+        );
+        CREATE TABLE relations (
+            hash TEXT PRIMARY KEY,
+            subject TEXT NOT NULL,
+            predicate TEXT NOT NULL,
+            object TEXT NOT NULL,
+            vector_index INTEGER,
+            confidence REAL DEFAULT 1.0,
+            created_at REAL,
+            source_paragraph TEXT,
+            metadata TEXT
+        );
+        CREATE TABLE paragraph_stale_relation_marks (
+            paragraph_hash TEXT NOT NULL,
+            relation_hash TEXT NOT NULL,
+            reason TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (paragraph_hash, relation_hash)
+        );
+        INSERT INTO paragraphs(hash, content, created_at, updated_at, source, word_count)
+        VALUES ('p13', 'schema 13 paragraph', 1.0, 1.0, 'source-13', 3);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = MetadataStore(tmp_path)
+    store.connect()
+    try:
+        assert store.get_schema_version() == 15
+        tables = {
+            row[0]
+            for row in store._conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        assert "memory_fuzzy_modify_plans" in tables
+
+        stale_columns = {
+            row[1]
+            for row in store._conn.execute("PRAGMA table_info(paragraph_stale_relation_marks)").fetchall()
+        }
+        assert {"source_type", "source_id", "source_operation_id"} <= stale_columns
+
+        kept = store._conn.execute("SELECT content FROM paragraphs WHERE hash='p13'").fetchone()
+        assert kept is not None and kept[0] == "schema 13 paragraph"
+    finally:
+        store.close()
+
+
 @pytest.mark.skipif(SCHEMA_VERSION < 13, reason="vendored core 未升级到 2.0.0 (SCHEMA_VERSION>=13)")
 def test_message_api_shim_reads_transcript_window(tmp_path):
     """feedback 垫片 MessageAPI 应从 transcript 表按时间窗取消息并解析身份。"""
@@ -538,4 +615,3 @@ def test_message_api_shim_reads_transcript_window(tmp_path):
         assert identity.group_id == "g1"
     finally:
         store.close()
-
