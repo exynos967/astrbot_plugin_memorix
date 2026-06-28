@@ -47,6 +47,12 @@ from typing import Dict, List, Optional, Tuple
 def _resolve_vector_store():
     """延迟导入 vendored VectorStore 与量化枚举。"""
 
+    # 直接运行本脚本时（python scripts/xxx.py），Python 仅把脚本目录加进 sys.path，
+    # 不含插件包根（memorix 的父目录）。此处显式注入包根，使 `import memorix` 可解析。
+    _pkg_root = str(Path(__file__).resolve().parent.parent)
+    if _pkg_root not in sys.path:
+        sys.path.insert(0, _pkg_root)
+
     try:
         # 与 scripts/migrate_schema_v8_to_v13.py 同样的导入路径，
         # memorix/__init__.py 会把包根注入 sys.path。
