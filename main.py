@@ -168,6 +168,10 @@ class MemorixPlugin(Star):
     def _resolve_scope(self, event: AstrMessageEvent) -> str:
         return self.scope_router.resolve(event)
 
+    @staticmethod
+    def _is_cron_event(event: AstrMessageEvent) -> bool:
+        return str(getattr(event, "get_platform_name", lambda: "")() or "").strip() == "cron"
+
     def _resolve_dashboard_webui_scope(self) -> str:
         known_scopes = self.runtime_manager.get_known_scopes()
         if known_scopes:
@@ -415,6 +419,8 @@ class MemorixPlugin(Star):
         parts.append(part)
 
     async def _build_profile_injection_block(self, event: AstrMessageEvent, adapted: MemorixEvent) -> str:
+        if self._is_cron_event(event):
+            return ""
         if not self._bool_cfg(self.config, "person_profile.enabled", True):
             return ""
         if not adapted.sender_id:
@@ -744,6 +750,8 @@ class MemorixPlugin(Star):
     async def on_all_messages(self, event: AstrMessageEvent):
         if not self._bool_cfg(self.config, "ingest.record_all_events", True):
             return
+        if self._is_cron_event(event):
+            return
         try:
             adapted = AstrbotEventAdapter.from_event(event, self._resolve_scope(event))
             if not await self._is_adapted_chat_enabled(adapted, adapted.sender_id):
@@ -781,7 +789,7 @@ class MemorixPlugin(Star):
             ingested = await self._ingest_event_message(event, "assistant", text)
             if not ingested:
                 return
-            if user_text and not self._is_command_message(user_text):
+            if user_text and not self._is_cron_event(event) and not self._is_command_message(user_text):
                 await self.person_fact_writeback_service.enqueue(
                     PersonFactWritebackItem(
                         scope_key=adapted.scope_key,

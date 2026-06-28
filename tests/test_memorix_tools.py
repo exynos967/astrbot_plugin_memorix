@@ -2,15 +2,14 @@ import asyncio
 from types import SimpleNamespace
 
 import numpy as np
-
 from astrbot_plugin_memorix.main import MEMORY_INJECTION_MARKER, MemorixPlugin
 from astrbot_plugin_memorix.memorix.adapters.astrbot_event_adapter import AstrbotEventAdapter
 from astrbot_plugin_memorix.memorix.amemorix.context import AppContext
 from astrbot_plugin_memorix.memorix.amemorix.services.query_service import QueryService
 from astrbot_plugin_memorix.memorix.core.storage.metadata_store import MetadataStore
 from astrbot_plugin_memorix.memorix.core.utils.summary_importer import SummaryImporter
-from astrbot_plugin_memorix.memorix.services.ingest_service import IngestService
 from astrbot_plugin_memorix.memorix.services.content_router import MemoryContentRouter
+from astrbot_plugin_memorix.memorix.services.ingest_service import IngestService
 from astrbot_plugin_memorix.memorix.services.person_fact_writeback_service import (
     PersonFactWritebackItem,
     PersonFactWritebackService,
@@ -212,6 +211,37 @@ def test_astrbot_event_adapter_extracts_group_name():
 
     assert adapted.group_id == "group-1"
     assert adapted.group_name == "测试群"
+
+
+def test_astrbot_event_adapter_restores_cron_original_session():
+    class _CronMessageObj:
+        session_id = "799462158"
+        message_id = "cron-msg"
+        timestamp = 123
+        message = []
+
+    class _CronEvent:
+        unified_msg_origin = "aiocqhttp:GroupMessage:799462158"
+        message_obj = _CronMessageObj()
+        message_str = "定时任务结果"
+
+        def get_platform_name(self):
+            return "cron"
+
+        def get_sender_id(self):
+            return "799462158"
+
+        def get_sender_name(self):
+            return "Scheduler"
+
+        def get_group_id(self):
+            return ""
+
+    adapted = AstrbotEventAdapter.from_event(_CronEvent(), "aiocqhttp:group:799462158")
+
+    assert adapted.platform == "aiocqhttp"
+    assert adapted.session_id == "799462158"
+    assert adapted.group_id == "799462158"
 
 
 def test_llm_request_injects_profile_and_auto_memory():
@@ -669,6 +699,58 @@ def test_person_fact_writeback_respects_chat_filter():
     )
 
     asyncio.run(service._handle_item(item))
+
+
+def test_cron_llm_response_skips_person_fact_writeback():
+    class _CronMessageObj:
+        session_id = "799462158"
+        message_id = "cron-msg"
+        timestamp = 123
+        message = []
+
+    class _CronEvent:
+        unified_msg_origin = "aiocqhttp:GroupMessage:799462158"
+        message_obj = _CronMessageObj()
+        message_str = "定时任务结果"
+
+        def get_platform_name(self):
+            return "cron"
+
+        def get_sender_id(self):
+            return "799462158"
+
+        def get_sender_name(self):
+            return "Scheduler"
+
+        def get_group_id(self):
+            return ""
+
+    class _PersonFactQueue:
+        async def enqueue(self, **_kwargs):
+            raise AssertionError("cron event should not enqueue person fact writeback")
+
+    class _SummaryService:
+        async def maybe_enqueue_auto_summary(self, **_kwargs):
+            return {"queued": False}
+
+    plugin = MemorixPlugin(DummyContext(), {"scope": {"mode": "group_global"}})
+    plugin.person_fact_writeback_service = _PersonFactQueue()
+    plugin.summary_service = _SummaryService()
+
+    async def _enabled(_adapted, _user_id=""):
+        return True
+
+    async def _format(_event):
+        return "定时任务结果"
+
+    async def _ingest(_event, _role, _text):
+        return True
+
+    plugin._is_adapted_chat_enabled = _enabled
+    plugin._format_event_text_for_memory = _format
+    plugin._ingest_event_message = _ingest
+
+    asyncio.run(plugin.on_llm_response(_CronEvent(), SimpleNamespace(completion_text="已完成")))
 
 
 def test_episode_and_aggregate_queries_respect_chat_filter():
