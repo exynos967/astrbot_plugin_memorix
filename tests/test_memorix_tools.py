@@ -169,6 +169,7 @@ EXPECTED_TOOL_NAMES = [
     "memory_runtime_admin",
     "memory_import_admin",
     "memory_tuning_admin",
+    "memory_feedback_admin",
     "memory_v5_admin",
     "memory_delete_admin",
 ]
