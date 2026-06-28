@@ -78,6 +78,14 @@ Dashboard 内嵌导入视图默认启用。页面可进行如下三种导入：
 
 导入中心支持手动选择 `knowledge_type`（`auto/factual/narrative/structured/mixed`），并提供任务级/文件级/分块级状态观察、任务取消与失败重试。
 
+### 记忆模糊修正
+
+支持基于自然语言请求对既有记忆进行模糊修正：LLM 根据用户的修改诉求生成结构化修改计划，先 **preview** 预览待改写项，由用户/管理员 **确认** 后再 **execute** 落库，并保留 **rollback** 回滚能力。
+
+- **默认关闭**：`integration.fuzzy_modify.enabled=False`，启用需显式设为 `True`。
+- **安全默认**：`auto_execute_enabled=False`（必须经过显式 confirmed 才会执行）、`confirm_threshold=0.85`、`allow_global_scope=False`（禁止跨作用域全局修改）。
+- **管理入口**：管理工具 `memory_fuzzy_modify_admin`（actions：`preview` / `execute` / `get` / `list` / `rollback` / `reconcile`），仅 AstrBot 管理员事件可调用；WebUI 路由 `POST /v1/fuzzy_modify`。
+
 #### 本插件基于 A_Dawn 的 A_Memorix 设计理念开发，并针对 AstrBot 做了完整适配。
 
 ## 工作流
@@ -158,6 +166,30 @@ data/plugin_data/astrbot_plugin_memorix/scopes/<scope_key>/
 | 向量存储 | FAISS（降级 Numpy 余弦） | 段落和关系的语义向量索引 |
 | 图谱存储 | SciPy 稀疏矩阵 | 实体节点 + 关系边权重图 |
 | 元数据存储 | SQLite | 结构化数据与全文检索（FTS5） |
+
+### 数据库 Schema 版本
+
+当前元数据 Schema 版本为 **SCHEMA 15**。相对前一版本，本次升级包含两项结构变更：
+
+- **新增 `fuzzy_modify_plans` 表**：存放模糊修正功能的修改计划与执行状态（preview / confirmed / executed / rolled_back），与模糊修正功能配套。
+- **`stale_relation` 表新增三列**：`source_type`、`source_id`、`source_operation_id`，用于精确标记关系条目的来源类型与具体来源操作 ID，便于追溯与回收。
+
+插件启动时会自动检测当前 Schema 版本并按需执行迁移，无需手动干预。
+
+### 双向量池架构（dual-pool）
+
+检索向量默认使用单池（single），段落向量与图谱关系向量共用同一向量索引。SCHEMA 15 起支持双向量池模式，将 **段落向量** 与 **图谱向量** 分离到独立索引，便于独立扩容、独立检索调参。
+
+- **默认 `mode=single`，零行为变化**：未启用 dual 时所有行为与历史版本完全一致。
+- **启用 dual 步骤**：
+  1. 配置 `retrieval.vector_pools.mode=dual`；
+  2. 运行离线迁移脚本预览分流结果（先 dry-run 再正式迁移）：
+     ```
+     python scripts/migrate_vectors_to_dual_pools.py --data-dir <scope目录> [--scope <scope_key>] [--dry-run]
+     ```
+  3. 迁移成功后，脚本会在 `vectors/` 下写入 `dual_ready.json` manifest，运行时据此判定 dual 是否就绪；
+  4. 若 manifest 缺失，运行时自动降级为 single，不会因配置错配而无法检索。
+- 迁移脚本幂等，不删除单池原数据，dual 模式可安全回退至 single。
 
 ## 完整配置参考
 
@@ -243,6 +275,7 @@ data/plugin_data/astrbot_plugin_memorix/scopes/<scope_key>/
 | `retrieval.aggregate.weights.search` | float | `1.0` | 语义检索通道权重 |
 | `retrieval.aggregate.weights.time` | float | `1.0` | 时序检索通道权重 |
 | `retrieval.aggregate.weights.episode` | float | `1.0` | 事件摘要检索通道权重 |
+| `retrieval.vector_pools.mode` | string | `single` | 向量池模式：`single`（单池，零行为变化） / `dual`（段落向量与图谱向量分离，需先跑迁移脚本） |
 
 ### 记忆维护（memory）
 
@@ -315,6 +348,15 @@ data/plugin_data/astrbot_plugin_memorix/scopes/<scope_key>/
 | `web.import.default_chunk_concurrency` | int | `4` | 默认分块并发（预留） |
 | `web.import.path_aliases.raw` | string | `raw` | 原始目录扫描别名（相对 `storage.data_dir`） |
 | `web.import.path_aliases.plugin_data` | string | `.` | 插件数据目录别名（相对 `storage.data_dir`） |
+
+### 模糊修正（integration.fuzzy_modify）
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `integration.fuzzy_modify.enabled` | bool | `false` | 启用记忆模糊修正功能；默认关闭 |
+| `integration.fuzzy_modify.auto_execute_enabled` | bool | `false` | 是否允许跳过显式确认直接执行；默认必须显式 confirmed |
+| `integration.fuzzy_modify.confirm_threshold` | float | `0.85` | 计划确认阈值，低于该阈值需人工复核 |
+| `integration.fuzzy_modify.allow_global_scope` | bool | `false` | 是否允许跨作用域的全局修改；默认禁止 |
 
 </details>
 
