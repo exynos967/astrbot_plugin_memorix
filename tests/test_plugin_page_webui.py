@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 import pytest
@@ -40,9 +41,6 @@ def test_plugin_page_assets_exist() -> None:
     assert assets_dir.is_dir(), "memorix-vue/assets 目录缺失"
     html = VUE_PAGE.read_text(encoding="utf-8")
 
-    # 收集 index.html 引用的所有 ./assets/ 资源，逐一断言存在
-    import re
-
     refs = re.findall(r'(?:src|href)="(\./assets/[^"]+)"', html)
     assert refs, "index.html 未引用任何 assets 资源"
     for ref in refs:
@@ -61,6 +59,31 @@ def test_plugin_page_vis_chunk_isolated() -> None:
     assert vis_chunks, "未生成独立 vis chunk，manualChunks.vis 配置可能失效"
     # vis chunk 应有体积（非空占位）
     assert any(p.stat().st_size > 1000 for p in vis_chunks), "vis chunk 体积异常"
+
+
+def test_plugin_page_chunks_use_spaced_esm_imports() -> None:
+    """跨 chunk 静态 import 必须「带空格」形式（vite.config.ts astrbotEsmImportCompat 回归）。
+
+    AstrBot 的 _JS_MODULE_FROM_RE 要求 `import\\s+`（import 后至少一空格）才 rewrite 注
+    asset_token。Vite/rollup minified 默认产出 `import{a,b}from"./x"`（零空格）→ 正则不匹配
+    → 跨 chunk 静态 import 不被 rewrite → 资源 URL 无 token → 401 → 图谱页空白
+    （仅 graph view 真·动态 import 触发跨 chunk 引用，故唯独图谱受影响）。
+    astrbotEsmImportCompat 插件在 generateBundle 阶段补回空格修复此缺陷。本断言防止
+    该插件被误删/失效后回退到 401 状态。
+    """
+    assets_dir = VUE_PAGE.parent / "assets"
+    js_chunks = list(assets_dir.glob("*.js"))
+    assert js_chunks, "memorix-vue/assets 下无 JS chunk"
+    for chunk in js_chunks:
+        code = chunk.read_text(encoding="utf-8")
+        # 不得残留零空格的 import{...}from"/export{...}from" 静态模块引用
+        assert not re.search(r'import\{[^}]*\}from"', code), (
+            f"{chunk.name} 残留 minified `import{{...}}from\"`（无空格），"
+            "AstrBot 不会 rewrite 注 token → 跨 chunk 加载 401。请确认 astrbotEsmImportCompat 插件生效。"
+        )
+        assert not re.search(r'export\{[^}]*\}from"', code), (
+            f"{chunk.name} 残留 minified `export{{...}}from\"`（无空格），同上会导致 401。"
+        )
 
 
 def test_plugin_page_bridge_rejects_unexpected_urls() -> None:
