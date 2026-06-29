@@ -1,15 +1,8 @@
 <script setup lang="ts">
 // 应用外壳：侧栏 + 顶栏 + 内容区（<RouterView />）。
 // 从 legacy .app/.shell/.workspace 结构（index.html 行 2018-2051）迁移。
-import { computed } from "vue";
-import { useRoute } from "vue-router";
 import Sidebar from "./Sidebar.vue";
 import TopBar from "./TopBar.vue";
-
-const route = useRoute();
-const viewStackClass = computed(() => ({
-  "view-stack--fixed": route.name === "graph",
-}));
 </script>
 
 <template>
@@ -22,7 +15,7 @@ const viewStackClass = computed(() => ({
       <Sidebar />
       <main class="workspace">
         <TopBar />
-        <div class="view-stack" :class="viewStackClass">
+        <div class="view-stack">
           <RouterView v-slot="{ Component }">
             <component :is="Component" />
           </RouterView>

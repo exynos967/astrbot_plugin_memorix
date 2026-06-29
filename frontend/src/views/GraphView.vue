@@ -178,25 +178,23 @@ function retryInit(): void {
  * grid 行 minmax(0,1fr) 让画布吃剩余高度且可收缩（min-height:0 是关键，
  * 否则 grid 子项会被内容撑爆溢出视口）。详情面板高度受限于主区、内部独立滚动。 */
 .graph-body {
-  flex: 1 1 0;
+  flex: 1 1 auto;
   min-height: 0;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  grid-template-rows: minmax(0, 1fr) auto;
+  grid-template-rows: minmax(380px, 1fr) auto;
   gap: 12px;
-  overflow: hidden;
 }
 
 @media (min-width: 980px) {
   .graph-body.has-detail {
     grid-template-columns: minmax(0, 1fr) 360px;
-    grid-template-rows: minmax(0, 1fr);
+    grid-template-rows: minmax(380px, 1fr);
   }
 }
 
-/* 画布：完全由 grid 单元格拉伸决定宽高，禁用固定 height/min-height。
- * position:relative 作为 .graph-canvas-inner(inset:0) 的定位上下文。
- * min-height:0 允许在 grid 内收缩，杜绝 min-height:320px 撑死不随窗口变化。 */
+/* 画布：grid 单元格拉伸决定宽高。grid 行 minmax(380px,1fr) 保证画布至少 380px，
+ * 杜绝被工具栏压扁成 2px（实测旧方案 iframe 500px 画布仅 2px）。 */
 .graph-canvas {
   position: relative;
   min-width: 0;
