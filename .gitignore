@@ -1,6 +1,5 @@
 .ruff_cache/
 .pytest_cache/
-tests/
 # Python cache files
 __pycache__/
 *.py[cod]

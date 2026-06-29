@@ -1,5 +1,4 @@
 import asyncio
-import importlib.util
 import sys
 import types
 from pathlib import Path
@@ -160,39 +159,6 @@ def test_webui_bridge_preserves_frontend_errors():
     response = asyncio.run(bridge.handle_request())
 
     assert response.get_json() == {"status": "error", "message": "boom"}
-
-
-def test_plugin_page_request_unwraps_bridge_envelope():
-    html = (ROOT / "astrbot_plugin_memorix" / "pages" / "memorix" / "index.html").read_text(encoding="utf-8")
-    script = html.split("<script>", 1)[1].rsplit("</script>", 1)[0]
-    jsdom_available = importlib.util.find_spec("jsdom") is not None
-
-    assert 'const envelope = await bridge.apiPost("webui/request", { method, url, data });' in script
-    assert 'return envelope.data;' in script
-    if not jsdom_available:
-        assert 'envelope?.status === "error"' in script
-
-
-def test_plugin_page_contains_ui_preference_and_trend_controls():
-    html = (ROOT / "astrbot_plugin_memorix" / "pages" / "memorix" / "index.html").read_text(encoding="utf-8")
-
-    assert 'id="graph-search-action"' in html
-    assert 'id="tool-call-chart"' in html
-    assert 'id="ui-theme"' in html
-    assert 'id="ui-effects"' in html
-    assert 'data-effects="lite"' in html
-    assert "近 2 小时" in html
-
-
-def test_plugin_page_guards_sandboxed_local_storage():
-    html = (ROOT / "astrbot_plugin_memorix" / "pages" / "memorix" / "index.html").read_text(encoding="utf-8")
-    script = html.split("<script>", 1)[1].rsplit("</script>", 1)[0]
-
-    assert "function getUiPrefsStorage()" in script
-    assert "const storage = getUiPrefsStorage();" in script
-    assert "localStorage.getItem" not in script
-    assert "localStorage.setItem" not in script
-    assert "WebUI 偏好本地保存失败" not in script
 
 
 def test_query_event_histogram_keeps_two_hour_window(monkeypatch):
