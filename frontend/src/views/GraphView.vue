@@ -8,7 +8,7 @@
 // - C1：store.loadGraph 错误进 store.initError，本视图显示空状态 + 重试按钮。
 // - vis 实例唯一，通过 provide(GRAPH_VIS_KEY) 下发子组件，子组件 inject 访问。
 // - 消除 window.*：showNodeDetail/showEdgeDetail 改为写 store.selectedNode/selectedEdgeId。
-import { computed, nextTick, onBeforeUnmount, onMounted, provide, ref, watch } from "vue";
+import { nextTick, onBeforeUnmount, onMounted, provide, ref, watch } from "vue";
 import { storeToRefs } from "pinia";
 import { useGraphStore } from "@/stores/graph";
 import { useVisNetwork, GRAPH_VIS_KEY } from "@/composables/useVisNetwork";
@@ -24,15 +24,8 @@ const store = useGraphStore();
 const { loading, initError } = storeToRefs(store);
 
 const canvasRef = ref<HTMLDivElement | null>(null);
-const viewRef = ref<HTMLElement | null>(null);
-const toolbarRef = ref<HTMLElement | null>(null);
 let resizeObserver: ResizeObserver | null = null;
-let layoutObserver: ResizeObserver | null = null;
 let resizeRaf: number | null = null;
-const graphBodyHeight = ref("380px");
-const graphBodyStyle = computed<Record<string, string>>(() => ({
-  "--graph-body-height": graphBodyHeight.value,
-}));
 
 // 本地渲染标志：精确覆盖「数据已到但画布尚未画出」的中间态。
 // store.loading 仅覆盖网络请求阶段；rendering 覆盖 nextTick+RAF 的渲染间隙。
@@ -97,17 +90,6 @@ function scheduleCanvasResize(): void {
   });
 }
 
-function updateGraphBodyHeight(): void {
-  const view = viewRef.value;
-  const toolbar = toolbarRef.value;
-  if (!view || !toolbar) return;
-  const gap = 12;
-  const minHeight = 380;
-  const available = Math.floor(view.clientHeight - toolbar.offsetHeight - gap);
-  graphBodyHeight.value = `${Math.max(minHeight, available)}px`;
-  scheduleCanvasResize();
-}
-
 /** 载入图谱数据并渲染。 */
 async function loadAndRender(): Promise<void> {
   await store.loadGraph();
@@ -116,13 +98,6 @@ async function loadAndRender(): Promise<void> {
 
 onMounted(() => {
   store.loadScopes();
-  if (typeof ResizeObserver !== "undefined") {
-    layoutObserver = new ResizeObserver(() => {
-      updateGraphBodyHeight();
-    });
-    if (viewRef.value) layoutObserver.observe(viewRef.value);
-    if (toolbarRef.value) layoutObserver.observe(toolbarRef.value);
-  }
   // H5：ResizeObserver 确保 canvas 首次有尺寸时触发渲染
   const el = canvasRef.value;
   if (el && typeof ResizeObserver !== "undefined") {
@@ -131,8 +106,6 @@ onMounted(() => {
     });
     resizeObserver.observe(el);
   }
-  window.addEventListener("resize", updateGraphBodyHeight);
-  void nextTick(updateGraphBodyHeight);
   void loadAndRender();
 });
 
@@ -147,9 +120,6 @@ watch(
 onBeforeUnmount(() => {
   resizeObserver?.disconnect();
   resizeObserver = null;
-  layoutObserver?.disconnect();
-  layoutObserver = null;
-  window.removeEventListener("resize", updateGraphBodyHeight);
   if (resizeRaf != null) {
     window.cancelAnimationFrame(resizeRaf);
     resizeRaf = null;
@@ -166,9 +136,9 @@ function retryInit(): void {
 </script>
 
 <template>
-  <section ref="viewRef" class="view-graph">
+  <section class="view-graph">
     <!-- 顶部工具栏区（auto 高度，内容多时内部 wrap 换行） -->
-    <div ref="toolbarRef" class="band" style="margin-top: 0">
+    <div class="band" style="margin-top: 0">
       <GraphToolbar />
       <GraphTools
         v-model:addNodeOpen="addNodeOpen"
@@ -179,7 +149,7 @@ function retryInit(): void {
     </div>
 
     <!-- 画布 + 详情面板：宽屏并排、窄屏堆叠，详情面板独立滚动绝不挤到视口外 -->
-    <div class="graph-body" :class="{ 'has-detail': store.selectedNode || store.selectedEdgeId }" :style="graphBodyStyle">
+    <div class="graph-body" :class="{ 'has-detail': store.selectedNode || store.selectedEdgeId }">
       <div class="graph-canvas">
         <div ref="canvasRef" class="graph-canvas-inner" />
         <!-- 加载态：仅角落小指示器，绝不覆盖已渲染的画布（修残留"载入中"盖住图谱） -->
@@ -208,31 +178,38 @@ function retryInit(): void {
  * grid 行 minmax(0,1fr) 让画布吃剩余高度且可收缩（min-height:0 是关键，
  * 否则 grid 子项会被内容撑爆溢出视口）。详情面板高度受限于主区、内部独立滚动。 */
 .graph-body {
-  flex: 0 0 var(--graph-body-height);
-  min-height: var(--graph-body-height);
-  height: var(--graph-body-height);
+  flex: 0 0 auto;
+  min-height: 0;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  grid-template-rows: minmax(0, 1fr) auto;
+  grid-template-rows: auto auto;
   gap: 12px;
-  overflow: hidden;
 }
 
 @media (min-width: 980px) {
   .graph-body.has-detail {
+    height: calc(100vh - 280px);
+    height: calc(100dvh - 280px);
+    min-height: 420px;
     grid-template-columns: minmax(0, 1fr) 360px;
     grid-template-rows: minmax(0, 1fr);
   }
+
+  .graph-body.has-detail .graph-canvas {
+    height: 100%;
+    min-height: 0;
+  }
 }
 
-/* 画布：grid 单元格拉伸决定宽高。grid 行 minmax(380px,1fr) 保证画布至少 380px，
- * 杜绝被工具栏压扁成 2px（实测旧方案 iframe 500px 画布仅 2px）。 */
+/* 画布：用插件 iframe viewport 计算高度，避免 100% 高度链在 Dashboard 中塌陷。 */
 .graph-canvas {
   position: relative;
   min-width: 0;
   min-height: 0;
   width: 100%;
-  height: 100%;
+  height: calc(100vh - 280px);
+  height: calc(100dvh - 280px);
+  min-height: 420px;
   overflow: hidden;
 }
 
@@ -240,11 +217,5 @@ function retryInit(): void {
 .graph-canvas-inner {
   position: absolute;
   inset: 0;
-}
-
-.graph-canvas-inner :global(.vis-network),
-.graph-canvas-inner :global(canvas) {
-  width: 100% !important;
-  height: 100% !important;
 }
 </style>

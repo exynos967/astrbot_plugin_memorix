@@ -58,12 +58,10 @@
 }
 
 /* view-graph 主区布局（GraphView.vue）：顶部工具栏 band + 画布/详情主区。
- * 高度由 view-stack 提供；GraphView 内部用 ResizeObserver 计算 graph-body 高度，
- * 避免 flex/grid 百分比在插件 iframe 中解析成 0 或固定不变。 */
+ * 画布高度由 GraphView 使用 100dvh 计算，避免依赖插件 iframe 的 100% 高度链。 */
 .view-graph {
-  flex: 1 1 auto;
-  min-height: 0;
-  height: 100%;
+  flex: 0 0 auto;
+  min-height: 100%;
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -117,12 +115,20 @@ html[data-theme="dark"] .graph-canvas::before {
     linear-gradient(90deg, rgba(96, 165, 250, 0.08) 1px, transparent 1px);
 }
 
-/* vis-network 画布容器填满。这里是全局 CSS 文件，不能使用 SFC 专属的 :deep()。 */
-.graph-canvas .vis-network,
-.graph-canvas canvas {
-  position: relative;
+/* vis-network 画布容器填满。这里是全局 CSS 文件，不能使用 SFC 专属的 :deep()/:global()。 */
+.graph-canvas-inner {
+  position: absolute;
+  inset: 0;
   width: 100%;
   height: 100%;
+  min-height: 0;
+}
+
+.graph-canvas .vis-network,
+.graph-canvas .vis-network canvas {
+  position: relative;
+  width: 100% !important;
+  height: 100% !important;
 }
 
 .graph-empty {
