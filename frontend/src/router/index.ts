@@ -4,6 +4,8 @@ import LogsView from "@/views/LogsView.vue";
 import DashboardView from "@/views/DashboardView.vue";
 import SettingsView from "@/views/SettingsView.vue";
 import MemoryView from "@/views/MemoryView.vue";
+import PeopleView from "@/views/PeopleView.vue";
+import SourcesView from "@/views/SourcesView.vue";
 
 // 导航项配置：router 与 Sidebar 共用，避免双写（DRY）。
 // title/subtitle 从 legacy titles 字典（index.html 行 2538-2549）原样迁移。
@@ -34,6 +36,8 @@ const REAL_VIEWS: Record<string, () => Promise<unknown>> = {
   dashboard: () => Promise.resolve({ default: DashboardView }),
   settings: () => Promise.resolve({ default: SettingsView }),
   memory: () => Promise.resolve({ default: MemoryView }),
+  people: () => Promise.resolve({ default: PeopleView }),
+  sources: () => Promise.resolve({ default: SourcesView }),
   logs: () => Promise.resolve({ default: LogsView }),
 };
 

@@ -451,6 +451,22 @@ html[data-theme="dark"] .notice {
   font-weight: 650;
 }
 
+/* 工具栏：横向排列输入/按钮（从 legacy 行 1198-1208 迁移）。
+   多 view 共用（dashboard/memory/settings/people/sources），此前漏迁到共享层，
+   P5 补齐。min-width:0 保证 flex 子项可收缩。 */
+.toolbar {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: end;
+}
+
+.toolbar .field {
+  min-width: 138px;
+  flex: 1;
+}
+
 .input,
 .select,
 .textarea {

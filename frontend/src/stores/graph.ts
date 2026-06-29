@@ -23,6 +23,13 @@ export const useGraphStore = defineStore("graph", () => {
   /** 可选 scope 列表（来自 /api/scopes）。 */
   const scopeOptions = ref<ScopeOption[]>([]);
 
+  /**
+   * 图谱节点标签列表（来源候选菜单的 graph-node 候选源）。
+   * P5 阶段为空——P8 loadGraph 后由 GraphView 经 setNodeLabels 填充。
+   * 此处只放标签字符串，完整 rawNodes（含坐标等）仍留 P8。
+   */
+  const nodeLabels = ref<string[]>([]);
+
   function setScope(scope: string): void {
     currentScope.value = String(scope || "");
   }
@@ -35,6 +42,10 @@ export const useGraphStore = defineStore("graph", () => {
     scopeOptions.value = Array.isArray(options) ? options : [];
   }
 
+  function setNodeLabels(labels: string[]): void {
+    nodeLabels.value = Array.isArray(labels) ? labels.filter(Boolean) : [];
+  }
+
   /** 实际用于请求的 scope：选中非空则用选中，否则回退到解析的默认 scope。 */
   function effectiveScope(): string {
     return currentScope.value || resolvedScope.value || "";
@@ -44,9 +55,11 @@ export const useGraphStore = defineStore("graph", () => {
     currentScope,
     resolvedScope,
     scopeOptions,
+    nodeLabels,
     setScope,
     setResolvedScope,
     setScopeOptions,
+    setNodeLabels,
     effectiveScope,
   };
 });

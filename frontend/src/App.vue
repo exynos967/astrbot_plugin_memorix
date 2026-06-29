@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import AppShell from "@/components/shell/AppShell.vue";
+import CandidateMenu from "@/components/common/CandidateMenu.vue";
 import { useTheme } from "@/composables/useTheme";
 import { useAppStore } from "@/stores/app";
 
@@ -11,6 +12,9 @@ const app = useAppStore();
 
 <template>
   <AppShell />
+
+  <!-- 全局候选菜单（单例，teleport 到 body；修 H8 内部滚动链） -->
+  <CandidateMenu />
 
   <!-- 全局错误 toast：修复 legacy 多处 catch 静默吞错 -->
   <div class="error-toast-stack" aria-live="polite">
