@@ -178,7 +178,7 @@ function retryInit(): void {
  * grid 行 minmax(0,1fr) 让画布吃剩余高度且可收缩（min-height:0 是关键，
  * 否则 grid 子项会被内容撑爆溢出视口）。详情面板高度受限于主区、内部独立滚动。 */
 .graph-body {
-  flex: 1 1 auto;
+  flex: 1 1 0;
   min-height: 0;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
