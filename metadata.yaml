@@ -1,7 +1,7 @@
 name: astrbot_plugin_memorix
 display_name: Memorix
 desc: 让AstrBot拥有可检索、可维护、可追溯的长期记忆——图谱+向量混合检索，内置生命周期管理与 WebUI。
-version: v0.9.5
+version: v0.9.6
 author: 薄暝
 repo: https://github.com/exynos967/astrbot_plugin_memorix
 support_platforms:

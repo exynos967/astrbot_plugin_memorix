@@ -7,7 +7,10 @@ context while avoiding binary/raw CQ payloads.
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
+import tempfile
 import uuid
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -362,3 +365,102 @@ def message_format_options_from_config(config: dict[str, Any] | None) -> Message
         max_text_chars=max(200, int(ingest_cfg.get("max_message_chars", 2000) or 2000)),
         skip_placeholder_only=bool(ingest_cfg.get("skip_placeholder_only", True)),
     )
+
+
+def _coerce_event_chain(event: Any) -> list[Any]:
+    """Extract message component chain from event."""
+    message_obj = getattr(event, "message_obj", None)
+    chain = getattr(message_obj, "message", []) or []
+    if isinstance(chain, (list, tuple)):
+        return list(chain)
+    nested = getattr(chain, "chain", None)
+    if isinstance(nested, (list, tuple)):
+        return list(nested)
+    return []
+
+
+async def copy_images_to_safe_dir(event: Any) -> list[str]:
+    """Copy Image component files to a pipeline-safe cache directory."""
+    safe_paths: list[str] = []
+    cache_dir = os.path.join(tempfile.gettempdir(), "astrbot_memorix_img_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    for comp in _coerce_event_chain(event):
+        if not isinstance(comp, Image):
+            continue
+        try:
+            src = await comp.convert_to_file_path()
+            if not src:
+                continue
+            dst = os.path.join(cache_dir, f"{uuid.uuid4().hex}.jpg")
+            shutil.copy2(src, dst)
+            safe_paths.append(dst)
+        except Exception:
+            logger.debug("[memorix] copy image to cache failed", exc_info=True)
+    return safe_paths
+
+
+def resolve_vision_provider(context: Any, config: dict[str, Any], event: Any) -> Provider | None:
+    """Resolve the vision-capable provider from config/context."""
+    if context is None:
+        return None
+    ingest_cfg = config.get("ingest", {}) if isinstance(config.get("ingest"), dict) else {}
+    caption_cfg = ingest_cfg.get("image_caption", {}) if isinstance(ingest_cfg.get("image_caption"), dict) else {}
+    provider_id = str(caption_cfg.get("provider_id", "") or "").strip()
+    provider: Provider | None = None
+    try:
+        if provider_id:
+            provider = context.get_provider_by_id(provider_id)
+        if provider is None:
+            provider = context.get_using_provider(getattr(event, "unified_msg_origin", None))
+    except Exception:
+        return None
+    return provider if isinstance(provider, Provider) else None
+
+
+async def enrich_text_with_captions(
+    text: str,
+    safe_paths: list[str],
+    context: Any,
+    config: dict[str, Any],
+    event: Any,
+) -> str:
+    """Replace [图片] placeholders with vision API captions in background task."""
+    if not safe_paths:
+        return text
+    provider = resolve_vision_provider(context, config, event)
+    if provider is None:
+        return text
+    opts = message_format_options_from_config(config)
+    max_count = max(0, int(opts.image_caption_max_count))
+    captioned = 0
+    current = text
+    for image_path in safe_paths:
+        if max_count > 0 and captioned >= max_count:
+            break
+        compressed = None
+        try:
+            compressed = await compress_image(image_path)
+            resp = await provider.text_chat(
+                prompt=opts.image_caption_prompt,
+                session_id=uuid.uuid4().hex,
+                image_urls=[compressed],
+                persist=False,
+            )
+            caption = str(getattr(resp, "completion_text", "") or "").strip()
+            if caption:
+                filtered = "".join(c for c in caption if ord(c) >= 0x20 or c in "\n\r\t")
+                current = current.replace("[图片]", f"[图片：{filtered}]", 1)
+                captioned += 1
+        except Exception:
+            logger.debug("[memorix] background image caption failed", exc_info=True)
+        finally:
+            if compressed and compressed != image_path:
+                try:
+                    os.remove(compressed)
+                except Exception:
+                    pass
+            try:
+                os.remove(image_path)
+            except Exception:
+                pass
+    return current
