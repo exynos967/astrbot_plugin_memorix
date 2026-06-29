@@ -8,6 +8,7 @@ import PeopleView from "@/views/PeopleView.vue";
 import SourcesView from "@/views/SourcesView.vue";
 import EpisodesView from "@/views/EpisodesView.vue";
 import ImportView from "@/views/ImportView.vue";
+import QueryView from "@/views/QueryView.vue";
 
 // 导航项配置：router 与 Sidebar 共用，避免双写（DRY）。
 // title/subtitle 从 legacy titles 字典（index.html 行 2538-2549）原样迁移。
@@ -42,6 +43,7 @@ const REAL_VIEWS: Record<string, () => Promise<unknown>> = {
   sources: () => Promise.resolve({ default: SourcesView }),
   episodes: () => Promise.resolve({ default: EpisodesView }),
   import: () => Promise.resolve({ default: ImportView }),
+  query: () => Promise.resolve({ default: QueryView }),
   logs: () => Promise.resolve({ default: LogsView }),
 };
 

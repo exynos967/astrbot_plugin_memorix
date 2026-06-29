@@ -467,6 +467,44 @@ html[data-theme="dark"] .notice {
   flex: 1;
 }
 
+/* segmented 分段控件：从 legacy 行 1251-1288 迁移，query-mode 等复用。 */
+.segmented {
+  max-width: 100%;
+  display: inline-flex;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid rgba(107, 139, 176, 0.24);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.52);
+  overflow-x: auto;
+}
+
+.segmented button {
+  flex: 0 0 auto;
+  min-height: 34px;
+  padding: 6px 12px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 720;
+  transition:
+    color 0.16s ease,
+    background 0.16s ease;
+}
+
+.segmented button:hover {
+  color: var(--accent-ink);
+  background: rgba(37, 99, 235, 0.08);
+}
+
+.segmented button.active {
+  color: #ffffff;
+  background: var(--accent);
+}
+
 .input,
 .select,
 .textarea {
