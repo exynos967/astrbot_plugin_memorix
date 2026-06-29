@@ -175,8 +175,8 @@ function retryInit(): void {
 
 <style scoped>
 /* 画布+详情主区：宽屏左右并排（画布自适应、详情定宽可滚），窄屏堆叠。
- * grid 让画布吃剩余空间，详情面板高度受限于主区、内部 overflow:auto 独立滚动，
- * 杜绝详情面板被挤到视口外被浏览器截断。 */
+ * grid 行 minmax(0,1fr) 让画布吃剩余高度且可收缩（min-height:0 是关键，
+ * 否则 grid 子项会被内容撑爆溢出视口）。详情面板高度受限于主区、内部独立滚动。 */
 .graph-body {
   flex: 1 1 auto;
   min-height: 0;
@@ -194,22 +194,22 @@ function retryInit(): void {
   }
 }
 
+/* 画布：完全由 grid 单元格拉伸决定宽高，禁用固定 height/min-height。
+ * position:relative 作为 .graph-canvas-inner(inset:0) 的定位上下文。
+ * min-height:0 允许在 grid 内收缩，杜绝 min-height:320px 撑死不随窗口变化。 */
 .graph-canvas {
   position: relative;
+  min-width: 0;
   min-height: 0;
   width: 100%;
-  height: auto;
-  align-self: stretch;
-  justify-self: stretch;
+  height: 100%;
   overflow: hidden;
 }
 
+/* vis 画布容器：绝对定位填满 .graph-canvas，确保 vis-network canvas 撑满分配高度。 */
 .graph-canvas-inner {
   position: absolute;
   inset: 0;
-  width: 100%;
-  height: 100%;
-  min-height: 0;
 }
 
 .graph-canvas-inner :global(.vis-network),

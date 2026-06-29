@@ -75,10 +75,11 @@
 }
 
 .graph-canvas {
+  /* 尺寸由 GraphView.vue scoped 的 grid 单元格拉伸决定（height:100%; min-height:0），
+   * 这里只保留视觉样式。删除 min-height:320px——固定底线导致画布不随窗口高度自适应、
+   * 且窗口小时下半部分被截断。 */
   position: relative;
-  min-height: 320px;
   width: 100%;
-  height: 100%;
   border: 1px solid rgba(107, 139, 176, 0.24);
   border-radius: 24px;
   background:
