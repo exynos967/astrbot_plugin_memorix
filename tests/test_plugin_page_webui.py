@@ -48,17 +48,34 @@ def test_plugin_page_assets_exist() -> None:
         assert asset.exists(), f"产物引用的资源缺失：{ref}"
 
 
-def test_plugin_page_vis_chunk_isolated() -> None:
-    """vis-network 单独 chunk 懒加载：主 bundle 不内联 vis，控体积（P8 硬约束）。
+def test_plugin_page_single_bundle_no_subchunks() -> None:
+    """单 bundle：禁用代码分割，所有 JS/CSS 内联进单文件（无子 chunk）。
 
-    主入口 chunk（index-*.js）由 GraphView 动态 import vis，配合 vite manualChunks.vis
-    把 vis-network+vis-data 归独立 chunk。这里断言 assets 下存在独立的 vis-*.js chunk。
+    AstrBot iframe sandbox 不带 allow-same-origin → iframe origin=null → 动态 import/
+    modulepreload/CSS 子 chunk 请求被浏览器 CORS 拦截（ACAO:* 对 origin=null 不生效），
+    唯独 graph 页依赖动态 import vis/GraphView 子 chunk → 加载失败画布空。
+    根治：vite.config.ts inlineDynamicImports:true + cssCodeSplit:false，全打成单 bundle，
+    HTML <script>/<link> 同源直接加载不走 fetch CORS。
+    本断言确保不回退到多 chunk（多 chunk 会在 sandbox 下 CORS 失败）。
     """
     assets_dir = VUE_PAGE.parent / "assets"
-    vis_chunks = list(assets_dir.glob("vis-*.js"))
-    assert vis_chunks, "未生成独立 vis chunk，manualChunks.vis 配置可能失效"
-    # vis chunk 应有体积（非空占位）
-    assert any(p.stat().st_size > 1000 for p in vis_chunks), "vis chunk 体积异常"
+    js_files = list(assets_dir.glob("*.js"))
+    css_files = list(assets_dir.glob("*.css"))
+    # 单 bundle：恰好 1 个 JS + 1 个 CSS（index-*.js / style-*.css）
+    assert len(js_files) == 1, (
+        f"期望单 JS bundle，实际 {len(js_files)} 个 JS 文件：{[f.name for f in js_files]}。"
+        "多 chunk 在 AstrBot sandbox iframe(origin=null) 下会 CORS 失败，请确认 "
+        "vite.config.ts inlineDynamicImports:true 未被移除。"
+    )
+    assert len(css_files) == 1, (
+        f"期望单 CSS bundle，实际 {len(css_files)} 个 CSS 文件。"
+        "多 CSS chunk 同样 CORS 失败，请确认 cssCodeSplit:false。"
+    )
+    # 主 bundle 必须内联 vis（含 Network 构造），证明 vis 已打进单 bundle
+    main_js = js_files[0].read_text(encoding="utf-8")
+    assert "forceAtlas2Based" in main_js or "vis-network" in main_js, (
+        "主 bundle 未内联 vis-network，可能仍走动态 import（会 CORS 失败）。"
+    )
 
 
 def test_plugin_page_chunks_use_spaced_esm_imports() -> None:

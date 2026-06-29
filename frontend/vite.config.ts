@@ -52,12 +52,16 @@ export default defineConfig({
     sourcemap: false,
     assetsInlineLimit: 8192,
     chunkSizeWarningLimit: 1200,
-    cssCodeSplit: true,
-    // vis-network 单独 chunk 懒加载：GraphView 动态 import vis-network，
-    // 配合 manualChunks 把 vis-network + vis-data 归到 vis chunk 控制体积（首屏不加载）。
+    // ⚠ AstrBot iframe sandbox 不带 allow-same-origin → iframe origin=null → 子 chunk
+    // （动态 import / modulepreload / CSS chunk）请求被浏览器 CORS 拦截（ACAO:* 对 origin=null
+    // 不生效），唯独 graph 页依赖动态 import vis/GraphView 子 chunk → 加载失败画布空。
+    // 根治：禁用代码分割，所有 JS+CSS 内联进单 bundle，HTML <script>/<link> 同源直接加载，
+    // 不走 fetch CORS。代价：主 bundle 含 vis（~500KB），首屏略慢，但 AstrBot no-store 反正重载。
+    cssCodeSplit: false,
     rollupOptions: {
       output: {
-        manualChunks: { vis: ["vis-network", "vis-data"] },
+        // 单 bundle：禁用 manualChunks + 内联所有动态 import，杜绝子 chunk 跨域加载
+        inlineDynamicImports: true,
       },
     },
   },
