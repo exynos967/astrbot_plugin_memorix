@@ -88,6 +88,15 @@
   </div>
 </template>
 
+<style scoped>
+/* 作为 .graph-body grid 列子项：独立纵向滚动，min-height:0 允许收缩不撑破父容器。
+ * 根 .band 默认 overflow:hidden 会裁内容，这里覆写为 auto 让详情可滚。 */
+.band {
+  min-height: 0;
+  overflow: auto;
+}
+</style>
+
 <script setup lang="ts">
 import { ref, computed, watch, inject } from "vue";
 import { storeToRefs } from "pinia";

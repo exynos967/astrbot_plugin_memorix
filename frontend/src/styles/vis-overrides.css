@@ -57,19 +57,21 @@
   padding-inline: 10px;
 }
 
-.graph-wrap {
-  height: 100%;
-  min-height: 0;
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
-  gap: 12px;
-}
-
+/* view-graph 主区布局（GraphView.vue）：顶部工具栏 band（auto）+ 画布/详情主区（flex:1）。
+ * 删除原 .graph-wrap（grid-template-rows:auto minmax(0,1fr) 会把画布撑满、
+ * 详情面板挤到视口外被截断）。改由 .graph-body（GraphView scoped）管理画布+详情并排。 */
 .view-graph {
   height: 100%;
   min-height: 0;
   display: flex;
   flex-direction: column;
+  gap: 12px;
+}
+
+/* 详情面板作为 grid 子项：高度受限于主区、内部独立滚动，绝不溢出视口。
+ * min-height:0 是 flex/grid 子项允许收缩到内容以下的关键。 */
+.view-graph .band {
+  flex-shrink: 0;
 }
 
 .graph-canvas {
@@ -131,6 +133,38 @@ html[data-theme="dark"] .graph-canvas::before {
   color: var(--muted);
   font-size: 13px;
   pointer-events: none;
+}
+
+/* 加载指示器：角落小徽标，绝不 inset:0 覆盖画布。
+ * 仅在数据未就绪或渲染间隙显示，图谱一旦画出即隐藏（GraphView.vue loading||rendering）。 */
+.graph-loading-badge {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 2;
+  padding: 5px 12px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.78);
+  border: 1px solid rgba(107, 139, 176, 0.3);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  pointer-events: none;
+  box-shadow: 0 1px 3px rgba(15, 39, 64, 0.12);
+  backdrop-filter: var(--blur-soft);
+  -webkit-backdrop-filter: var(--blur-soft);
+  animation: graph-badge-pulse 1.4s ease-in-out infinite;
+}
+
+html[data-theme="dark"] .graph-loading-badge {
+  background: rgba(15, 23, 42, 0.82);
+  border-color: var(--hairline);
+  color: var(--muted);
+}
+
+@keyframes graph-badge-pulse {
+  0%, 100% { opacity: 0.72; }
+  50% { opacity: 1; }
 }
 
 .topology-row {
