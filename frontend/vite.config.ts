@@ -22,8 +22,13 @@ export default defineConfig({
     assetsInlineLimit: 8192,
     chunkSizeWarningLimit: 1200,
     cssCodeSplit: true,
-    // vis-network 单独 chunk 懒加载：P8 引入 GraphView 时启用，避免 P0 产出空 chunk。
-    // rollupOptions.output.manualChunks = { vis: ["vis-network"] }
+    // vis-network 单独 chunk 懒加载：GraphView 动态 import vis-network，
+    // 配合 manualChunks 把 vis-network + vis-data 归到 vis chunk 控制体积（首屏不加载）。
+    rollupOptions: {
+      output: {
+        manualChunks: { vis: ["vis-network", "vis-data"] },
+      },
+    },
   },
   server: {
     // dev 仅组件级开发；集成调试走 build 产物经 AstrBot 托管（iframe 同源约束）。

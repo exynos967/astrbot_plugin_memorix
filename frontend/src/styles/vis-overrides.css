@@ -1,0 +1,147 @@
+/* Graph 视图专属样式：从 legacy index.html 行 1211-1396, 1521-1532 迁移。
+ * 放单独文件便于 vis-network 相关样式集中管理（禁裸 @import，由 main.ts JS import 注入）。
+ */
+
+.graph-scope-field {
+  flex: 1.35 1 190px;
+  min-width: 190px;
+}
+
+.graph-zoom {
+  flex: 1 1 300px;
+  max-width: 390px;
+  min-height: var(--control-h);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 7px;
+  border: 1px solid rgba(107, 139, 176, 0.26);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.58);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.68);
+}
+
+.graph-zoom .btn.icon {
+  width: 34px;
+  min-width: 34px;
+  min-height: 34px;
+  border-radius: 12px;
+}
+
+.graph-zoom input {
+  flex: 1;
+  min-width: 86px;
+  accent-color: var(--accent);
+}
+
+.zoom-value {
+  min-width: 42px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  text-align: right;
+}
+
+.graph-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(107, 139, 176, 0.18);
+}
+
+.graph-tools .tag {
+  min-height: 30px;
+  padding-inline: 10px;
+}
+
+.graph-wrap {
+  height: 100%;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 12px;
+}
+
+.view-graph {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.graph-canvas {
+  position: relative;
+  min-height: 320px;
+  width: 100%;
+  height: 100%;
+  border: 1px solid rgba(107, 139, 176, 0.24);
+  border-radius: 24px;
+  background:
+    radial-gradient(circle at 50% 46%, rgba(59, 130, 246, 0.14), transparent 32%),
+    radial-gradient(circle at 22% 18%, rgba(255, 255, 255, 0.9), transparent 26%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.72), rgba(239, 246, 255, 0.44));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.74), var(--shadow-xs);
+  overflow: hidden;
+  backdrop-filter: var(--blur-soft);
+  -webkit-backdrop-filter: var(--blur-soft);
+}
+
+html[data-theme="dark"] .graph-canvas {
+  border-color: var(--hairline);
+  background:
+    radial-gradient(circle at 50% 46%, rgba(96, 165, 250, 0.12), transparent 34%),
+    radial-gradient(circle at 22% 18%, rgba(30, 41, 59, 0.74), transparent 28%),
+    linear-gradient(180deg, rgba(15, 23, 42, 0.88), rgba(2, 6, 23, 0.7));
+}
+
+.graph-canvas::before {
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(37, 99, 235, 0.055) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(37, 99, 235, 0.055) 1px, transparent 1px);
+  background-size: 36px 36px;
+  content: "";
+  pointer-events: none;
+}
+
+html[data-theme="dark"] .graph-canvas::before {
+  background-image:
+    linear-gradient(rgba(96, 165, 250, 0.08) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(96, 165, 250, 0.08) 1px, transparent 1px);
+}
+
+/* vis-network 画布容器填满 */
+.graph-canvas :deep(.vis-network),
+.graph-canvas :deep(canvas) {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+.graph-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-size: 13px;
+  pointer-events: none;
+}
+
+.topology-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 9px 0;
+  border-top: 1px solid rgba(107, 139, 176, 0.18);
+}
+
+.topology-row:first-child {
+  border-top: 0;
+}

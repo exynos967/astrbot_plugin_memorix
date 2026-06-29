@@ -44,6 +44,8 @@ const REAL_VIEWS: Record<string, () => Promise<unknown>> = {
   episodes: () => Promise.resolve({ default: EpisodesView }),
   import: () => Promise.resolve({ default: ImportView }),
   query: () => Promise.resolve({ default: QueryView }),
+  // graph 动态 import：vis-network 体积大，单独 chunk 懒加载，首屏不加载（配合 vite manualChunks.vis）
+  graph: () => import("@/views/GraphView.vue"),
   logs: () => Promise.resolve({ default: LogsView }),
 };
 

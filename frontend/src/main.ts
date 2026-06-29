@@ -5,6 +5,7 @@ import { router } from "./router";
 import "./styles/tokens.css";
 import "./styles/base.css";
 import "./styles/components.css";
+import "./styles/vis-overrides.css";
 
 const app = createApp(App);
 app.use(createPinia());
