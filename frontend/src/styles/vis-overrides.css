@@ -58,12 +58,12 @@
 }
 
 /* view-graph 主区布局（GraphView.vue）：顶部工具栏 band + 画布/详情主区。
- * 覆盖 view-stack :deep(>*) 的 flex:1，改 flex:0 0 auto + min-height:100%——
- * 大窗口占满视口，小窗口画布 min-height:380 保底、整体超出由 view-stack(overflow:auto) 滚动。
- * 杜绝画布被工具栏压扁成 2px（实测旧方案 iframe 500px 画布仅 2px）。 */
+ * 高度由 view-stack 提供；GraphView 内部用 ResizeObserver 计算 graph-body 高度，
+ * 避免 flex/grid 百分比在插件 iframe 中解析成 0 或固定不变。 */
 .view-graph {
-  flex: 0 0 auto;
-  min-height: 100%;
+  flex: 1 1 auto;
+  min-height: 0;
+  height: 100%;
   display: flex;
   flex-direction: column;
   gap: 12px;
