@@ -813,13 +813,13 @@ class MemorixPlugin(Star):
         asyncio.create_task(self._record_llm_response_background(event, text, user_text, safe_paths))
 
     async def _record_llm_response_background(self, event: AstrMessageEvent, text: str, user_text: str, safe_paths: list[str] | None = None):
-        if safe_paths:
-            user_text = await enrich_text_with_captions(user_text, safe_paths, self.context, self.config, event)
-        adapted = AstrbotEventAdapter.from_event(event, self._resolve_scope(event))
-        if not await self._is_adapted_chat_enabled(adapted, adapted.sender_id):
-            logger.debug("[memorix] skip chat-filtered LLM response %s", self._event_ctx_text(event, adapted.scope_key))
-            return
         try:
+            if safe_paths:
+                user_text = await enrich_text_with_captions(user_text, safe_paths, self.context, self.config, event)
+            adapted = AstrbotEventAdapter.from_event(event, self._resolve_scope(event))
+            if not await self._is_adapted_chat_enabled(adapted, adapted.sender_id):
+                logger.debug("[memorix] skip chat-filtered LLM response %s", self._event_ctx_text(event, adapted.scope_key))
+                return
             ingested = await self._ingest_event_message(event, "assistant", text)
             if not ingested:
                 return

@@ -417,6 +417,14 @@ def resolve_vision_provider(context: Any, config: dict[str, Any], event: Any) ->
     return provider if isinstance(provider, Provider) else None
 
 
+def _remove_quiet(path: str) -> None:
+    if path:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+
 async def enrich_text_with_captions(
     text: str,
     safe_paths: list[str],
@@ -429,14 +437,18 @@ async def enrich_text_with_captions(
         return text
     provider = resolve_vision_provider(context, config, event)
     if provider is None:
+        for p in safe_paths:
+            _remove_quiet(p)
         return text
     opts = message_format_options_from_config(config)
     max_count = max(0, int(opts.image_caption_max_count))
     captioned = 0
     current = text
+    remaining_paths: list[str] = []
     for image_path in safe_paths:
         if max_count > 0 and captioned >= max_count:
-            break
+            remaining_paths.append(image_path)
+            continue
         compressed = None
         try:
             compressed = await compress_image(image_path)
@@ -454,13 +466,8 @@ async def enrich_text_with_captions(
         except Exception:
             logger.debug("[memorix] background image caption failed", exc_info=True)
         finally:
-            if compressed and compressed != image_path:
-                try:
-                    os.remove(compressed)
-                except Exception:
-                    pass
-            try:
-                os.remove(image_path)
-            except Exception:
-                pass
+            _remove_quiet(compressed if compressed != image_path else None)
+            _remove_quiet(image_path)
+    for p in remaining_paths:
+        _remove_quiet(p)
     return current
