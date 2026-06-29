@@ -256,7 +256,6 @@ class MemorixServer:
                 raise HTTPException(status_code=503, detail="Graph store not initialized")
             
             node_names = self.plugin.graph_store.get_nodes()
-            scores = {}  # saliency 分数（exclude_leaf 时填充，截断逻辑也复用）
 
             # --- 智能显著性过滤 (Saliency Filtering) ---
             if exclude_leaf:
@@ -567,29 +566,11 @@ class MemorixServer:
                 except Exception as e:
                     logger.warning(f"Failed to inject V5 metadata: {e}")
 
-            # 瓶颈4优化：全量节点/边无上限会传几万节点到前端，vis 渲染卡死浏览器（>2000 明显卡）。
-            # 超过 MAX_GRAPH_NODES 时按 PageRank 保留 top-N 核心节点，丢弃裁剪后的悬空边，
-            # 在 debug 里标注截断。优先尊重 exclude_leaf 已做的密度过滤，仅在仍超量时二次裁剪。
-            MAX_GRAPH_NODES = 2000
-            truncated = False
-            if len(nodes) > MAX_GRAPH_NODES:
-                truncated = True
-                # saliency：exclude_leaf 时已填充；否则取 store 缓存（不重复计算 PageRank）
-                saliency = scores if scores else (self.plugin.graph_store.get_saliency_scores() if self.plugin.graph_store else {})
-                if saliency:
-                    keep_ids = {n["id"] for n in sorted(nodes, key=lambda x: saliency.get(x["id"], 0), reverse=True)[:MAX_GRAPH_NODES]}
-                else:
-                    keep_ids = {n["id"] for n in nodes[:MAX_GRAPH_NODES]}
-                nodes = [n for n in nodes if n["id"] in keep_ids]
-                edges = [e for e in edges if e["from"] in keep_ids and e["to"] in keep_ids]
-                logger.info(f"[Graph] 节点超 {MAX_GRAPH_NODES}，按显著性截断至 {len(nodes)} 节点 / {len(edges)} 边")
-
             debug_info = {
                 "relation_count": relation_count,
                 "sample_key": list(edge_predicates.keys())[0] if edge_predicates else None,
                 "edge_count": len(edges),
                 "exclude_leaf": exclude_leaf,
-                "truncated": truncated,
             }
 
             return {"nodes": nodes, "edges": edges, "debug": debug_info}
