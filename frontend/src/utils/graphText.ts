@@ -107,9 +107,12 @@ export function buildLabelUpdates(
   });
 }
 
-/** scope 标签（与 legacy graphScopeLabel 一致）。 */
+/** scope 标签（与 legacy graphScopeLabel 一致）。
+ * "default" 是后端在无会话触发 runtime 时的兜底作用域标识（scope_resolver 兜底），
+ * 不该原样展示给用户，统一映射为「自动 / 最近」。 */
 export function scopeLabel(scopeKey: string, options?: { value: string; label?: string }[]): string {
   const key = String(scopeKey || "");
+  if (key === "default") return "自动 / 最近";
   const known = (options || []).find((item) => item.value === key);
   if (known?.label) return known.label;
   const parts = key.split(":");

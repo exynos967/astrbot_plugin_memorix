@@ -100,7 +100,13 @@ export const useGraphStore = defineStore("graph", () => {
   async function loadScopes(): Promise<void> {
     try {
       const data = await fetchScopes();
-      setScopeOptions(data.scopes || []);
+      // 后端在无会话触发 runtime 时兜底返回字面量 "default"（scope_resolver 兜底），
+      // 这是内部作用域标识，不该原样展示给用户。下拉已有静态「自动 / 最近」option（value=""）
+      // 对应 currentScope 为空→effectiveScope 回退 resolvedScope(default) 的语义，
+      // 故过滤掉 default 项避免重复展示；保留真实作用域（如 aiocqhttp:group:xxx）。
+      const rawScopes = data.scopes || [];
+      const scopes = rawScopes.filter((s) => s.value !== "default");
+      setScopeOptions(scopes);
       setResolvedScope(data.current || "");
     } catch (err) {
       app.pushError(errText(err), "loadGraphScopes");
