@@ -169,6 +169,16 @@ export function useVisNetwork(opts: UseVisNetworkOptions = {}) {
     } as never);
   }
 
+  function syncNetworkSize(): boolean {
+    const net = network.value;
+    if (!net || !containerEl) return false;
+    const width = containerEl.clientWidth;
+    const height = containerEl.clientHeight;
+    if (width <= 0 || height <= 0) return false;
+    net.setSize(`${width}px`, `${height}px`);
+    return true;
+  }
+
   /** RAF 节流标签更新（修 updateLabelsByZoom 性能）。 */
   function scheduleUpdateLabels(): void {
     if (labelRaf != null) return;
@@ -195,6 +205,7 @@ export function useVisNetwork(opts: UseVisNetworkOptions = {}) {
     fitInFlight = true;
     window.requestAnimationFrame(() => {
       try {
+        syncNetworkSize();
         net.redraw();
         net.fit({ animation: shouldAnimate(animated) ? { duration: 320, easingFunction: "easeInOutQuad" } : false });
         const delay = shouldAnimate(animated) ? 360 : 40;
@@ -204,6 +215,21 @@ export function useVisNetwork(opts: UseVisNetworkOptions = {}) {
         }, delay);
       } catch {
         fitInFlight = false;
+      }
+    });
+  }
+
+  function resizeGraphView(animated = false): void {
+    const net = network.value;
+    if (!net) return;
+    applyResponsiveOptions();
+    window.requestAnimationFrame(() => {
+      try {
+        syncNetworkSize();
+        net.redraw();
+        if (!store.userZoomed) fitGraphView(animated);
+      } catch {
+        /* ignore resize race during route changes */
       }
     });
   }
@@ -259,6 +285,7 @@ export function useVisNetwork(opts: UseVisNetworkOptions = {}) {
       store.userZoomed = false;
       clearAutoFit();
       applyResponsiveOptions();
+      syncNetworkSize();
       // C3：每次渲染前 off stabilized，避免旧 handler 泄漏
       net.off("stabilized");
       ns.clear();
@@ -459,6 +486,7 @@ export function useVisNetwork(opts: UseVisNetworkOptions = {}) {
     renderGraph,
     retryInit,
     fitGraphView,
+    resizeGraphView,
     setZoom,
     adjustZoom,
     focusNode,

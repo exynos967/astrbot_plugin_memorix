@@ -25,6 +25,7 @@ const { loading, initError } = storeToRefs(store);
 
 const canvasRef = ref<HTMLDivElement | null>(null);
 let resizeObserver: ResizeObserver | null = null;
+let resizeRaf: number | null = null;
 
 // 本地渲染标志：精确覆盖「数据已到但画布尚未画出」的中间态。
 // store.loading 仅覆盖网络请求阶段；rendering 覆盖 nextTick+RAF 的渲染间隙。
@@ -75,6 +76,20 @@ function renderWhenReady(): void {
   });
 }
 
+function scheduleCanvasResize(): void {
+  if (resizeRaf != null) return;
+  resizeRaf = window.requestAnimationFrame(() => {
+    resizeRaf = null;
+    const el = canvasRef.value;
+    if (!el || el.clientWidth <= 0 || el.clientHeight <= 0 || !store.rawNodes.length) return;
+    if (!vis.ready.value) {
+      renderWhenReady();
+      return;
+    }
+    vis.resizeGraphView(false);
+  });
+}
+
 /** 载入图谱数据并渲染。 */
 async function loadAndRender(): Promise<void> {
   await store.loadGraph();
@@ -87,8 +102,7 @@ onMounted(() => {
   const el = canvasRef.value;
   if (el && typeof ResizeObserver !== "undefined") {
     resizeObserver = new ResizeObserver(() => {
-      // 仅在已有数据但 network 未就绪时补渲染一次
-      if (store.rawNodes.length && !vis.ready.value) renderWhenReady();
+      scheduleCanvasResize();
     });
     resizeObserver.observe(el);
   }
@@ -106,6 +120,10 @@ watch(
 onBeforeUnmount(() => {
   resizeObserver?.disconnect();
   resizeObserver = null;
+  if (resizeRaf != null) {
+    window.cancelAnimationFrame(resizeRaf);
+    resizeRaf = null;
+  }
   // vis.destroy 由 useVisNetwork 的 onBeforeUnmount 处理
 });
 
@@ -160,12 +178,13 @@ function retryInit(): void {
  * grid 让画布吃剩余空间，详情面板高度受限于主区、内部 overflow:auto 独立滚动，
  * 杜绝详情面板被挤到视口外被浏览器截断。 */
 .graph-body {
-  flex: 1;
+  flex: 1 1 auto;
   min-height: 0;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   grid-template-rows: minmax(0, 1fr) auto;
   gap: 12px;
+  overflow: hidden;
 }
 
 @media (min-width: 980px) {
@@ -179,12 +198,23 @@ function retryInit(): void {
   position: relative;
   min-height: 0;
   width: 100%;
-  height: 100%;
-  min-height: 320px;
+  height: auto;
+  align-self: stretch;
+  justify-self: stretch;
+  overflow: hidden;
 }
 
 .graph-canvas-inner {
   position: absolute;
   inset: 0;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+}
+
+.graph-canvas-inner :global(.vis-network),
+.graph-canvas-inner :global(canvas) {
+  width: 100% !important;
+  height: 100% !important;
 }
 </style>

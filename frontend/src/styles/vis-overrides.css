@@ -116,9 +116,9 @@ html[data-theme="dark"] .graph-canvas::before {
     linear-gradient(90deg, rgba(96, 165, 250, 0.08) 1px, transparent 1px);
 }
 
-/* vis-network 画布容器填满 */
-.graph-canvas :deep(.vis-network),
-.graph-canvas :deep(canvas) {
+/* vis-network 画布容器填满。这里是全局 CSS 文件，不能使用 SFC 专属的 :deep()。 */
+.graph-canvas .vis-network,
+.graph-canvas canvas {
   position: relative;
   width: 100%;
   height: 100%;
