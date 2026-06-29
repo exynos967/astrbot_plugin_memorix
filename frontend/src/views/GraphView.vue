@@ -178,38 +178,29 @@ function retryInit(): void {
  * grid 行 minmax(0,1fr) 让画布吃剩余高度且可收缩（min-height:0 是关键，
  * 否则 grid 子项会被内容撑爆溢出视口）。详情面板高度受限于主区、内部独立滚动。 */
 .graph-body {
-  flex: 0 0 auto;
+  flex: 1 1 0;
   min-height: 0;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  grid-template-rows: auto auto;
+  grid-template-rows: minmax(0, 1fr) auto;
   gap: 12px;
+  overflow: hidden;
 }
 
 @media (min-width: 980px) {
   .graph-body.has-detail {
-    height: calc(100vh - 280px);
-    height: calc(100dvh - 280px);
-    min-height: 420px;
     grid-template-columns: minmax(0, 1fr) 360px;
     grid-template-rows: minmax(0, 1fr);
   }
-
-  .graph-body.has-detail .graph-canvas {
-    height: 100%;
-    min-height: 0;
-  }
 }
 
-/* 画布：用插件 iframe viewport 计算高度，避免 100% 高度链在 Dashboard 中塌陷。 */
+/* 画布：完全由 grid 单元格拉伸决定宽高，禁用固定 height/min-height。 */
 .graph-canvas {
   position: relative;
   min-width: 0;
   min-height: 0;
   width: 100%;
-  height: calc(100vh - 280px);
-  height: calc(100dvh - 280px);
-  min-height: 420px;
+  height: 100%;
   overflow: hidden;
 }
 
