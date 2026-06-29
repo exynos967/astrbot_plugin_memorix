@@ -3,6 +3,7 @@ import type { RouteRecordRaw } from "vue-router";
 import LogsView from "@/views/LogsView.vue";
 import DashboardView from "@/views/DashboardView.vue";
 import SettingsView from "@/views/SettingsView.vue";
+import MemoryView from "@/views/MemoryView.vue";
 
 // 导航项配置：router 与 Sidebar 共用，避免双写（DRY）。
 // title/subtitle 从 legacy titles 字典（index.html 行 2538-2549）原样迁移。
@@ -32,6 +33,7 @@ export const NAV_ITEMS: NavItem[] = [
 const REAL_VIEWS: Record<string, () => Promise<unknown>> = {
   dashboard: () => Promise.resolve({ default: DashboardView }),
   settings: () => Promise.resolve({ default: SettingsView }),
+  memory: () => Promise.resolve({ default: MemoryView }),
   logs: () => Promise.resolve({ default: LogsView }),
 };
 
