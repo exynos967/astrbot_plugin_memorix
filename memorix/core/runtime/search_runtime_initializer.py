@@ -275,7 +275,7 @@ def build_search_runtime(
             min_threshold=_get_config_value(plugin_config, "threshold.min_threshold", 0.3),
             max_threshold=_get_config_value(plugin_config, "threshold.max_threshold", 0.95),
             percentile=_get_config_value(plugin_config, "threshold.percentile", 75.0),
-            std_multiplier=_get_config_value(plugin_config, "threshold.std_multiplier", 1.5),
+            std_multiplier=1.5,  # MaiBot 亦未暴露；自适应阈值的 std 倍率，1.5 为经验最优值，固化为常量
             min_results=_get_config_value(plugin_config, "threshold.min_results", 3),
             enable_auto_adjust=_get_config_value(plugin_config, "threshold.enable_auto_adjust", True),
         )

@@ -187,7 +187,7 @@ async def initialize_storage_async(plugin: Any) -> None:
         batch_size=plugin.get_config("embedding.batch_size", 32),
         max_concurrent=plugin.get_config("embedding.max_concurrent", 5),
         default_dimension=plugin.get_config("embedding.dimension", 1024),
-        model_name=plugin.get_config("embedding.model_name", "auto"),
+        model_name="auto",
         dimension_request_mode=plugin.get_config("embedding.dimension_request_mode", "explicit"),
         retry_config=plugin.get_config("embedding.retry", {}),
     )
@@ -210,19 +210,16 @@ async def initialize_storage_async(plugin: Any) -> None:
         quantization_type=quantization_type,
         data_dir=data_dir / "vectors",
     )
-    plugin.vector_store.min_train_threshold = plugin.get_config("embedding.min_train_threshold", 40)
     plugin.paragraph_vector_store = VectorStore(
         dimension=detected_dimension,
         quantization_type=quantization_type,
         data_dir=data_dir / "vectors" / "paragraph",
     )
-    plugin.paragraph_vector_store.min_train_threshold = plugin.get_config("embedding.min_train_threshold", 40)
     plugin.graph_vector_store = VectorStore(
         dimension=detected_dimension,
         quantization_type=quantization_type,
         data_dir=data_dir / "vectors" / "graph",
     )
-    plugin.graph_vector_store.min_train_threshold = plugin.get_config("embedding.min_train_threshold", 40)
     vector_pools_cfg = plugin.get_config("retrieval.vector_pools", {}) or {}
     vector_pool_mode = (
         str(vector_pools_cfg.get("mode", "dual") if isinstance(vector_pools_cfg, dict) else "dual")
@@ -242,15 +239,9 @@ async def initialize_storage_async(plugin: Any) -> None:
         f"训练阈值: {plugin.vector_store.min_train_threshold}）"
     )
 
-    matrix_format_str = plugin.get_config("graph.sparse_matrix_format", "csr")
-    matrix_format_map = {
-        "csr": SparseMatrixFormat.CSR,
-        "csc": SparseMatrixFormat.CSC,
-    }
-    matrix_format = matrix_format_map.get(matrix_format_str, SparseMatrixFormat.CSR)
-
+    # 稀疏矩阵格式固定 CSR（原 graph.sparse_matrix_format 未暴露、默认即 csr，固化）。
     plugin.graph_store = GraphStore(
-        matrix_format=matrix_format,
+        matrix_format=SparseMatrixFormat.CSR,
         data_dir=data_dir / "graph",
     )
     logger.debug("图存储初始化完成")

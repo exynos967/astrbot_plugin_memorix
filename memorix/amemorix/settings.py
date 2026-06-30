@@ -24,7 +24,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "quantization_type": "int8",
         "batch_size": 32,
         "max_concurrent": 5,
-        "model_name": "auto",
         "retry": {"max_attempts": 5, "max_wait_seconds": 30, "min_wait_seconds": 2},
         "openai": {
             "base_url": "",
@@ -160,11 +159,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "min_threshold": 0.3,
         "max_threshold": 0.95,
         "percentile": 75.0,
-        "std_multiplier": 1.5,
         "min_results": 3,
         "enable_auto_adjust": True,
     },
-    "graph": {"sparse_matrix_format": "csr"},
     "advanced": {
         "enable_auto_save": True,
         "auto_save_interval_minutes": 5,

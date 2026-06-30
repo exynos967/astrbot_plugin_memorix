@@ -1089,7 +1089,7 @@ class SDKMemoryKernel:
             max_concurrent=int(self._cfg("embedding.max_concurrent", 5)),
             default_dimension=self.embedding_dimension,
             enable_cache=bool(self._cfg("embedding.enable_cache", False)),
-            model_name=str(self._cfg("embedding.model_name", "auto") or "auto"),
+            model_name="auto",
             dimension_request_mode=str(self._cfg("embedding.dimension_request_mode", "explicit") or "explicit"),
             retry_config=self._cfg("embedding.retry", {}) or {},
         )
@@ -1097,15 +1097,13 @@ class SDKMemoryKernel:
         provisional_dimension = stored_dimension or self.embedding_dimension
         self.embedding_dimension = int(provisional_dimension)
 
-        matrix_format = str(self._cfg("graph.sparse_matrix_format", "csr") or "csr").strip().lower()
-        graph_format = SparseMatrixFormat.CSC if matrix_format == "csc" else SparseMatrixFormat.CSR
-
+        # 稀疏矩阵格式固定 CSR（原 graph.sparse_matrix_format 未暴露、默认即 csr，固化）。
         self.vector_store = VectorStore(
             dimension=provisional_dimension,
             quantization_type=QuantizationType.INT8,
             data_dir=self.data_dir / "vectors",
         )
-        self.graph_store = GraphStore(matrix_format=graph_format, data_dir=self.data_dir / "graph")
+        self.graph_store = GraphStore(matrix_format=SparseMatrixFormat.CSR, data_dir=self.data_dir / "graph")
         self.metadata_store = MetadataStore(data_dir=self.data_dir / "metadata")
         self.metadata_store.connect()
 

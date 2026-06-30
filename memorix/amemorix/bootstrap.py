@@ -114,14 +114,13 @@ def build_context(settings: AppSettings) -> AppContext:
     metadata_dir.mkdir(parents=True, exist_ok=True)
 
     endpoint_cfg = resolve_openapi_endpoint_config(settings.config, section="embedding")
-    retry_cfg = settings.get("embedding.retry", {}) or {}
     configured_dim = _resolve_vector_dimension(settings, vectors_dir)
     adapter = create_embedding_api_adapter(
         batch_size=_safe_int(settings.get("embedding.batch_size", 32), 32),
         max_concurrent=_safe_int(settings.get("embedding.max_concurrent", 5), 5),
         default_dimension=configured_dim,
-        model_name=str(settings.get("embedding.model_name", "auto")),
-        retry_config=retry_cfg,
+        model_name="auto",
+        retry_config=settings.get("embedding.retry", {}) or {},
         base_url=str(endpoint_cfg.get("base_url", "")),
         api_key=str(endpoint_cfg.get("api_key", "")),
         openai_model=str(endpoint_cfg.get("model", "")),
@@ -132,8 +131,11 @@ def build_context(settings: AppSettings) -> AppContext:
     metadata_path = vectors_dir / "vectors_metadata.pkl"
     vector_dim = configured_dim
     embedding_enabled = bool(settings.get("embedding.enabled", False))
-    auto_detect = embedding_enabled and bool(settings.get("embedding.auto_detect_dimension", True))
-    if auto_detect and not metadata_path.exists():
+    # 维度自动探测恒定开启（embedding 启用时）：fresh store 探测真实维度对齐向量存储，
+    # 避免用户配置维度与模型实际输出不符导致索引错乱。原 embedding.auto_detect_dimension
+    # 开关从未在 schema 暴露、默认即 True，固化为恒定行为（dimensions 兼容性探测另由
+    # adapter.encode 入口独立保证，不依赖此开关）。
+    if embedding_enabled and not metadata_path.exists():
         probed_dim = _probe_embedding_dimension(adapter, configured_dim)
         if probed_dim != configured_dim:
             logger.info(
@@ -160,7 +162,6 @@ def build_context(settings: AppSettings) -> AppContext:
         quantization_type=quantization_type,
         data_dir=vectors_dir,
     )
-    vector_store.min_train_threshold = _safe_int(settings.get("embedding.min_train_threshold", 40), 40)
 
     # 双池子存储：始终构造（即使最终降级为 single，对象存在以备升级与回滚安全）。
     paragraph_vectors_dir = vectors_dir / "paragraph"
@@ -172,13 +173,11 @@ def build_context(settings: AppSettings) -> AppContext:
         quantization_type=quantization_type,
         data_dir=paragraph_vectors_dir,
     )
-    paragraph_vector_store.min_train_threshold = vector_store.min_train_threshold
     graph_vector_store = VectorStore(
         dimension=vector_dim,
         quantization_type=quantization_type,
         data_dir=graph_vectors_dir,
     )
-    graph_vector_store.min_train_threshold = vector_store.min_train_threshold
 
     # 读取双池模式：默认 dual；ready manifest 缺失时降级为 single。
     vector_pools_cfg = settings.get("retrieval.vector_pools", {}) or {}
@@ -196,15 +195,9 @@ def build_context(settings: AppSettings) -> AppContext:
                 "双池配置已开启，但 ready manifest 不可用，当前按单池检索与写入运行"
             )
 
-    matrix_format_map = {
-        "csr": SparseMatrixFormat.CSR,
-        "csc": SparseMatrixFormat.CSC,
-    }
-    matrix_format = matrix_format_map.get(
-        str(settings.get("graph.sparse_matrix_format", "csr")).strip().lower(),
-        SparseMatrixFormat.CSR,
-    )
-    graph_store = GraphStore(matrix_format=matrix_format, data_dir=graph_dir)
+    # 稀疏矩阵格式固定 CSR：CSR 是图遍历（出边邻居）的标准最优格式，CSC 几乎无场景需求。
+    # 原 graph.sparse_matrix_format 从未在 schema 暴露、默认即 csr，固化为常量。
+    graph_store = GraphStore(matrix_format=SparseMatrixFormat.CSR, data_dir=graph_dir)
     metadata_store = MetadataStore(data_dir=metadata_dir)
     metadata_store.connect()
 
@@ -289,7 +282,7 @@ def build_context(settings: AppSettings) -> AppContext:
             min_threshold=_safe_float(settings.get("threshold.min_threshold", 0.3), 0.3),
             max_threshold=_safe_float(settings.get("threshold.max_threshold", 0.95), 0.95),
             percentile=_safe_float(settings.get("threshold.percentile", 75.0), 75.0),
-            std_multiplier=_safe_float(settings.get("threshold.std_multiplier", 1.5), 1.5),
+            std_multiplier=1.5,  # MaiBot 亦未暴露；自适应阈值的 std 倍率，1.5 为经验最优值，固化为常量
             min_results=_safe_int(settings.get("threshold.min_results", 3), 3),
             enable_auto_adjust=bool(settings.get("threshold.enable_auto_adjust", True)),
         )
