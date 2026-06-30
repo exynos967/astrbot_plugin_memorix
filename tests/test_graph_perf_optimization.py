@@ -67,6 +67,29 @@ def test_edge_predicate_cache_lowercase_key_matches_case_variant():
     assert cache.get(("carol", "dave"), []) == []
 
 
+def test_get_graph_offloads_sync_to_thread():
+    """issue #19 回归：get_graph 必须把 CPU 密集同步构建丢进线程池，不得阻塞事件循环。
+
+    100M metadata.db 下，同步遍历段落/实体/关系 + PageRank 过滤 + 批量元数据查询是
+    CPU 密集且无 await 的逻辑。若直接跑在 async def get_graph 的事件循环上，会阻塞
+    整个 AstrBot webui（其余请求排队、刷新出不来、CPU 单核吃满、关浏览器也不释放）。
+    修复：get_graph 经 asyncio.to_thread 调用 _build_graph_sync，offload 到线程池。
+    本断言读取源码，确保 to_thread 调用链不被退化回同步内联。
+    """
+    import inspect
+    from memorix.webui import routes_compat as rc
+
+    src = inspect.getsource(rc.MemorixServer)
+    # _build_graph_sync 闭包存在，承接同步重计算
+    assert "_build_graph_sync" in src, "缺少 _build_graph_sync 闭包——同步构建可能又内联回 get_graph"
+    # get_graph 必须 to_thread offload（关键：issue #19 根治点）
+    assert "asyncio.to_thread(_build_graph_sync" in src, (
+        "get_graph 未用 asyncio.to_thread(_build_graph_sync, ...) offload 同步构建，"
+        "大 DB 下会重新阻塞事件循环（issue #19 复发）。"
+    )
+
+
 if __name__ == "__main__":
     test_edge_predicate_cache_lowercase_key_matches_case_variant()
+    test_get_graph_offloads_sync_to_thread()
     print("OK")

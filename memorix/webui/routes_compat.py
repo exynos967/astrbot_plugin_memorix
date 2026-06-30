@@ -167,7 +167,18 @@ class MemorixServer:
         
         @self.app.get("/api/graph")
         async def get_graph(exclude_leaf: bool = False, source: Optional[str] = None, density: float = 1.0):
-            """获取图谱数据，支持过滤叶子节点、来源及信息密度控制"""
+            """获取图谱数据，支持过滤叶子节点、来源及信息密度控制
+
+            重计算（遍历段落/实体/关系、PageRank 显著性过滤、批量元数据状态查询）为 CPU 密集且
+            全程无 await 的同步逻辑。若直接跑在事件循环上，大 metadata.db 时会阻塞整个 AstrBot
+            webui——其余请求排队、刷新出不来、CPU 单核吃满、关浏览器也不释放（issue #19）。
+            用 asyncio.to_thread 把同步构建丢进线程池 offload，事件循环立刻释放，其余请求恢复
+            响应。同步函数内抛出的 HTTPException 会随 to_thread 传播回事件循环，FastAPI 仍正常捕获。
+            """
+            return await asyncio.to_thread(_build_graph_sync, exclude_leaf, source, density)
+
+        def _build_graph_sync(exclude_leaf: bool, source: Optional[str], density: float):
+            """图谱同步构建（CPU 密集），由 get_graph 经 asyncio.to_thread 在线程池执行。"""
             
             # --- 分支 1: 按来源过滤 (Batch Filtering) ---
             if source:
