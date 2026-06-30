@@ -153,11 +153,12 @@ export const useGraphStore = defineStore("graph", () => {
       rawNodes.value = data.nodes || [];
       rawEdges.value = data.edges || [];
       // 填充候选标签（P5/P6/Query 依赖 nodeLabels，P7 relation 依赖 predicateLabels）
+      // 不限上限：候选源（graphNodeSource 等）已用 .slice(0, 10) 限制显示数量，
+      // 源池全量保证大图谱目标节点不丢失（issue #20：500 上限导致候选菜单检索不到）。
       const labels = rawNodes.value
         .map((n) => n.label || n.id)
         .filter(Boolean)
-        .sort((a, b) => String(a).localeCompare(String(b), "zh-CN"))
-        .slice(0, 500);
+        .sort((a, b) => String(a).localeCompare(String(b), "zh-CN"));
       setNodeLabels(labels);
       predicateLabels.value = Array.from(
         new Set(
