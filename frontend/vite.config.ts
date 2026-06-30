@@ -47,7 +47,7 @@ export default defineConfig({
     },
   },
   build: {
-    outDir: "../pages/memorix-vue",
+    outDir: "../pages/memorix",
     emptyOutDir: true,
     sourcemap: false,
     assetsInlineLimit: 8192,

@@ -5,19 +5,19 @@ import pytest
 from astrbot_plugin_memorix.memorix.webui.plugin_page_bridge import PluginPageWebUIBridge
 
 ROOT = Path(__file__).resolve().parents[1]
-VUE_PAGE = ROOT / "pages" / "memorix-vue" / "index.html"
+VUE_PAGE = ROOT / "pages" / "memorix" / "index.html"
 
 
 def test_plugin_page_embeds_dashboard_bridge() -> None:
-    """memorix-vue 产物可达性断言（P9：替代原 legacy memorix/index.html 断言）。
+    """memorix 页产物可达性断言。
 
     验证 Vite 构建产物的关键结构：
     - index.html 存在且为 Vite 产物（引用相对路径的 JS/CSS chunk + #app 挂载点）
-    - 显式注入 AstrBot 桥接 SDK（与 legacy 一致，运行时由 AstrBot rewrite 为带鉴权 URL）
+    - 显式注入 AstrBot 桥接 SDK（运行时由 AstrBot rewrite 为带鉴权 URL）
     - 资源路径为相对路径（base:'./'，不出现 / 开头绝对资源路径）
     - vis-network 独立 chunk 懒加载（不内联进主 bundle，控体积）
     """
-    assert VUE_PAGE.exists(), "memorix-vue 产物 index.html 缺失，请先执行 npm run build"
+    assert VUE_PAGE.exists(), "memorix 产物 index.html 缺失，请先执行 npm run build"
     html = VUE_PAGE.read_text(encoding="utf-8")
 
     # 桥接 SDK 显式注入（services/api.ts 依赖 window.AstrBotPluginPage）
@@ -36,9 +36,9 @@ def test_plugin_page_embeds_dashboard_bridge() -> None:
 
 
 def test_plugin_page_assets_exist() -> None:
-    """memorix-vue 产物引用的资源文件实际存在（无悬空引用）。"""
+    """memorix 产物引用的资源文件实际存在（无悬空引用）。"""
     assets_dir = VUE_PAGE.parent / "assets"
-    assert assets_dir.is_dir(), "memorix-vue/assets 目录缺失"
+    assert assets_dir.is_dir(), "memorix/assets 目录缺失"
     html = VUE_PAGE.read_text(encoding="utf-8")
 
     refs = re.findall(r'(?:src|href)="(\./assets/[^"]+)"', html)
@@ -90,7 +90,7 @@ def test_plugin_page_chunks_use_spaced_esm_imports() -> None:
     """
     assets_dir = VUE_PAGE.parent / "assets"
     js_chunks = list(assets_dir.glob("*.js"))
-    assert js_chunks, "memorix-vue/assets 下无 JS chunk"
+    assert js_chunks, "memorix/assets 下无 JS chunk"
     for chunk in js_chunks:
         code = chunk.read_text(encoding="utf-8")
         # 不得残留零空格的 import{...}from"/export{...}from" 静态模块引用

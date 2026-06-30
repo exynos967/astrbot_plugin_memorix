@@ -26,7 +26,6 @@ from ..core.utils.episode_service import EpisodeService
 from ..core.utils.paragraph_vector_service import ParagraphVectorWriteService
 from ..core.utils.person_profile_service import PersonProfileService
 from ..core.utils.relation_write_service import RelationWriteService
-
 from .common.logging import get_logger
 from .context import AppContext
 from .settings import AppSettings, resolve_openapi_endpoint_config
@@ -282,7 +281,7 @@ def build_context(settings: AppSettings) -> AppContext:
             min_threshold=_safe_float(settings.get("threshold.min_threshold", 0.3), 0.3),
             max_threshold=_safe_float(settings.get("threshold.max_threshold", 0.95), 0.95),
             percentile=_safe_float(settings.get("threshold.percentile", 75.0), 75.0),
-            std_multiplier=1.5,  # MaiBot 亦未暴露；自适应阈值的 std 倍率，1.5 为经验最优值，固化为常量
+            std_multiplier=1.5,  # 上游亦未暴露；自适应阈值的 std 倍率，1.5 为经验最优值，固化为常量
             min_results=_safe_int(settings.get("threshold.min_results", 3), 3),
             enable_auto_adjust=bool(settings.get("threshold.enable_auto_adjust", True)),
         )

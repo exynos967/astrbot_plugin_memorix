@@ -1,10 +1,9 @@
 """Phase 1 依赖剥离桩：宿主 ``src.*`` 中暂无对应插件 shim 的符号。
 
-这些符号在新版 vendored core 的 **尚未接入** 路径（episode/tuning/summary/web_import/
-runtime.kernel）中被引用。Phase 1 目标仅为 ``core`` 可 import，这些路径不在运行链上；
-Phase 3 移植时会用 ``llm_client.LLMClient`` / ``message_api.MessageAPI`` / 插件配置
-真实替换桩。桩采用递归属性 + 可调用语义，确保即便被调用也不会因属性缺失而崩溃，
-但返回值无业务意义——任何真实使用都是 Phase 3 重写范围。
+这些符号仅保留给 ``core/runtime/sdk_memory_kernel.py`` 这个未接入插件主线的
+上游 SDK 运行时。插件实际运行路径已用 ``generate_text``、``MessageAPI`` 和
+``ctx.get_config`` 替换宿主依赖。桩采用递归属性 + 可调用语义，确保即便被调用也
+不会因属性缺失而崩溃，但返回值无业务意义——任何真实使用都应改成本地适配。
 """
 
 from __future__ import annotations
@@ -29,11 +28,8 @@ class _RecursiveStub:
 
 # 配置树桩：global_config.a_memorix.integration / global_config.bot.nickname 等
 global_config = _RecursiveStub()
-config_manager = _RecursiveStub()
 
-# LLM 服务桩：llm_api.generate / llm_api.LLMServiceRequest / llm_api.LLMServiceResult
-llm_api = _RecursiveStub()
-LLMServiceResult = _RecursiveStub()
+# LLM 服务桩：SDKMemoryKernel 反馈纠错旧路径仍引用 LLMServiceClient。
 LLMServiceClient = _RecursiveStub()
 
 # 消息/会话桩：message_api.get_messages_by_time_in_chat /
