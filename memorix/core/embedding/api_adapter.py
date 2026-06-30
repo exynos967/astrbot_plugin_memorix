@@ -118,6 +118,11 @@ class EmbeddingAPIAdapter:
 
         self._dimension: Optional[int] = None
         self._dimension_detected = False
+        # 是否向远端发送 `dimensions` 参数。默认 True 保持旧行为（OpenAI 等支持该参数
+        # 的服务商借此返回稳定维度）；_detect_dimension 探测若发现 provider 拒绝该参数
+        # （如 SiliconFlow 返回 20015 parameter is invalid），则置 False，后续 encode 永不
+        # 发送，避免每次写入都失败（issue #22）。
+        self._supports_dimensions: bool = True
         self._client: Optional[AsyncOpenAI] = None
 
         self._total_encoded = 0
@@ -217,10 +222,15 @@ class EmbeddingAPIAdapter:
             if probed and probed[0]:
                 self._dimension = len(probed[0])
                 self._dimension_detected = True
+                self._supports_dimensions = True
                 return self._dimension
         except Exception as exc:
             logger.debug("Dimension probe with requested dimension failed: %s", exc)
 
+        # Provider rejected `dimensions` (e.g. SiliconFlow returns 20015 parameter
+        # is invalid). 标记本 provider 不支持该参数，后续 encode 不再发送；用模型原生
+        # 维度重探，原生维度对写入是权威的（issue #22）。
+        self._supports_dimensions = False
         # Probe with natural model dimension.
         try:
             probed = await self._request_embeddings("dimension_probe", dimensions=None)
@@ -278,9 +288,11 @@ class EmbeddingAPIAdapter:
         async def _encode_chunk(chunk: List[str]) -> np.ndarray:
             async with semaphore:
                 try:
-                    # Always send the effective target dimension so providers that
-                    # support OpenAI-compatible `dimensions` return stable vector size.
-                    vectors = await self._request_embeddings(chunk, dimensions=target_dim)
+                    # 仅当 provider 真正接受 `dimensions` 时才发送。_detect_dimension 探测过
+                    # 一次并缓存结果：SiliconFlow 等不支持的 provider 探测即失败 → 标志 False →
+                    # 此处不发，避免每次写入撞 20015 parameter is invalid（issue #22）。
+                    send_dim = target_dim if self._supports_dimensions else None
+                    vectors = await self._request_embeddings(chunk, dimensions=send_dim)
                     arr = np.asarray(vectors, dtype=np.float32)
                     if arr.ndim == 1:
                         arr = arr.reshape(1, -1)
