@@ -1230,8 +1230,6 @@ class SDKMemoryKernel:
         chat_id: str,
         context_length: Optional[int] = None,
         include_personality: Optional[bool] = None,
-        time_end: Optional[float] = None,
-        metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         await self.initialize()
         assert self.summary_importer
@@ -1239,8 +1237,6 @@ class SDKMemoryKernel:
             stream_id=str(chat_id or "").strip(),
             context_length=context_length,
             include_personality=include_personality,
-            time_end=time_end,
-            metadata=metadata,
         )
         success = bool(getattr(import_result, "success", False))
         detail = str(getattr(import_result, "detail", "") or "")
@@ -1302,13 +1298,6 @@ class SDKMemoryKernel:
                 chat_id=chat_id,
                 context_length=self._optional_int(summary_meta.get("context_length")),
                 include_personality=summary_meta.get("include_personality"),
-                time_end=time_end,
-                metadata={
-                    **summary_meta,
-                    "external_id": external_token,
-                    "chat_id": str(chat_id or "").strip(),
-                    "source_type": "chat_summary",
-                },
             )
             result.setdefault("external_id", external_id)
             result.setdefault("chat_id", chat_id)
