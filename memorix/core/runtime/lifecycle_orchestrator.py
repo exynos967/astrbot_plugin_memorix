@@ -188,7 +188,6 @@ async def initialize_storage_async(plugin: Any) -> None:
         max_concurrent=plugin.get_config("embedding.max_concurrent", 5),
         default_dimension=plugin.get_config("embedding.dimension", 1024),
         model_name="auto",
-        dimension_request_mode=plugin.get_config("embedding.dimension_request_mode", "explicit"),
         retry_config=plugin.get_config("embedding.retry", {}),
     )
     logger.info("嵌入 API 适配器初始化完成")

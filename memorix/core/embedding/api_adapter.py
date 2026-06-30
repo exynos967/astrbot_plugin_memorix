@@ -81,7 +81,6 @@ class EmbeddingAPIAdapter:
         batch_size: int = 32,
         max_concurrent: int = 5,
         default_dimension: int = 1024,
-        enable_cache: bool = False,
         model_name: str = "auto",
         retry_config: Optional[dict] = None,
         base_url: str = "",
@@ -93,7 +92,6 @@ class EmbeddingAPIAdapter:
         self.batch_size = max(1, int(batch_size))
         self.max_concurrent = max(1, int(max_concurrent))
         self.default_dimension = max(1, int(default_dimension))
-        self.enable_cache = bool(enable_cache)
         self.model_name = str(model_name or "auto")
         self.timeout_seconds = float(timeout_seconds or 30.0)
         self.max_retries = max(1, int(max_retries))

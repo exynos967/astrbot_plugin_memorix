@@ -1088,9 +1088,7 @@ class SDKMemoryKernel:
             batch_size=int(self._cfg("embedding.batch_size", 32)),
             max_concurrent=int(self._cfg("embedding.max_concurrent", 5)),
             default_dimension=self.embedding_dimension,
-            enable_cache=bool(self._cfg("embedding.enable_cache", False)),
             model_name="auto",
-            dimension_request_mode=str(self._cfg("embedding.dimension_request_mode", "explicit") or "explicit"),
             retry_config=self._cfg("embedding.retry", {}) or {},
         )
         stored_dimension = self._stored_vector_dimension()
