@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -379,11 +380,48 @@ def _coerce_event_chain(event: Any) -> list[Any]:
     return []
 
 
+# 图片缓存目录清理阈值：单目录文件上限与过期时长（避免无界增长，Sourcery #3）。
+_IMG_CACHE_MAX_FILES = 200
+_IMG_CACHE_MAX_AGE_SECONDS = 2 * 60 * 60
+
+
+def _cleanup_image_cache(cache_dir: str) -> None:
+    """清理图片缓存目录：删过期文件，超量时删最旧的（best-effort，失败静默）。"""
+    try:
+        entries: list[tuple[str, float]] = []
+        now = time.time()
+        with os.scandir(cache_dir) as it:
+            for entry in it:
+                if not entry.is_file():
+                    continue
+                try:
+                    mtime = entry.stat().st_mtime
+                except OSError:
+                    continue
+                if now - mtime > _IMG_CACHE_MAX_AGE_SECONDS:
+                    try:
+                        os.remove(entry.path)
+                    except OSError:
+                        pass
+                    continue
+                entries.append((entry.path, mtime))
+        if len(entries) > _IMG_CACHE_MAX_FILES:
+            entries.sort(key=lambda item: item[1])
+            for path, _ in entries[: len(entries) - _IMG_CACHE_MAX_FILES]:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
 async def copy_images_to_safe_dir(event: Any) -> list[str]:
     """Copy Image component files to a pipeline-safe cache directory."""
     safe_paths: list[str] = []
     cache_dir = os.path.join(tempfile.gettempdir(), "astrbot_memorix_img_cache")
     os.makedirs(cache_dir, exist_ok=True)
+    _cleanup_image_cache(cache_dir)
     for comp in _coerce_event_chain(event):
         if not isinstance(comp, Image):
             continue

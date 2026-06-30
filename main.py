@@ -4,6 +4,7 @@ import asyncio
 import re
 import time
 from dataclasses import dataclass
+from typing import cast
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -100,6 +101,9 @@ class MemorixPlugin(Star):
             scope_resolver=self._resolve_dashboard_webui_scope,
             admin_service=self.admin_service,
         )
+        # 持有后台 ingest 任务引用，避免被 GC 回收（asyncio 未持有的 task 在调度紧迫时可能被回收）。
+        # done 回调自动从集合移除，单任务异常不外泄（任务体内已有 try/except 兜底）。
+        self._background_tasks: set[asyncio.Task] = set()
 
     async def initialize(self):
         logger.info("[memorix] initialize start")
@@ -113,6 +117,14 @@ class MemorixPlugin(Star):
     async def terminate(self):
         logger.info("[memorix] terminate start")
         self._remove_llm_tools()
+        # 等待进行中的后台 ingest 任务完成（最多 5s），超时则取消，避免插件关闭丢消息。
+        pending = [t for t in self._background_tasks if not t.done()]
+        if pending:
+            try:
+                await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=5.0)
+            except asyncio.TimeoutError:
+                for t in pending:
+                    t.cancel()
         await self.person_fact_writeback_service.close()
         await self.webui_page_bridge.close()
         await self.feedback_service.stop_background_loops()
@@ -174,6 +186,16 @@ class MemorixPlugin(Star):
     @staticmethod
     def _is_cron_event(event: AstrMessageEvent) -> bool:
         return str(getattr(event, "get_platform_name", lambda: "")() or "").strip() == "cron"
+
+    def _spawn_background_task(self, coro) -> asyncio.Task:
+        """创建并持有后台任务，避免未持有 task 被 GC 回收（Sourcery #2）。
+
+        done 回调自动从集合移除；任务体内已 try/except，异常不外泄。
+        """
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     def _resolve_dashboard_webui_scope(self) -> str:
         known_scopes = self.runtime_manager.get_known_scopes()
@@ -472,7 +494,7 @@ class MemorixPlugin(Star):
                 if isinstance(result, Exception):
                     logger.debug("[memorix] profile query skipped: %s", result, exc_info=True)
                     continue
-                payload = result
+                payload = cast(dict, result)
                 profile_text = build_profile_injection_text(self._profile_text_from_payload(payload))
                 if not profile_text:
                     continue
@@ -543,12 +565,12 @@ class MemorixPlugin(Star):
         if isinstance(profile_result, Exception):
             logger.debug("[memorix] profile injection skipped: %s", profile_result, exc_info=True)
         elif profile_result:
-            sections.append(profile_result)
+            sections.append(cast(str, profile_result))
 
         if isinstance(memory_result, Exception):
             logger.debug("[memorix] memory search injection skipped: %s", memory_result, exc_info=True)
         elif memory_result:
-            sections.append(memory_result)
+            sections.append(cast(str, memory_result))
 
         if not sections:
             return ""
@@ -625,10 +647,16 @@ class MemorixPlugin(Star):
             current = updated
 
     def _command_prefixes(self) -> list[str]:
-        if not hasattr(self, '_cached_command_prefixes'):
-            ingest_cfg = self.config.get("ingest", {}) if isinstance(self.config.get("ingest"), dict) else {}
-            raw = ingest_cfg.get("command_prefixes", ingest_cfg.get("command_prefix", ["/"]))
-            self._cached_command_prefixes = self._normalize_command_prefixes(raw)
+        # 缓存带配置指纹校验：ingest.command_prefixes 热更新后自动失效重算（Sourcery #1）。
+        ingest_cfg = self.config.get("ingest", {}) if isinstance(self.config.get("ingest"), dict) else {}
+        raw = ingest_cfg.get("command_prefixes", ingest_cfg.get("command_prefix", ["/"]))
+        fingerprint = repr(raw)
+        cached = getattr(self, "_cached_command_prefixes", None)
+        cached_fp = getattr(self, "_cached_command_prefixes_fp", None)
+        if cached is not None and cached_fp == fingerprint:
+            return cached
+        self._cached_command_prefixes = self._normalize_command_prefixes(raw)
+        self._cached_command_prefixes_fp = fingerprint
         return self._cached_command_prefixes
 
     def _is_command_message(self, text: str) -> bool:
@@ -776,7 +804,7 @@ class MemorixPlugin(Star):
             return
         safe_paths = await copy_images_to_safe_dir(event)
         text = await self._format_event_text_for_memory(event, skip_image_caption=True)
-        asyncio.create_task(self._record_message_background(event, text, safe_paths))
+        self._spawn_background_task(self._record_message_background(event, text, safe_paths))
 
     async def _record_message_background(self, event: AstrMessageEvent, text: str, safe_paths: list[str] | None = None):
         try:
@@ -808,9 +836,11 @@ class MemorixPlugin(Star):
         text = str(getattr(resp, "completion_text", "") or "").strip()
         if not text:
             return
+        if self._is_cron_event(event):
+            return
         safe_paths = await copy_images_to_safe_dir(event)
         user_text = await self._format_event_text_for_memory(event, skip_image_caption=True)
-        asyncio.create_task(self._record_llm_response_background(event, text, user_text, safe_paths))
+        self._spawn_background_task(self._record_llm_response_background(event, text, user_text, safe_paths))
 
     async def _record_llm_response_background(self, event: AstrMessageEvent, text: str, user_text: str, safe_paths: list[str] | None = None):
         try:

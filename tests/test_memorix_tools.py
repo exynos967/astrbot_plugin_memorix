@@ -740,7 +740,7 @@ def test_cron_llm_response_skips_person_fact_writeback():
     async def _enabled(_adapted, _user_id=""):
         return True
 
-    async def _format(_event):
+    async def _format(_event, *, skip_image_caption: bool = False):
         return "定时任务结果"
 
     async def _ingest(_event, _role, _text):
@@ -862,3 +862,34 @@ def test_passive_event_ingest_skips_filtered_chat():
     assert result is False
     assert plugin.profile_service.called is False
     assert plugin.ingest_service.called is False
+
+
+def test_spawn_background_task_holds_and_releases():
+    """后台任务被持有引用防 GC，完成后自动从集合移除（Sourcery #2）。"""
+    plugin = MemorixPlugin(DummyContext(), {"scope": {"mode": "group_global"}})
+
+    async def _main():
+        async def _work():
+            await asyncio.sleep(0.01)
+
+        task = plugin._spawn_background_task(_work())
+        assert task in plugin._background_tasks
+        await asyncio.wait_for(task, timeout=1.0)
+        assert task not in plugin._background_tasks
+
+    asyncio.run(_main())
+
+
+def test_command_prefixes_cache_invalidates_on_config_change():
+    """ingest.command_prefixes 热更新后缓存指纹失效，重算（Sourcery #1）。"""
+    plugin = MemorixPlugin(DummyContext(), {"scope": {"mode": "group_global"}})
+    plugin.config = {"ingest": {"command_prefixes": ["/"]}}
+    first = plugin._command_prefixes()
+    assert first == ["/"]
+    # 配置未变 → 命中缓存
+    assert plugin._command_prefixes() is first
+    # 热更新配置 → 指纹失效，重算
+    plugin.config = {"ingest": {"command_prefixes": ["/", "！"]}}
+    second = plugin._command_prefixes()
+    assert second == ["/", "！"]
+    assert second is not first
