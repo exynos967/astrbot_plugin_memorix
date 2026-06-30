@@ -19,6 +19,7 @@ const vis = inject<VisController | null>(GRAPH_VIS_KEY, null);
 const searchKeyword = ref("");
 
 // storeToRefs 取 ref 供 v-model 双向绑定（setup store 自动解包，但 v-model 需 Ref）
+// zoom 仍解构：供缩放百分比展示用（滑块已删，缩放改由 +/- 按钮控制）。
 const { currentScope, density, excludeLeaf, zoom } = storeToRefs(store);
 
 // excludeLeaf 是 boolean，<select> 用 "true"/"false" 字符串，computed 做转换
@@ -86,12 +87,6 @@ async function onScopeChange(e: Event): Promise<void> {
   await store.loadGraph();
 }
 
-// zoom range input：设置缩放（非动画）
-function onZoomInput(e: Event): void {
-  const val = Number((e.target as HTMLInputElement).value);
-  vis?.setZoom(val, false);
-}
-
 // 适配视图按钮：fit + 清除用户缩放标记
 function onFit(): void {
   vis?.fitGraphView(true);
@@ -151,19 +146,10 @@ function onLayout(): void {
     <!-- 整理布局：vis 未暴露 stabilize，改用 fitGraphView 重新适配 -->
     <button class="btn" @click="onLayout">整理布局</button>
 
-    <!-- zoom 控件 -->
+    <!-- zoom 控件：滑块因 .input padding 导致拖不到底且与按钮重复，已移除；
+         缩放由 - / + 按钮 + 适配视图 + 百分比显示承担。 -->
     <div class="graph-zoom" aria-label="图谱缩放">
       <button class="btn icon" title="缩小图谱" @click="vis?.adjustZoom(-0.15)">-</button>
-      <input
-        class="input"
-        type="range"
-        min="0.35"
-        max="2.4"
-        step="0.05"
-        :value="zoom"
-        aria-label="图谱缩放比例"
-        @input="onZoomInput"
-      />
       <button class="btn icon" title="放大图谱" @click="vis?.adjustZoom(0.15)">+</button>
       <button class="btn icon" title="适配视图" @click="onFit">⤢</button>
       <span class="zoom-value">{{ Math.round(zoom * 100) }}%</span>

@@ -7,6 +7,18 @@
   min-width: 190px;
 }
 
+/* range 滑块修正：信息密度滑块套了 .input（padding:9px 11px + min-height:42px + border），
+ * 原生 input[type=range] 的 padding 会压缩 thumb 可滑范围，右端被 padding 顶住 → 滑不到 max。
+ * 此处覆盖为透明无内边距，让 track 占满宽度、thumb 可滑到两端。特异性 0,1,1 压过 .input 的 0,1,0。 */
+.toolbar input[type="range"] {
+  padding: 0;
+  min-height: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  accent-color: var(--accent);
+}
+
 .graph-zoom {
   flex: 1 1 300px;
   max-width: 390px;
