@@ -119,10 +119,11 @@ class EmbeddingAPIAdapter:
         self._dimension: Optional[int] = None
         self._dimension_detected = False
         # 是否向远端发送 `dimensions` 参数。默认 True 保持旧行为（OpenAI 等支持该参数
-        # 的服务商借此返回稳定维度）；_detect_dimension 探测若发现 provider 拒绝该参数
-        # （如 SiliconFlow 返回 20015 parameter is invalid），则置 False，后续 encode 永不
-        # 发送，避免每次写入都失败（issue #22）。
+        # 的服务商借此返回稳定维度）；_detect_dimensions_support 探测若发现 provider 拒绝
+        # 该参数（如 SiliconFlow 返回 20015 parameter is invalid），则置 False，后续 encode
+        # 永不发送，避免每次写入都失败（issue #22）。
         self._supports_dimensions: bool = True
+        self._dimensions_support_detected: bool = False
         self._client: Optional[AsyncOpenAI] = None
 
         self._total_encoded = 0
@@ -212,26 +213,46 @@ class EmbeddingAPIAdapter:
                 raise ValueError(f"embedding endpoint returned non-json body: {resp.text[:200]}") from exc
         return _coerce_embedding_rows(data)
 
+    async def _detect_dimensions_support(self) -> bool:
+        """探测 provider 是否接受 `dimensions` 请求参数（与维度探测解耦，issue #22）。
+
+        用一条 probe 文本带 dimensions 试请求：成功 → True；被拒（如 SiliconFlow 20015
+        parameter is invalid）→ False。结果缓存，进程生命周期内只探一次。
+
+        独立于 _detect_dimension 存在的原因：auto_detect_dimension 关闭时 _detect_dimension
+        不跑，但 dimensions 兼容性必须探——否则 SiliconFlow 仍每次写入撞 20015。encode 入口
+        保证此方法至少跑一次，不依赖任何 auto_detect 开关。
+        """
+        if self._dimensions_support_detected:
+            return self._supports_dimensions
+        try:
+            probed = await self._request_embeddings("dimension_probe", dimensions=self.default_dimension)
+            self._supports_dimensions = bool(probed and probed[0])
+        except Exception as exc:
+            logger.debug("Dimensions param probe failed, treat as unsupported: %s", exc)
+            self._supports_dimensions = False
+        self._dimensions_support_detected = True
+        return self._supports_dimensions
+
     async def _detect_dimension(self) -> int:
         if self._dimension_detected and self._dimension is not None:
             return self._dimension
 
-        # Probe with requested dimension first.
-        try:
-            probed = await self._request_embeddings("dimension_probe", dimensions=self.default_dimension)
-            if probed and probed[0]:
-                self._dimension = len(probed[0])
-                self._dimension_detected = True
-                self._supports_dimensions = True
-                return self._dimension
-        except Exception as exc:
-            logger.debug("Dimension probe with requested dimension failed: %s", exc)
+        # 先探 dimensions 兼容性（顺带复用第一次带 dimensions 的请求结果）。
+        supports = await self._detect_dimensions_support()
+        if supports:
+            # 带 dimensions 探测成功，直接取其向量维度。
+            try:
+                probed = await self._request_embeddings("dimension_probe", dimensions=self.default_dimension)
+                if probed and probed[0]:
+                    self._dimension = len(probed[0])
+                    self._dimension_detected = True
+                    return self._dimension
+            except Exception as exc:
+                logger.debug("Dimension probe with requested dimension failed: %s", exc)
 
-        # Provider rejected `dimensions` (e.g. SiliconFlow returns 20015 parameter
-        # is invalid). 标记本 provider 不支持该参数，后续 encode 不再发送；用模型原生
+        # Provider rejected `dimensions`（_supports_dimensions 已置 False）。用模型原生
         # 维度重探，原生维度对写入是权威的（issue #22）。
-        self._supports_dimensions = False
-        # Probe with natural model dimension.
         try:
             probed = await self._request_embeddings("dimension_probe", dimensions=None)
             if probed and probed[0]:
@@ -277,6 +298,12 @@ class EmbeddingAPIAdapter:
                 await self._detect_dimension()
             target_dim = self._dimension or self.default_dimension
         target_dim = int(target_dim)
+
+        # dimensions 兼容性探测与维度探测解耦：即便 auto_detect_dimension 关闭、
+        # _detect_dimension 不跑，这里也保证至少探一次 SiliconFlow 等不支持 dimensions
+        # 参数的 provider 被识别，避免每次写入撞 20015（issue #22）。
+        if not self._dimensions_support_detected:
+            await self._detect_dimensions_support()
 
         if not input_texts:
             empty = np.zeros((0, target_dim), dtype=np.float32)

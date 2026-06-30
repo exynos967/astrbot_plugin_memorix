@@ -130,8 +130,32 @@ def test_default_supports_dimensions_before_probe():
     assert adapter._supports_dimensions is True
 
 
+def test_encode_detects_dimensions_support_without_dimension_probe():
+    """方案 A 核心：即便维度探测（auto_detect）关闭，encode 仍独立探测 dimensions 兼容性。
+
+    模拟 SiliconFlow：_detect_dimension 不被调用，encode 入口应自行触发
+    _detect_dimensions_support，识别出 provider 不支持 dimensions 后不再发送。
+    这是与维度探测解耦的关键——auto_detect_dimension 关闭时 issue #22 修复仍生效。
+    """
+    adapter = _make_adapter()
+    calls = _patch_request(adapter, siliconflow_like=True)
+    # 不调 _detect_dimension，直接 encode（模拟 auto_detect 关闭路径）
+    out = asyncio.run(adapter.encode("hello"))
+    assert isinstance(out, np.ndarray)
+
+    assert adapter._dimensions_support_detected is True
+    assert adapter._supports_dimensions is False, "encode 应自行探测出 provider 不支持 dimensions"
+    # encode 写入阶段不应发 dimensions
+    write_dims = [c["dimensions"] for c in calls if c["inputs"] != "dimension_probe"]
+    assert write_dims, "应有写入请求"
+    assert all(d is None for d in write_dims), (
+        f"SiliconFlow 式 provider 探测后 encode 不应发 dimensions，实际: {write_dims}"
+    )
+
+
 if __name__ == "__main__":
     test_siliconflow_like_provider_drops_dimensions()
     test_openai_like_provider_keeps_dimensions()
     test_default_supports_dimensions_before_probe()
+    test_encode_detects_dimensions_support_without_dimension_probe()
     print("OK")
