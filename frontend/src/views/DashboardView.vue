@@ -43,11 +43,13 @@ onMounted(async () => {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  /* 填满 view-stack，让内部 flex:1 子项（趋势图）拿到确定的高度 */
+  flex: 1;
 }
 
-/* 调用趋势图撑满剩余高度（MetricCards 固定高度，趋势图用 flex:1 吃进视口） */
+/* 调用趋势图撑满剩余高度 */
 .trend-chart-fill {
-  flex: 1 1 0;
+  flex: 1;
   min-height: 0;
 }
 </style>

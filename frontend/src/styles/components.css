@@ -314,10 +314,12 @@ html[data-theme="dark"] .notice {
   overflow-wrap: anywhere;
 }
 
-/* 调用趋势图外层 band：flex 列让 chart 撑满剩余高度 */
+/* 调用趋势图外层 band：flex 列让 chart 撑满剩余高度。
+ * 覆盖 .band overflow:hidden——图表需要撑满 flex 空间，裁剪会导致截断。 */
 .chart-band {
   display: flex;
   flex-direction: column;
+  overflow: visible;
 }
 
 .call-chart {
