@@ -87,6 +87,12 @@ async function onScopeChange(e: Event): Promise<void> {
   await store.loadGraph();
 }
 
+// density/excludeLeaf 改动后重载：这两个是后端过滤参数，须重新请求才生效。
+// 滑块用 @change（松手触发一次）而非 @input，避免拖动中每帧请求。
+async function onReload(): Promise<void> {
+  await store.loadGraph();
+}
+
 // 适配视图按钮：fit + 清除用户缩放标记
 function onFit(): void {
   vis?.fitGraphView(true);
@@ -125,16 +131,24 @@ function onLayout(): void {
       </select>
     </div>
 
-    <!-- 信息密度：range -->
+    <!-- 信息密度：range。@change 松手时触发一次重载（非拖动中每帧），density 是后端过滤参数须重新请求 -->
     <div class="field">
       <label>信息密度</label>
-      <input class="input" type="range" min="0.1" max="1" step="0.05" v-model.number="density" />
+      <input
+        class="input"
+        type="range"
+        min="0.1"
+        max="1"
+        step="0.05"
+        v-model.number="density"
+        @change="onReload"
+      />
     </div>
 
-    <!-- 过滤叶子：select 字符串转布尔 -->
+    <!-- 过滤叶子：select 字符串转布尔。切换后重载 -->
     <label class="field" style="max-width: 130px">
       <span>过滤叶子</span>
-      <select class="select" v-model="excludeLeafModel">
+      <select class="select" v-model="excludeLeafModel" @change="onReload">
         <option value="true">开启</option>
         <option value="false">关闭</option>
       </select>
