@@ -8,7 +8,7 @@ import { NAV_ITEMS } from "@/router";
 <template>
   <aside class="sidebar">
     <div class="brand">
-      <span class="brand-fallback">M</span>
+      <span class="brand-fallback">Memorix</span>
     </div>
     <nav class="nav">
       <RouterLink
