@@ -1,14 +1,5 @@
 import { createRouter, createWebHashHistory } from "vue-router";
 import type { RouteRecordRaw } from "vue-router";
-import LogsView from "@/views/LogsView.vue";
-import DashboardView from "@/views/DashboardView.vue";
-import SettingsView from "@/views/SettingsView.vue";
-import MemoryView from "@/views/MemoryView.vue";
-import PeopleView from "@/views/PeopleView.vue";
-import SourcesView from "@/views/SourcesView.vue";
-import EpisodesView from "@/views/EpisodesView.vue";
-import ImportView from "@/views/ImportView.vue";
-import QueryView from "@/views/QueryView.vue";
 
 // 导航项配置：router 与 Sidebar 共用，避免双写（DRY）。
 // title/subtitle 从 legacy titles 字典（index.html 行 2538-2549）原样迁移。
@@ -34,19 +25,18 @@ export const NAV_ITEMS: NavItem[] = [
   { name: "logs", path: "/logs", icon: "L", label: "日志", title: "Activity Logs", subtitle: "近期 API 请求、自检与配置变更记录" },
 ];
 
-// 已实现 view 映射；未在此映射的 route 指向 PlaceholderView（待对应阶段填充）。
+// 已实现 view 映射；全部走动态 import 拆 chunk，首屏仅加载当前 view（graph 含 vis-network 单独 chunk）。
 const REAL_VIEWS: Record<string, () => Promise<unknown>> = {
-  dashboard: () => Promise.resolve({ default: DashboardView }),
-  settings: () => Promise.resolve({ default: SettingsView }),
-  memory: () => Promise.resolve({ default: MemoryView }),
-  people: () => Promise.resolve({ default: PeopleView }),
-  sources: () => Promise.resolve({ default: SourcesView }),
-  episodes: () => Promise.resolve({ default: EpisodesView }),
-  import: () => Promise.resolve({ default: ImportView }),
-  query: () => Promise.resolve({ default: QueryView }),
-  // graph 动态 import：vis-network 体积大，单独 chunk 懒加载，首屏不加载（配合 vite manualChunks.vis）
+  dashboard: () => import("@/views/DashboardView.vue"),
+  settings: () => import("@/views/SettingsView.vue"),
+  memory: () => import("@/views/MemoryView.vue"),
+  people: () => import("@/views/PeopleView.vue"),
+  sources: () => import("@/views/SourcesView.vue"),
+  episodes: () => import("@/views/EpisodesView.vue"),
+  import: () => import("@/views/ImportView.vue"),
+  query: () => import("@/views/QueryView.vue"),
   graph: () => import("@/views/GraphView.vue"),
-  logs: () => Promise.resolve({ default: LogsView }),
+  logs: () => import("@/views/LogsView.vue"),
 };
 
 function buildRoutes(): RouteRecordRaw[] {

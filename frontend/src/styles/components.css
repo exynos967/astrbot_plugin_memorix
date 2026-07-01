@@ -389,10 +389,24 @@ html[data-theme="dark"] .notice {
   color: var(--accent-strong);
 }
 
-.btn:disabled {
+.btn:disabled,
+.btn:disabled:hover {
   cursor: not-allowed;
   opacity: 0.48;
   box-shadow: none;
+  border-color: rgba(107, 139, 176, 0.26);
+  background: rgba(255, 255, 255, 0.58);
+  color: var(--accent-ink);
+}
+
+/* primary/active disabled 保留底色但降透明度，避免 disabled 态颜色错乱 */
+.btn.primary:disabled,
+.btn.primary:disabled:hover,
+.btn.active:disabled,
+.btn.active:disabled:hover {
+  color: #ffffff;
+  border-color: var(--accent);
+  background: var(--accent);
 }
 
 .btn.primary,

@@ -124,8 +124,14 @@ const rawJson = computed(() => (result.value ? JSON.stringify(result.value, null
             <label>结果数</label>
             <input v-model.number="topk" class="input" type="number" min="1" max="50" />
           </div>
-          <CandidateInput v-model="timeFrom" :source="graphNodeSource" :debounce-ms="0" label="起始时间" placeholder="2026-05-01" />
-          <CandidateInput v-model="timeTo" :source="graphNodeSource" :debounce-ms="0" label="结束时间" placeholder="2026-05-21" />
+          <div class="field">
+            <label>起始时间</label>
+            <input v-model="timeFrom" class="input" placeholder="2026-05-01" />
+          </div>
+          <div class="field">
+            <label>结束时间</label>
+            <input v-model="timeTo" class="input" placeholder="2026-05-21" />
+          </div>
           <CandidateInput v-model="person" :source="personSource" :debounce-ms="180" label="人物" placeholder="person" />
           <CandidateInput v-model="source" :source="sourceSource" :debounce-ms="180" label="来源" placeholder="来源名称" />
         </div>
