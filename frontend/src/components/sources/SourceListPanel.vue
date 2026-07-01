@@ -14,7 +14,7 @@ import {
   sourceUpdatedLabel,
 } from "@/utils/sourceText";
 
-defineProps<{ items: SourceListItem[] }>();
+defineProps<{ items: SourceListItem[]; deleting?: boolean }>();
 
 const emit = defineEmits<{
   removeSource: [source: string];
@@ -56,7 +56,7 @@ function onDeleteParagraph(hash: string): void {
           <div class="result-head">
             <h3>{{ paragraphTitle(item) }}</h3>
             <div class="result-actions" style="margin-top: 0">
-              <button class="btn danger" @click="onDeleteParagraph(item.hash || '')">删除</button>
+              <button class="btn danger" :disabled="deleting" @click="onDeleteParagraph(item.hash || '')">删除</button>
             </div>
           </div>
           <p v-if="item.content">{{ item.content }}</p>
@@ -69,7 +69,7 @@ function onDeleteParagraph(hash: string): void {
           <div class="result-head">
             <h3>{{ sourceNameOf(item) || "source" }}</h3>
             <div class="result-actions" style="margin-top: 0">
-              <button class="btn danger" @click="onDeleteSource(sourceNameOf(item))">删除 source</button>
+              <button class="btn danger" :disabled="deleting" @click="onDeleteSource(sourceNameOf(item))">删除 source</button>
             </div>
           </div>
           <div class="tags">

@@ -1,10 +1,11 @@
 // Source API（typed 封装）。
-// 后端契约（均 NOT scope-aware，直接操作插件级全局 store，故不传 scope）：
+// 后端契约：
 //   POST /api/source/list         {node_id?, edge_source?, edge_target?} → routes_compat.py:746
 //        ─ 全空返回 {mode:"summary", sources:[{source,count,last_updated}]}
 //        ─ node_id 或 edge_source+edge_target 非空返回 {sources:[{hash,content,created_at,source}]}
 //   POST /api/source/batch_delete {source} → routes_compat.py:800（{success,count,message}）
-//   POST /v1/delete/paragraph     {paragraph_hash} → v1_router.py:513（{success,relation_prune_count,deleted_vectors}）
+//   POST /v1/delete/paragraph     {paragraph_hash} → v1_router.py:513（scope-aware，经 bridge _scope 路由，须传 scope）
+//   注：/api/source/* 挂在 routes_compat 全局 app（NOT scope-aware）；/v1/delete/paragraph 走 v1_router（scope-aware）。
 
 import { api } from "./api";
 
@@ -57,6 +58,10 @@ export function batchDeleteSource(source: string): Promise<SourceDeleteResult> {
   return api.post<SourceDeleteResult>("/api/source/batch_delete", { source });
 }
 
-export function deleteParagraph(hash: string): Promise<ParagraphDeleteResult> {
-  return api.post<ParagraphDeleteResult>("/v1/delete/paragraph", { paragraph_hash: hash });
+export function deleteParagraph(hash: string, scope: string): Promise<ParagraphDeleteResult> {
+  return api.post<ParagraphDeleteResult>(
+    "/v1/delete/paragraph",
+    { paragraph_hash: hash },
+    { scope },
+  );
 }

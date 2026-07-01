@@ -16,9 +16,10 @@ const { overrideId } = storeToRefs(store);
 // Person ID 输入框 template ref，供候选菜单 attach
 const idRef = ref<HTMLInputElement | null>(null);
 
-// 候选来源：与查询面板一致，按关键词拉 registry 摊平为字符串集合
+// 候选来源：与查询面板一致，按关键词拉 registry 摊平为字符串集合。
+// 用 suggestPersons（只读），不污染右栏候选列表。
 async function source(kw: string): Promise<CandidateItem[]> {
-  const items = await store.loadCandidates(kw);
+  const items = await store.suggestPersons(kw);
   return items.flatMap(personCandidateValues).map((value) => ({ value }));
 }
 

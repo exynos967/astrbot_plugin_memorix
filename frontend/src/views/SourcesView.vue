@@ -24,6 +24,7 @@ onMounted(() => {
       </div>
       <SourceListPanel
         :items="store.items"
+        :deleting="store.deleting"
         @remove-source="store.removeSource"
         @remove-paragraph="store.removeParagraph"
       />
