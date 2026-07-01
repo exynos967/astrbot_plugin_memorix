@@ -276,7 +276,11 @@ export function useVisNetwork(opts: UseVisNetworkOptions = {}) {
    */
   function renderGraph(container: HTMLElement): void {
     containerEl = container;
-    if (!ensureGraph(container)) return;
+    // ensureGraph 失败时 throw，让 GraphView.renderWhenReady 的 catch 捕获并写 store.initError，
+    // 走「居中提示 + 重试」分支（原仅 return，错误被吞，UI 陷入无重试入口的空状态）。
+    if (!ensureGraph(container)) {
+      throw new Error(initError.value || "图谱初始化失败");
+    }
     const net = network.value;
     const ns = nodes.value;
     const es = edges.value;
@@ -296,10 +300,12 @@ export function useVisNetwork(opts: UseVisNetworkOptions = {}) {
       ns.add(rawNodes.map((n) => normalizeGraphNode(n, p)));
       es.add(rawEdges.map((e) => normalizeGraphEdge(e, p)));
       updateLabelsByZoom();
-      // H3：暂停时跳过 stabilize 直接 fit；运行时等 stabilized 再 fit
+      // C4：fit 完成后才存坐标快照（原 saveSnapshot 同步执行存到 stabilize 前中间态）。
+      // 运行时：stabilized 后 fit + 存快照；暂停时：autoFit 兜底 fit 后存。
       if (store.simulationRunning) {
         net.once("stabilized", () => {
           if (!store.userZoomed) fitGraphView(true);
+          saveSnapshot();
         });
       }
       fitGraphView(true);
@@ -307,9 +313,9 @@ export function useVisNetwork(opts: UseVisNetworkOptions = {}) {
       autoFitTimer = window.setTimeout(() => {
         autoFitTimer = null;
         if (!store.userZoomed) fitGraphView(false);
+        // 暂停时无 stabilized 事件，在此兜底存快照；运行时 stabilized 已存，重复存无害（同坐标）。
+        if (!store.simulationRunning) saveSnapshot();
       }, AUTO_FIT_DELAY);
-      // C4：fit 后存坐标快照
-      saveSnapshot();
     } catch (err) {
       // C1：渲染异常向上抛，由 GraphView 捕获进 store.initError
       throw err instanceof Error ? err : new Error(String(err));

@@ -4,8 +4,9 @@
     <div class="dialog">
       <h2 class="panel-title">新增节点</h2>
       <div class="field">
-        <label>实体名称</label>
+        <label for="graph-add-node-name">实体名称</label>
         <input
+          id="graph-add-node-name"
           ref="nameInput"
           v-model="nodeName"
           class="input"

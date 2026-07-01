@@ -90,10 +90,10 @@ function scheduleCanvasResize(): void {
   });
 }
 
-/** 载入图谱数据并渲染。 */
+/** 载入图谱数据。渲染交由 watch(store.rawNodes) 触发——loadGraph 成功必重赋 rawNodes，
+ *  watch 必触发 renderWhenReady，故此处不再显式调用，避免每次载入双渲染（闪烁 + 开销）。 */
 async function loadAndRender(): Promise<void> {
   await store.loadGraph();
-  if (!initError.value) renderWhenReady();
 }
 
 onMounted(() => {

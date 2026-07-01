@@ -105,6 +105,7 @@ import { useAppStore } from "@/stores/app";
 import { GRAPH_VIS_KEY, type VisController } from "@/composables/useVisNetwork";
 import { fetchSourceList, type SourceParagraphItem } from "@/services/sourceApi";
 import type { GraphEdge } from "@/services/graphApi";
+import { errText } from "@/utils/error";
 
 const store = useGraphStore();
 const app = useAppStore();
@@ -231,24 +232,25 @@ async function onRemoveEdge(): Promise<void> {
   }
 }
 
-// 加载来源预览（节点选中时）
+// 加载来源预览（节点选中时）。请求序号守卫：快速切换节点时丢弃过期请求，避免旧来源覆盖新选中。
+let sourceSeq = 0;
 async function loadNodeSources(nodeId: string): Promise<void> {
   if (!nodeId) {
     sources.value = [];
     return;
   }
+  const seq = ++sourceSeq;
   sourceLoading.value = true;
   try {
     const data = await fetchSourceList({ node_id: nodeId });
+    if (seq !== sourceSeq) return; // 已有更新的选中节点，丢弃本次结果
     sources.value = (data.sources || []) as SourceParagraphItem[];
   } catch (err) {
-    app.pushError(
-      err instanceof Error ? err.message : String(err ?? "来源加载失败"),
-      "loadNodeSources",
-    );
+    if (seq !== sourceSeq) return;
+    app.pushError(errText(err), "loadNodeSources");
     sources.value = [];
   } finally {
-    sourceLoading.value = false;
+    if (seq === sourceSeq) sourceLoading.value = false;
   }
 }
 

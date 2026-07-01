@@ -114,7 +114,13 @@ async function submit(): Promise<void> {
     app.pushError("请输入主体与客体", "addEdge");
     return;
   }
-  const ok = await store.addEdge(s, t, predicate.value.trim(), weight.value);
+  // weight 校验：v-model.number 清空输入返回 ""/undefined，须拦在发请求前，否则后端收到非法 weight。
+  const w = Number(weight.value);
+  if (!Number.isFinite(w) || w <= 0) {
+    app.pushError("权重须为正数", "addEdge");
+    return;
+  }
+  const ok = await store.addEdge(s, t, predicate.value.trim(), w);
   if (!ok) return;
   await store.loadGraph();
   close();
