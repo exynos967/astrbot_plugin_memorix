@@ -81,7 +81,8 @@ import TopBar from "./TopBar.vue";
 }
 
 .view-stack :deep(> *) {
-  flex: 1;
+  /* 不设 flex:1——仅 GraphView（.view-graph）需要撑满剩余高度，它自己设了 flex:1 1 0。
+   * 其他 view（设置/总览/人物等）内容溢出不需限制高度，由 view-stack overflow:auto 处理滚动。 */
   min-height: 0;
 }
 </style>
