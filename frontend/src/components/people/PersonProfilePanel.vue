@@ -40,45 +40,40 @@ function truncate(text: string | undefined): string {
 </script>
 
 <template>
-  <div class="band">
-    <div class="panel-title"><h2>画像结果</h2></div>
-    <div class="result-list">
-      <div v-if="!profile" class="empty">输入人物关键词后查询</div>
-      <div v-else class="result">
-        <div class="result-head">
-          <h3>{{ title }}</h3>
+  <div v-if="!profile" class="empty">输入人物关键词后查询</div>
+  <div v-else class="result">
+    <div class="result-head">
+      <h3>{{ title }}</h3>
+      <div class="tags">
+        <span class="tag">{{ sourceLabel }}</span>
+        <span class="tag">关系 {{ relationCount }}</span>
+        <span class="tag">证据 {{ evidenceCount }}</span>
+      </div>
+    </div>
+    <p v-if="profile.profile_text" class="profile-text">{{ profile.profile_text }}</p>
+    <p v-else class="empty">无画像文本</p>
+
+    <div v-if="relations.length" class="sub-section">
+      <h4>关系</h4>
+      <div class="edge-list">
+        <div v-for="(edge, idx) in relations" :key="idx" class="edge-row">
+          <span class="edge-subject">{{ edge.subject || "-" }}</span>
+          <span class="edge-predicate">—{{ edge.predicate || "?" }}→</span>
+          <span class="edge-object">{{ edge.object || "-" }}</span>
+          <span class="tag mono">{{ confidencePct(edge.confidence) }}</span>
+        </div>
+      </div>
+    </div>
+
+    <div v-if="evidences.length" class="sub-section">
+      <h4>证据</h4>
+      <div class="evidence-list">
+        <div v-for="(ev, idx) in evidences" :key="idx" class="evidence-row">
           <div class="tags">
-            <span class="tag">{{ sourceLabel }}</span>
-            <span class="tag">关系 {{ relationCount }}</span>
-            <span class="tag">证据 {{ evidenceCount }}</span>
+            <span v-if="ev.type" class="tag">{{ ev.type }}</span>
+            <span class="tag mono">{{ scoreText(ev.score) }}</span>
           </div>
-        </div>
-        <p v-if="profile.profile_text" class="profile-text">{{ profile.profile_text }}</p>
-        <p v-else class="empty">无画像文本</p>
-
-        <div v-if="relations.length" class="sub-section">
-          <h4>关系</h4>
-          <div class="edge-list">
-            <div v-for="(edge, idx) in relations" :key="idx" class="edge-row">
-              <span class="edge-subject">{{ edge.subject || "-" }}</span>
-              <span class="edge-predicate">—{{ edge.predicate || "?" }}→</span>
-              <span class="edge-object">{{ edge.object || "-" }}</span>
-              <span class="tag mono">{{ confidencePct(edge.confidence) }}</span>
-            </div>
-          </div>
-        </div>
-
-        <div v-if="evidences.length" class="sub-section">
-          <h4>证据</h4>
-          <div class="evidence-list">
-            <div v-for="(ev, idx) in evidences" :key="idx" class="evidence-row">
-              <div class="tags">
-                <span v-if="ev.type" class="tag">{{ ev.type }}</span>
-                <span class="tag mono">{{ scoreText(ev.score) }}</span>
-              </div>
-              <p>{{ truncate(ev.content) }}</p>
-            </div>
-          </div>
+          <p>{{ truncate(ev.content) }}</p>
         </div>
       </div>
     </div>

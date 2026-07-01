@@ -33,25 +33,22 @@ const cm = useCandidateMenu({
 </script>
 
 <template>
-  <div class="band" style="margin-top: 0">
-    <div class="panel-title"><h2>人物画像</h2></div>
-    <div class="toolbar">
-      <div class="field" style="flex: 2">
-        <label>人物关键词</label>
-        <input
-          ref="kwRef"
-          v-model="store.keyword"
-          class="input"
-          placeholder="姓名、别名或 person_id"
-          @focus="cm.open()"
-          @input="cm.onInput()"
-        />
-      </div>
-      <div class="field">
-        <label>Top K</label>
-        <input v-model.number="store.topk" class="input" type="number" min="1" max="50" />
-      </div>
-      <button class="btn primary" :disabled="store.querying" @click="store.query()">查询画像</button>
+  <div class="toolbar people-query-toolbar">
+    <div class="field" style="flex: 2">
+      <label>人物关键词</label>
+      <input
+        ref="kwRef"
+        v-model="store.keyword"
+        class="input"
+        placeholder="姓名、别名或 person_id"
+        @focus="cm.open()"
+        @input="cm.onInput()"
+      />
     </div>
+    <div class="field">
+      <label>Top K</label>
+      <input v-model.number="store.topk" class="input" type="number" min="1" max="50" />
+    </div>
+    <button class="btn primary" :disabled="store.querying" @click="store.query()">查询画像</button>
   </div>
 </template>

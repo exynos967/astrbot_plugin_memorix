@@ -12,15 +12,16 @@ const store = usePeopleStore();
 
 <template>
   <section class="view-people">
-    <div class="grid-2">
-      <div class="people-col">
-        <PersonQueryPanel />
+    <!-- 人物画像：查询 toolbar + 结果显示合并为一个 band -->
+    <div class="band" style="margin-top: 0">
+      <div class="panel-title"><h2>人物画像</h2></div>
+      <PersonQueryPanel />
+      <div class="profile-result">
         <PersonProfilePanel :profile="store.profile" />
       </div>
-      <div class="people-col">
-        <PersonOverridePanel />
-      </div>
     </div>
+
+    <PersonOverridePanel />
   </section>
 </template>
 
@@ -31,9 +32,8 @@ const store = usePeopleStore();
   gap: 4px;
 }
 
-.people-col {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
+/* 画像结果与上方 toolbar 间距 */
+.profile-result {
+  margin-top: 14px;
 }
 </style>
