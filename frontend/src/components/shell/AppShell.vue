@@ -8,7 +8,7 @@ import TopBar from "./TopBar.vue";
 <template>
   <div class="app">
     <div class="app-title">
-      <strong>A_MEMORIX CONTROL PANEL</strong>
+      <strong>Memorix</strong>
       <span>AstrBot embedded dashboard</span>
     </div>
     <div class="shell">

@@ -140,7 +140,7 @@ const rawJson = computed(() => (result.value ? JSON.stringify(result.value, null
         <div v-if="mode === 'relation'" class="grid-3" style="margin-top: 12px">
           <CandidateInput v-model="relationSubject" :source="graphNodeSource" :debounce-ms="0" label="主体" placeholder="Alice" />
           <CandidateInput v-model="relationPredicate" :source="predicateSource" :debounce-ms="0" label="关系" placeholder="负责" />
-          <CandidateInput v-model="relationObject" :source="graphNodeSource" :debounce-ms="0" label="客体" placeholder="A_Memorix WebUI" />
+          <CandidateInput v-model="relationObject" :source="graphNodeSource" :debounce-ms="0" label="客体" placeholder="Memorix WebUI" />
         </div>
       </details>
     </div>
