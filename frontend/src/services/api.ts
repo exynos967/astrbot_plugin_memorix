@@ -5,6 +5,8 @@
 // 两者写入同一 DOM 导致节点总量不一致。新实现统一从 useGraphStore.currentScope 读取 scope，
 // 由调用方经 options.scope 传入；本骨架仅透传，scope 联动刷新在 P2 useScope composable 完成。
 
+import { errText } from "@/utils/error";
+
 export type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 
 export interface RequestOptions {
@@ -70,11 +72,6 @@ function unwrapEnvelope<T>(envelope: unknown, url: string, method: HttpMethod): 
   }
   // 非标准 envelope，原样返回。
   return envelope as T;
-}
-
-function errText(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  return String(err ?? "未知错误");
 }
 
 /** 便捷方法。 */

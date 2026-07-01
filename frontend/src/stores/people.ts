@@ -10,10 +10,8 @@ import {
 } from "@/services/personApi";
 import { useAppStore } from "@/stores/app";
 import { useLogsStore } from "@/stores/logs";
+import { errText } from "@/utils/error";
 
-function errText(err: unknown): string {
-  return err instanceof Error ? err.message : String(err ?? "未知错误");
-}
 
 /**
  * People store：人物候选 + 画像查询 + 人工覆盖。
@@ -40,8 +38,27 @@ export const usePeopleStore = defineStore("people", () => {
 
   let candidateSeq = 0;
   let querySeq = 0;
+  // 候选菜单（PersonQueryPanel/PersonOverridePanel）独立的只读序号，避免与右栏候选列表的 candidateSeq 互相 invalidate。
+  let suggestSeq = 0;
 
-  /** 拉取候选 registry（输入防抖用），返回当前候选项。 */
+  /**
+   * 候选菜单只读建议：拉 registry 返回候选项，**不写共享 candidates 状态**、不进 candidateSeq。
+   * 原候选菜单 source 复用 loadCandidates 会污染右栏 PersonListPanel 列表 + 两侧序号互相丢弃，
+   * 此处独立路径隔离。仍持序号守卫丢弃过期请求。
+   */
+  async function suggestPersons(kw = ""): Promise<PersonRegistryItem[]> {
+    const seq = ++suggestSeq;
+    try {
+      const data = await fetchPersonRegistry(kw, 1, 30);
+      if (seq !== suggestSeq) return [];
+      return data.items || [];
+    } catch {
+      if (seq === suggestSeq) return [];
+      return [];
+    }
+  }
+
+  /** 拉取候选 registry 写入右栏候选列表（"候选列表"按钮 + onMounted 用）。 */
   async function loadCandidates(kw = ""): Promise<PersonRegistryItem[]> {
     candidateSeq += 1;
     const seq = candidateSeq;
@@ -157,6 +174,7 @@ export const usePeopleStore = defineStore("people", () => {
     querying,
     busy,
     loadCandidates,
+    suggestPersons,
     refreshCandidates,
     query,
     saveOverride,

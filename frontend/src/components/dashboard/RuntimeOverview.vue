@@ -14,9 +14,13 @@ const autoSaveText = computed(() =>
 );
 const autoSaveTone = computed(() => (dashboard.config?.auto_save_enabled ? "ok" : "warn"));
 
-// runtime-chip 标签/语气
-const [chipLabel, chipTone] = runtimeLabel(dashboard.runtime);
-const chipToneClass = computed(() => (chipTone === "ok" ? "ok" : chipTone === "bad" ? "bad" : "warn"));
+// runtime-chip 标签/语气：必须包进 computed，否则 setup 顶层求值一次后不再随 dashboard.runtime 刷新。
+const chip = computed(() => runtimeLabel(dashboard.runtime));
+const chipLabel = computed(() => chip.value[0]);
+const chipToneClass = computed(() => {
+  const t = chip.value[1];
+  return t === "ok" ? "ok" : t === "bad" ? "bad" : "warn";
+});
 </script>
 
 <template>

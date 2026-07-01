@@ -9,16 +9,16 @@ import {
 } from "@/services/sourceApi";
 import { isSummaryMode, sourceNameOf } from "@/utils/sourceText";
 import { useAppStore } from "@/stores/app";
+import { useGraphStore } from "@/stores/graph";
 import { useLogsStore } from "@/stores/logs";
+import { errText } from "@/utils/error";
 
-function errText(err: unknown): string {
-  return err instanceof Error ? err.message : String(err ?? "未知错误");
-}
 
 /**
  * Sources store：来源/段落列表 + 删除。
  *
- * 后端 /api/source/* 与 /v1/delete/paragraph 均 NOT scope-aware，直接请求。
+ * /api/source/*（list/batch_delete）挂 routes_compat 全局 app，NOT scope-aware；
+ * /v1/delete/paragraph 走 v1_router，scope-aware，removeParagraph 须传 effectiveScope。
  * 修复 H4：load 用单调请求序号，await 后若已过期则丢弃旧结果，避免快速切换错位。
  * 错误显式进总线。
  */
@@ -34,6 +34,7 @@ export const useSourcesStore = defineStore("sources", () => {
   const lastResult = ref<SourceListResult | null>(null);
 
   const app = useAppStore();
+  const graph = useGraphStore();
   const logs = useLogsStore();
 
   let reqSeq = 0;
@@ -87,7 +88,7 @@ export const useSourcesStore = defineStore("sources", () => {
     if (!hash || !window.confirm("删除该段落？")) return false;
     deleting.value = true;
     try {
-      const data = await deleteParagraphApi(hash);
+      const data = await deleteParagraphApi(hash, graph.effectiveScope());
       logs.log(`段落删除：剪枝 ${data?.relation_prune_count ?? 0} 关系`, "info");
       await load();
       return true;

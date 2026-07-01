@@ -2,11 +2,8 @@ import { fetchScopes } from "@/services/configApi";
 import { useAppStore } from "@/stores/app";
 import { useGraphStore } from "@/stores/graph";
 import { useLogsStore } from "@/stores/logs";
+import { errText } from "@/utils/error";
 
-function errText(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  return String(err ?? "未知错误");
-}
 
 /**
  * Scope 编排 composable：加载可选 scope 列表 + 切换 scope。

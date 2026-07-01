@@ -13,11 +13,9 @@ import { queryEpisodes } from "@/services/episodeApi";
 import { useAppStore } from "@/stores/app";
 import { useGraphStore } from "@/stores/graph";
 import { useLogsStore } from "@/stores/logs";
+import { errText } from "@/utils/error";
 import { useDashboardStore } from "@/stores/dashboard";
 
-function errText(err: unknown): string {
-  return err instanceof Error ? err.message : String(err ?? "未知错误");
-}
 
 /**
  * Query store：统一查询中心。

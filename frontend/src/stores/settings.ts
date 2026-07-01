@@ -10,11 +10,8 @@ import { CONFIG_FIELDS, fieldValue } from "@/utils/configFields";
 import { useAppStore } from "@/stores/app";
 import { useDashboardStore } from "@/stores/dashboard";
 import { useLogsStore } from "@/stores/logs";
+import { errText } from "@/utils/error";
 
-function errText(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  return String(err ?? "未知错误");
-}
 
 /**
  * Settings store：配置表单状态 + 保存动作。

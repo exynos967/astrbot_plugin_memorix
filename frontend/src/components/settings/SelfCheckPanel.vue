@@ -11,8 +11,11 @@ const emit = defineEmits<{ force: [] }>();
 const dashboard = useDashboardStore();
 
 const report = computed(() => dashboard.runtime);
-const [label, tone] = runtimeLabel(report.value);
-const toneClass = computed(() => (tone === "ok" ? "ok" : tone === "bad" ? "bad" : "warn"));
+// label/tone 必须包进 computed，否则 setup 顶层求值一次后自检刷新不更新（与 RuntimeOverview 同款 bug）。
+const runtimeTuple = computed(() => runtimeLabel(report.value));
+const label = computed(() => runtimeTuple.value[0]);
+const tone = computed(() => runtimeTuple.value[1]);
+const toneClass = computed(() => (tone.value === "ok" ? "ok" : tone.value === "bad" ? "bad" : "warn"));
 
 const dimension = computed(() => report.value?.embedding?.dimension ?? report.value?.dimension ?? "-");
 const expected = computed(
@@ -24,7 +27,7 @@ const checkedAt = computed(() =>
     ? new Date(report.value.checked_at * 1000).toLocaleString("zh-CN")
     : "-",
 );
-const code = computed(() => report.value?.code || label);
+const code = computed(() => report.value?.code || label.value);
 const message = computed(() => runtimeMessageText(report.value, "等待自检"));
 const statusText = computed(() => statusLabel(report.value?.ok ? "ready" : "failed"));
 const rawJson = computed(() => JSON.stringify(report.value ?? {}, null, 2));

@@ -15,10 +15,8 @@ import {
 import { fetchScopes } from "@/services/configApi";
 import { useAppStore } from "@/stores/app";
 import { useLogsStore } from "@/stores/logs";
+import { errText } from "@/utils/error";
 
-function errText(err: unknown): string {
-  return err instanceof Error ? err.message : String(err ?? "未知错误");
-}
 
 /**
  * 图谱 store：scope（C5 全局唯一 source）+ 图谱业务状态 + CRUD actions。
@@ -140,7 +138,11 @@ export const useGraphStore = defineStore("graph", () => {
    * 注意：成功后 useVisNetwork 负责把 rawNodes/rawEdges 灌入 DataSet 与 fit，
    * store 仅持久化数据 + 填充候选标签 + 存快照前的清空。
    */
+  // 请求序号守卫：快速切换 scope/source 时丢弃过期请求，避免旧结果覆盖新结果。
+  let loadSeq = 0;
+
   async function loadGraph(): Promise<void> {
+    const seq = ++loadSeq;
     loading.value = true;
     initError.value = "";
     try {
@@ -150,6 +152,7 @@ export const useGraphStore = defineStore("graph", () => {
         source: sourceFocus.value.trim() || undefined,
         scope: effectiveScope(),
       });
+      if (seq !== loadSeq) return; // 已有更新的请求，丢弃本次结果
       rawNodes.value = data.nodes || [];
       rawEdges.value = data.edges || [];
       // 填充候选标签（P5/P6/Query 依赖 nodeLabels，P7 relation 依赖 predicateLabels）
@@ -177,12 +180,13 @@ export const useGraphStore = defineStore("graph", () => {
       userZoomed.value = false;
       logs.log(`图谱已载入：${rawNodes.value.length} 节点，${rawEdges.value.length} 边`, "info");
     } catch (err) {
+      if (seq !== loadSeq) return; // 过期请求的错误不覆盖当前状态
       // C1：错误进总线 + 空状态降级
       initError.value = errText(err);
       app.pushError(errText(err), "loadGraph");
       resetGraphState();
     } finally {
-      loading.value = false;
+      if (seq === loadSeq) loading.value = false;
     }
   }
 

@@ -10,10 +10,8 @@ import {
 import { useAppStore } from "@/stores/app";
 import { useGraphStore } from "@/stores/graph";
 import { useLogsStore } from "@/stores/logs";
+import { errText } from "@/utils/error";
 
-function errText(err: unknown): string {
-  return err instanceof Error ? err.message : String(err ?? "未知错误");
-}
 
 /**
  * Episode store：情景记忆列表 + 详情 + 按 source 重建。

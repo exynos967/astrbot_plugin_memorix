@@ -12,10 +12,8 @@ import {
 import { useAppStore } from "@/stores/app";
 import { useGraphStore } from "@/stores/graph";
 import { useLogsStore } from "@/stores/logs";
+import { errText } from "@/utils/error";
 
-function errText(err: unknown): string {
-  return err instanceof Error ? err.message : String(err ?? "未知错误");
-}
 
 /**
  * Import/Summary 任务 store。
@@ -40,7 +38,17 @@ export const useTaskStore = defineStore("task", () => {
   const logs = useLogsStore();
 
   let timer: number | null = null;
+  let refreshing = false;
+  /** 视图活跃标志：仅 ImportView 挂载期间为 true。防止创建请求 in-flight 时离开视图，
+   *  await 返回后仍 startPolling 新建定时器导致泄漏（stopPolling 在 unmount 已执行，无可清）。 */
+  let viewActive = false;
   const POLL_INTERVAL = 2500;
+
+  /** ImportView onMounted/onBeforeUnmount 调用，标记视图是否仍在查看任务。 */
+  function setViewActive(active: boolean): void {
+    viewActive = active;
+    if (!active) stopPolling();
+  }
 
   function stopPolling(): void {
     if (timer != null) {
@@ -51,11 +59,14 @@ export const useTaskStore = defineStore("task", () => {
   }
 
   async function refresh(): Promise<void> {
+    // in-flight 守卫：单次 refresh > POLL_INTERVAL 时跳过后续 tick，避免并发覆盖。
+    if (refreshing) return;
     const id = currentTaskId.value.trim();
     if (!id) {
       app.pushError("请填写 task id", "refreshTask");
       return;
     }
+    refreshing = true;
     try {
       const type = currentTaskType.value || "import";
       const data =
@@ -63,10 +74,14 @@ export const useTaskStore = defineStore("task", () => {
           ? await getSummaryTask(id, graph.effectiveScope())
           : await getImportTask(id, graph.effectiveScope());
       taskDetail.value = data;
+      // summaryResult 随轮询同步更新：原仅创建瞬间写桩值，SummaryTaskPanel 展示永不刷新。
+      if (type === "summary") summaryResult.value = data;
       if (isTerminalStatus(data.status)) stopPolling();
     } catch (err) {
       app.pushError(errText(err), "refreshTask");
       stopPolling();
+    } finally {
+      refreshing = false;
     }
   }
 
@@ -89,7 +104,8 @@ export const useTaskStore = defineStore("task", () => {
       currentTaskId.value = data.task_id || "";
       currentTaskType.value = "import";
       logs.log(`导入任务已创建：${data.task_id || ""}`, "info");
-      startPolling();
+      // 仅视图仍活跃时启动轮询，避免离开后创建 in-flight 完成导致定时器泄漏。
+      if (viewActive) startPolling();
       return true;
     } catch (err) {
       app.pushError(errText(err), "createImportTask");
@@ -120,7 +136,7 @@ export const useTaskStore = defineStore("task", () => {
       currentTaskType.value = "summary";
       summaryResult.value = { task_id: data.task_id, status: data.status } as TaskDetail;
       logs.log(`摘要任务已创建：${data.task_id || ""}`, "info");
-      startPolling();
+      if (viewActive) startPolling();
       return true;
     } catch (err) {
       app.pushError(errText(err), "createSummaryTask");
@@ -140,6 +156,7 @@ export const useTaskStore = defineStore("task", () => {
     refresh,
     startPolling,
     stopPolling,
+    setViewActive,
     createImport,
     createSummary,
   };

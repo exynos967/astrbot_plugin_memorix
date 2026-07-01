@@ -13,11 +13,8 @@ import {
 import { useAppStore } from "@/stores/app";
 import { useGraphStore } from "@/stores/graph";
 import { useLogsStore } from "@/stores/logs";
+import { errText } from "@/utils/error";
 
-function errText(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  return String(err ?? "未知错误");
-}
 
 /**
  * Memory store：记忆状态 + 回收站 + 关系操作结果。

@@ -12,7 +12,7 @@ const props = withDefaults(
     bucketSeconds?: number;
     seconds?: number;
   }>(),
-  { buckets: () => [], totalCount: 0, bucketSeconds: 300, seconds: 7200 },
+  { buckets: () => [], bucketSeconds: 300, seconds: 7200 },
 );
 
 const WIDTH = 640;
@@ -50,7 +50,7 @@ const meta = computed(() => {
   return `近 ${hours} 小时 · ${minutes} 分钟区间 · ${total.value} 次`;
 });
 
-const empty = computed(() => !compact.value.length || total.value <= 0);
+const empty = computed(() => !compact.value.length);
 
 const maxValue = computed(() => Math.max(1, ...compact.value.map((item) => item.total)));
 
