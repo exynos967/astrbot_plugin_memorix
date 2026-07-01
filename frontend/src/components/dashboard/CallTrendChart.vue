@@ -2,7 +2,8 @@
 // 调用趋势图：近 N 小时查询/工具调用频次（柱 + 折线 + 面积）。
 // 纯展示组件，几何计算从 legacy renderCallTrend（index.html 行 2943-3002）忠实移植。
 // 数据来自 dashboard status services.query.{trend_*}。
-import { computed } from "vue";
+// 宽度自适应容器，高度按宽高比 4:1 计算（宽屏可用作 flex:1 撑满视口）。
+import { computed, onBeforeUnmount, onMounted, ref, shallowRef } from "vue";
 import type { TrendBucket } from "@/services/configApi";
 
 const props = withDefaults(
@@ -15,9 +16,34 @@ const props = withDefaults(
   { buckets: () => [], bucketSeconds: 300, seconds: 7200 },
 );
 
-const WIDTH = 640;
-const HEIGHT = 148;
 const PAD = { left: 18, right: 12, top: 14, bottom: 24 };
+const chartEl = ref<HTMLElement | null>(null);
+const containerWidth = shallowRef(640);
+const containerHeight = shallowRef(148);
+let resizeObserver: ResizeObserver | null = null;
+
+onMounted(() => {
+  if (chartEl.value && typeof ResizeObserver !== "undefined") {
+    resizeObserver = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const w = entry.contentRect.width;
+        const h = entry.contentRect.height;
+        if (w > 0 && w !== containerWidth.value) containerWidth.value = w;
+        if (h > 0 && h !== containerHeight.value) containerHeight.value = h;
+      }
+    });
+    resizeObserver.observe(chartEl.value);
+  }
+});
+
+onBeforeUnmount(() => {
+  resizeObserver?.disconnect();
+  resizeObserver = null;
+});
+
+const WIDTH = computed(() => Math.max(200, containerWidth.value));
+/** 高度：优先容器高度（flex:1 撑高），否则按宽高比回退，最低 120px。 */
+const HEIGHT = computed(() => Math.max(120, containerHeight.value > 40 ? containerHeight.value : Math.round(containerWidth.value / 4)));
 
 function fmtTime(sec: number): string {
   return new Date(sec * 1000).toLocaleTimeString("zh-CN", {
@@ -54,8 +80,8 @@ const empty = computed(() => !compact.value.length);
 
 const maxValue = computed(() => Math.max(1, ...compact.value.map((item) => item.total)));
 
-const innerW = computed(() => WIDTH - PAD.left - PAD.right);
-const innerH = computed(() => HEIGHT - PAD.top - PAD.bottom);
+const innerW = computed(() => WIDTH.value - PAD.left - PAD.right);
+const innerH = computed(() => HEIGHT.value - PAD.top - PAD.bottom);
 
 interface Point {
   x: number;
@@ -109,15 +135,22 @@ const footEnd = computed(() =>
 </script>
 
 <template>
-  <div class="band">
+  <div class="band chart-band">
     <div class="panel-title">
       <h2>调用趋势</h2>
       <span class="section-label">{{ meta }}</span>
     </div>
-    <div class="call-chart">
+    <div ref="chartEl" class="call-chart">
       <div v-if="empty" class="empty">近 2 小时暂无查询/工具调用记录</div>
       <template v-else>
-        <svg :viewBox="`0 0 ${WIDTH} ${HEIGHT}`" role="img" aria-label="近 2 小时查询与工具调用趋势">
+        <svg
+          :viewBox="`0 0 ${WIDTH} ${HEIGHT}`"
+          width="100%"
+          height="100%"
+          preserveAspectRatio="xMidYMid meet"
+          role="img"
+          aria-label="近 2 小时查询与工具调用趋势"
+        >
           <line class="axis" :x1="PAD.left" :y1="PAD.top + innerH" :x2="PAD.left + innerW" :y2="PAD.top + innerH" />
           <line class="axis" :x1="PAD.left" :y1="PAD.top" :x2="PAD.left" :y2="PAD.top + innerH" />
           <rect
