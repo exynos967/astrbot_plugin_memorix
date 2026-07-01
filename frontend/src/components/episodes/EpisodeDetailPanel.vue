@@ -6,7 +6,6 @@ import type { Episode } from "@/services/episodeApi";
 import {
   episodeKeywords,
   episodeParticipants,
-  episodeSummary,
   episodeTimeRange,
   episodeTitle,
 } from "@/utils/episodeText";
@@ -57,10 +56,6 @@ function paragraphTime(p: { created_at?: number; [k: string]: unknown }): string
           <div class="tags">
             <span v-for="kw in episodeKeywords(detail)" :key="kw" class="tag mono">{{ kw }}</span>
           </div>
-        </div>
-        <div v-if="episodeSummary(detail)" class="sub-section">
-          <h4>摘要</h4>
-          <p class="summary-text">{{ episodeSummary(detail) }}</p>
         </div>
         <div v-if="detail.paragraphs && detail.paragraphs.length" class="sub-section">
           <h4>段落</h4>
