@@ -38,6 +38,9 @@
   min-width: 34px;
   min-height: 34px;
   border-radius: 12px;
+  /* 保证单字符图标在按钮内水平和垂直居中（继承 .btn 的 flex 居中，加 line-height 消除字高偏移） */
+  line-height: 1;
+  padding: 0;
 }
 
 .graph-zoom input {

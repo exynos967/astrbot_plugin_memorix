@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // Graph 视图顶部工具栏（从 legacy view-graph toolbar 迁移）。
-// 职责：搜索定位 / 群过滤 / 信息密度 / 过滤叶子 / 载入图谱 / 整理布局 / zoom 控件。
+// 职责：搜索定位 / 群过滤 / 信息密度 / 过滤叶子 / 载入图谱 / zoom 控件。
 // 数据流：scope/density/excludeLeaf/zoom 通过 storeToRefs 取 ref 给 v-model 双向绑定；
 // vis 动作通过 inject(GRAPH_VIS_KEY) 调用，调用前判空（GraphView 未 provide 完成时为 null）。
 import { computed, inject, ref } from "vue";
@@ -38,7 +38,7 @@ function graphNodeSource(kw: string): CandidateItem[] {
   const q = kw.trim().toLowerCase();
   return store.nodeLabels
     .filter((v) => !q || v.toLowerCase().includes(q))
-    .slice(0, 10)
+    .slice(0, 20)
     .map((v) => ({ value: v, kind: "实体" }));
 }
 
@@ -99,11 +99,6 @@ function onFit(): void {
   store.userZoomed = false;
 }
 
-// 整理布局：legacy 用 network.stabilize(120)，但 vis 未暴露 stabilize，
-// 改为重新适配视图（重新 fit），让布局稳定展示。
-function onLayout(): void {
-  vis?.fitGraphView(true);
-}
 </script>
 
 <template>
@@ -157,15 +152,12 @@ function onLayout(): void {
     <!-- 载入图谱 -->
     <button class="btn primary" :disabled="store.loading" @click="store.loadGraph()">载入图谱</button>
 
-    <!-- 整理布局：vis 未暴露 stabilize，改用 fitGraphView 重新适配 -->
-    <button class="btn" @click="onLayout">整理布局</button>
-
     <!-- zoom 控件：滑块因 .input padding 导致拖不到底且与按钮重复，已移除；
          缩放由 - / + 按钮 + 适配视图 + 百分比显示承担。 -->
     <div class="graph-zoom" aria-label="图谱缩放">
       <button class="btn icon" title="缩小图谱" @click="vis?.adjustZoom(-0.15)">-</button>
       <button class="btn icon" title="放大图谱" @click="vis?.adjustZoom(0.15)">+</button>
-      <button class="btn icon" title="适配视图" @click="onFit">⤢</button>
+      <button class="btn icon" title="适配视图" @click="onFit">◰</button>
       <span class="zoom-value">{{ Math.round(zoom * 100) }}%</span>
     </div>
   </div>

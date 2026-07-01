@@ -10,7 +10,7 @@
       {{ simulationRunning ? "暂停模拟" : "继续布局" }}
     </button>
     <button class="btn" :class="{ active: lowPerf }" @click="togglePerf">性能模式</button>
-    <button class="btn" :class="{ active: !!highlightedNode }" @click="clearHighlight">清除高亮</button>
+
     <span class="tag" :class="{ ok: !!(sourceFocus || currentScope) }">{{ filterChipText }}</span>
   </div>
 </template>
@@ -39,7 +39,7 @@ const emit = defineEmits<{
 const store = useGraphStore();
 const vis = inject<VisController | null>(GRAPH_VIS_KEY, null);
 
-const { sourceFocus, currentScope, resolvedScope, scopeOptions, simulationRunning, lowPerf, highlightedNode } =
+const { sourceFocus, currentScope, resolvedScope, scopeOptions, simulationRunning, lowPerf } =
   storeToRefs(store);
 
 // filter chip 文案与 legacy updateGraphToolState 一致
@@ -66,7 +66,4 @@ function togglePerf() {
   vis?.applyLowPerf();
 }
 
-function clearHighlight() {
-  vis?.resetHighlight();
-}
 </script>
