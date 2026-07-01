@@ -20,7 +20,7 @@ const idRef = ref<HTMLInputElement | null>(null);
 // 用 suggestPersons（只读），不污染右栏候选列表。
 async function source(kw: string): Promise<CandidateItem[]> {
   const items = await store.suggestPersons(kw);
-  return items.flatMap(personCandidateValues).map((value) => ({ value }));
+  return personCandidateValues(items).map((value) => ({ value }));
 }
 
 const cm = useCandidateMenu({

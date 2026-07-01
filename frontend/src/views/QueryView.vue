@@ -63,7 +63,7 @@ function graphNodeSource(kw: string): CandidateItem[] {
 // 人物候选：拉 registry 摊平（异步，180ms 防抖）。
 async function personSource(kw: string): Promise<CandidateItem[]> {
   const data = await fetchPersonRegistry(kw.trim(), 1, 30);
-  return data.items.flatMap(personCandidateValues).map((value) => ({ value, kind: "人物" }));
+  return personCandidateValues(data.items).map((value) => ({ value, kind: "人物" }));
 }
 
 // 来源候选：拉 source summary 摊平 source 名（异步，180ms 防抖）。

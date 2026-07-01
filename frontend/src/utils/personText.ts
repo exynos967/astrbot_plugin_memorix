@@ -3,7 +3,14 @@ import type {
   PersonRegistryItem,
 } from "@/services/personApi";
 
-/** registry 列表项的展示名（优先 display_name，回退各别名维度）。 */
+/** 过滤 Python dict/JSON 字符串、超长值等脏数据。 */
+function isGarbageValue(v: string): boolean {
+  const s = v.trim();
+  return s.startsWith("{") || s.startsWith("[") || s.length > 200;
+}
+
+/** registry 列表项的展示名（优先 display_name，回退各别名维度）。
+ *  过滤 dict 字符串等垃圾值。 */
 export function personDisplayName(item: PersonRegistryItem): string {
   return (
     item.display_name ||
@@ -48,19 +55,20 @@ export function profileEvidenceCount(profile: PersonProfile | null): number {
   return Array.isArray(profile?.vector_evidence) ? profile.vector_evidence.length : 0;
 }
 
-/** registry item 可供候选菜单使用的候选值集合（person_id + display + 各别名，去重）。 */
-export function personCandidateValues(item: PersonRegistryItem): string[] {
-  const set: string[] = [];
-  const values = [
-    item.person_id,
-    item.display_name,
-    item.person_name,
-    item.nickname,
-    item.user_id,
-    ...(item.aliases || []),
-  ];
-  for (const v of values) {
-    if (v && !set.includes(v)) set.push(v);
+/**
+ * 从 registry 列表提取候选选项（每人仅取最佳展示名，跨 item 去重，过滤 dict 垃圾值）。
+ * 替代原先 `items.flatMap(personCandidateValues)` 的"一人多条目"爆炸模式。
+ */
+export function personCandidateValues(items: PersonRegistryItem[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const item of items) {
+    // 优先 display_name，回退各别名维度
+    const raw = item.display_name || item.person_name || item.nickname || item.person_id || "";
+    if (!raw || isGarbageValue(raw)) continue;
+    if (seen.has(raw)) continue;
+    seen.add(raw);
+    result.push(raw);
   }
-  return set;
+  return result;
 }

@@ -16,7 +16,7 @@ const kwRef = ref<HTMLInputElement | null>(null);
 
 async function source(kw: string): Promise<CandidateItem[]> {
   const items = await store.suggestPersons(kw);
-  return items.flatMap(personCandidateValues).map((value) => ({ value }));
+  return personCandidateValues(items).map((value) => ({ value }));
 }
 
 const cm = useCandidateMenu({
