@@ -56,7 +56,7 @@ function graphNodeSource(kw: string): CandidateItem[] {
       const t = v.toLowerCase();
       return t === q || t.startsWith(q) || t.includes(q);
     })
-    .slice(0, 10)
+    .slice(0, 20)
     .map((value) => ({ value, kind: "实体" }));
 }
 
@@ -70,11 +70,13 @@ async function personSource(kw: string): Promise<CandidateItem[]> {
 async function sourceSource(kw: string): Promise<CandidateItem[]> {
   const data = await fetchSourceList({});
   const q = kw.trim().toLowerCase();
+  const seen = new Set<string>();
   return (data.sources || [])
     .map((s) => (typeof s === "string" ? s : s.source || ""))
     .filter(Boolean)
     .filter((v) => !q || v.toLowerCase().includes(q))
-    .slice(0, 10)
+    .filter((v) => (seen.has(v) ? false : (seen.add(v), true)))
+    .slice(0, 20)
     .map((value) => ({ value, kind: "来源" }));
 }
 

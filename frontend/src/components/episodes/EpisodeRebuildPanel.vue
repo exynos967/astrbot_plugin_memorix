@@ -23,7 +23,7 @@ function sourceCandidates(keyword: string): CandidateItem[] {
   const kw = keyword.trim().toLowerCase();
   return graph.nodeLabels
     .filter((label) => !kw || label.toLowerCase().includes(kw))
-    .slice(0, 50)
+    .slice(0, 20)
     .map((value) => ({ value, kind: "来源" }));
 }
 

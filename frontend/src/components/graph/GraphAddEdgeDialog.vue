@@ -76,7 +76,7 @@ function graphNodeSource(kw: string): CandidateItem[] {
   const q = kw.trim().toLowerCase();
   return store.nodeLabels
     .filter((v) => !q || v.toLowerCase().includes(q))
-    .slice(0, 10)
+    .slice(0, 20)
     .map((v) => ({ value: v, kind: "实体" }));
 }
 
@@ -85,7 +85,7 @@ function predicateSource(kw: string): CandidateItem[] {
   const q = kw.trim().toLowerCase();
   return store.predicateLabels
     .filter((v) => !q || v.toLowerCase().includes(q))
-    .slice(0, 10)
+    .slice(0, 20)
     .map((v) => ({ value: v, kind: "关系" }));
 }
 
