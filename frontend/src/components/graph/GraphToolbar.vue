@@ -20,7 +20,7 @@ const searchKeyword = ref("");
 
 // storeToRefs 取 ref 供 v-model 双向绑定（setup store 自动解包，但 v-model 需 Ref）
 // zoom 仍解构：供缩放百分比展示用（滑块已删，缩放改由 +/- 按钮控制）。
-const { currentScope, density, excludeLeaf, zoom } = storeToRefs(store);
+const { currentScope, density, excludeLeaf } = storeToRefs(store);
 
 // excludeLeaf 是 boolean，<select> 用 "true"/"false" 字符串，computed 做转换
 const excludeLeafModel = computed<string>({
@@ -93,11 +93,6 @@ async function onReload(): Promise<void> {
   await store.loadGraph();
 }
 
-// 适配视图按钮：fit + 清除用户缩放标记
-function onFit(): void {
-  vis?.fitGraphView(true);
-  store.userZoomed = false;
-}
 
 </script>
 
@@ -110,6 +105,7 @@ function onFit(): void {
       :debounce-ms="180"
       placeholder="输入实体名称"
       label="搜索节点"
+      :flex="2.5"
       @choose="onChoose"
       @keydown="onSearchKeydown"
     />
@@ -152,13 +148,5 @@ function onFit(): void {
     <!-- 载入图谱 -->
     <button class="btn primary" :disabled="store.loading" @click="store.loadGraph()">载入图谱</button>
 
-    <!-- zoom 控件：滑块因 .input padding 导致拖不到底且与按钮重复，已移除；
-         缩放由 - / + 按钮 + 适配视图 + 百分比显示承担。 -->
-    <div class="graph-zoom" aria-label="图谱缩放">
-      <button class="btn icon" title="缩小图谱" @click="vis?.adjustZoom(-0.15)">-</button>
-      <button class="btn icon" title="放大图谱" @click="vis?.adjustZoom(0.15)">+</button>
-      <button class="btn icon" title="适配视图" @click="onFit">◰</button>
-      <span class="zoom-value">{{ Math.round(zoom * 100) }}%</span>
-    </div>
   </div>
 </template>

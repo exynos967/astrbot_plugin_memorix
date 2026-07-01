@@ -19,38 +19,31 @@
   accent-color: var(--accent);
 }
 
-.graph-zoom {
-  flex: 1 1 300px;
-  max-width: 390px;
-  min-height: var(--control-h);
-  display: flex;
+/* zoom 控件已移入 .graph-tools 行内（graph-zoom-inline），
+ * 去掉旧 .graph-zoom flex:1 大容器，改为紧凑的 inline-flex。 */
+
+.graph-zoom-inline {
+  display: inline-flex;
   align-items: center;
-  gap: 7px;
-  padding: 4px 7px;
+  gap: 4px;
+  padding: 3px 7px;
   border: 1px solid rgba(107, 139, 176, 0.26);
-  border-radius: 16px;
+  border-radius: 14px;
   background: rgba(255, 255, 255, 0.58);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.68);
 }
 
-.graph-zoom .btn.icon {
-  width: 34px;
-  min-width: 34px;
-  min-height: 34px;
-  border-radius: 12px;
-  /* 保证单字符图标在按钮内水平和垂直居中（继承 .btn 的 flex 居中，加 line-height 消除字高偏移） */
+.graph-zoom-inline .btn.icon {
+  width: 30px;
+  min-width: 30px;
+  min-height: 30px;
+  border-radius: 10px;
   line-height: 1;
   padding: 0;
 }
 
-.graph-zoom input {
-  flex: 1;
-  min-width: 86px;
-  accent-color: var(--accent);
-}
-
 .zoom-value {
-  min-width: 42px;
+  min-width: 38px;
   color: var(--muted);
   font-size: 12px;
   font-weight: 700;

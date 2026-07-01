@@ -22,7 +22,8 @@ const menuStyle = computed<Record<string, string>>((): Record<string, string> =>
   if (!a) return { display: "none" };
   const vw = window.innerWidth;
   const vh = window.innerHeight;
-  const width = a.width;
+  // 最小宽度 240px 保证长实体名不被截断（min-width 优先级低于视口防溢出）
+  const width = Math.max(a.width, 240);
   const spaceBelow = vh - a.bottom;
   const showBelow = spaceBelow >= 160 || spaceBelow >= a.top;
   const top = showBelow ? a.bottom + 4 : Math.max(8, a.top - MAX_HEIGHT - 4);
@@ -136,6 +137,7 @@ function hover(index: number): void {
         :class="{ active: idx === store.activeIndex }"
         type="button"
         role="option"
+        :title="item.value"
         @mouseenter="hover(idx)"
         @mousedown.prevent="pick(idx)"
       >

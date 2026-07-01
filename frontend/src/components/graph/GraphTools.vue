@@ -5,11 +5,17 @@
     <button class="btn" @click="emit('update:addEdgeOpen', true)">新增关系</button>
     <button class="btn" @click="emit('update:dictOpen', true)">内容字典</button>
     <button class="btn" @click="emit('update:sourceBrowserOpen', true)">来源批次</button>
-    <button class="btn" @click="clearSource">全部图谱</button>
     <button class="btn" :class="{ active: !simulationRunning }" @click="toggleSim">
       {{ simulationRunning ? "暂停模拟" : "继续布局" }}
     </button>
     <button class="btn" :class="{ active: lowPerf }" @click="togglePerf">性能模式</button>
+
+    <span class="graph-zoom-inline" aria-label="图谱缩放">
+      <button class="btn icon" title="缩小图谱" @click="vis?.adjustZoom(-0.15)">-</button>
+      <button class="btn icon" title="放大图谱" @click="vis?.adjustZoom(0.15)">+</button>
+      <button class="btn icon" title="适配视图" @click="onFit">◰</button>
+      <span class="zoom-value">{{ Math.round(zoom * 100) }}%</span>
+    </span>
 
     <span class="tag" :class="{ ok: !!(sourceFocus || currentScope) }">{{ filterChipText }}</span>
   </div>
@@ -39,7 +45,7 @@ const emit = defineEmits<{
 const store = useGraphStore();
 const vis = inject<VisController | null>(GRAPH_VIS_KEY, null);
 
-const { sourceFocus, currentScope, resolvedScope, scopeOptions, simulationRunning, lowPerf } =
+const { sourceFocus, currentScope, resolvedScope, scopeOptions, simulationRunning, lowPerf, zoom } =
   storeToRefs(store);
 
 // filter chip 文案与 legacy updateGraphToolState 一致
@@ -52,18 +58,17 @@ const filterChipText = computed(() => {
     : "自动 scope";
 });
 
-// 全部图谱：清空来源过滤后重新加载
-function clearSource() {
-  store.sourceFocus = "";
-  store.loadGraph();
-}
-
 function toggleSim() {
   vis?.toggleSimulation();
 }
 
 function togglePerf() {
   vis?.applyLowPerf();
+}
+
+function onFit() {
+  vis?.fitGraphView(true);
+  store.userZoomed = false;
 }
 
 </script>
