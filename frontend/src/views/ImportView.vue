@@ -4,7 +4,7 @@
 // 修复 legacy 缺陷：legacy 无任务轮询且无定时器清理。store 已内建轮询，
 // 本 view 仅在卸载时调 store.stopPolling() 清理定时器，杜绝泄漏。
 // 挂载时不自动启动任务（无遗留任务可恢复）。
-import { onBeforeUnmount } from "vue";
+import { onMounted, onBeforeUnmount } from "vue";
 import { useTaskStore } from "@/stores/task";
 import ImportTaskPanel from "@/components/import/ImportTaskPanel.vue";
 import TaskStatusPanel from "@/components/import/TaskStatusPanel.vue";
@@ -12,8 +12,14 @@ import SummaryTaskPanel from "@/components/import/SummaryTaskPanel.vue";
 
 const store = useTaskStore();
 
+onMounted(() => {
+  // 标记视图活跃，允许 createImport/createSummary 在 in-flight 完成后启动轮询。
+  store.setViewActive(true);
+});
+
 onBeforeUnmount(() => {
-  store.stopPolling();
+  // 标记离开 + 清理定时器，杜绝创建 in-flight 完成后泄漏轮询。
+  store.setViewActive(false);
 });
 </script>
 

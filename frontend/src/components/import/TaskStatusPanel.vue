@@ -10,7 +10,15 @@ import { useTaskStore } from "@/stores/task";
 import { taskStatusLabel, taskProgressPct } from "@/utils/episodeText";
 
 const store = useTaskStore();
-const { currentTaskId, taskDetail, polling } = storeToRefs(store);
+const { currentTaskId, currentTaskType, taskDetail, polling } = storeToRefs(store);
+
+// 手动粘贴 task id 时，类型需用户显式选择，否则 refresh 会按上次创建的类型或默认 import 走错端点。
+const taskTypeModel = computed<"import" | "summary">({
+  get: () => (currentTaskType.value === "summary" ? "summary" : "import"),
+  set: (v) => {
+    currentTaskType.value = v;
+  },
+});
 
 /** 任务详情 JSON 格式化展示。 */
 const detailJson = computed(() =>
@@ -35,6 +43,14 @@ const progressLabel = computed(() => taskProgressPct(taskDetail.value));
         <label>Task ID</label>
         <input v-model="currentTaskId" class="input" placeholder="task_id" />
       </div>
+      <div class="field" style="max-width: 130px">
+        <label>类型</label>
+        <select v-model="taskTypeModel" class="select">
+          <option value="import">import</option>
+          <option value="summary">summary</option>
+        </select>
+      </div>
+      <button class="btn" :disabled="polling" @click="store.refresh()">刷新任务</button>
       <span v-if="polling" class="polling-tag">轮询中…</span>
       <button v-if="polling" class="btn" @click="store.stopPolling()">停止轮询</button>
     </div>
