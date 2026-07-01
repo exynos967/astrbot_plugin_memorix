@@ -228,9 +228,11 @@ class PluginPageWebUIBridge:
         *,
         runtime_manager: ScopeRuntimeManager,
         scope_resolver: Callable[[], str],
+        admin_service: Any = None,
     ) -> None:
         self.runtime_manager = runtime_manager
         self.scope_resolver = scope_resolver
+        self.admin_service = admin_service
         self._apps: Dict[str, _EmbeddedWebUIApp] = {}
         self._lock = asyncio.Lock()
 
@@ -409,6 +411,9 @@ class PluginPageWebUIBridge:
         server = MemorixServer(plugin_instance=runtime.context)
         app = server.app
         app.state.context = runtime.context
+        app.state.scope_key = scope_key
+        if self.admin_service is not None:
+            app.state.admin_service = self.admin_service
         if not bool(getattr(app.state, "_memorix_v1_router_registered", False)):
             app.include_router(v1_router)
             app.state._memorix_v1_router_registered = True

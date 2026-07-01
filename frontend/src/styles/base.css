@@ -1,0 +1,89 @@
+/* 全局基础样式：reset + body 背景层 + effects 切换。从 legacy index.html 行 86-167 提取。 */
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+body {
+  position: relative;
+  margin: 0;
+  color: var(--text);
+  background:
+    radial-gradient(circle at 15% 16%, rgba(125, 211, 252, 0.42), transparent 26%),
+    radial-gradient(circle at 82% 12%, rgba(191, 219, 254, 0.7), transparent 28%),
+    linear-gradient(135deg, var(--page-bg), var(--page-bg-2) 52%, #edf7ff);
+  font-family:
+    Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+html[data-theme="dark"] body {
+  background:
+    radial-gradient(circle at 16% 18%, rgba(14, 165, 233, 0.2), transparent 28%),
+    radial-gradient(circle at 84% 10%, rgba(79, 70, 229, 0.28), transparent 30%),
+    linear-gradient(135deg, var(--page-bg), var(--page-bg-2) 56%, #0b1220);
+}
+
+html[data-effects="lite"] body {
+  background: linear-gradient(135deg, var(--page-bg), var(--page-bg-2));
+}
+
+body::before,
+body::after {
+  position: fixed;
+  inset: auto;
+  z-index: 0;
+  width: 46vmax;
+  height: 46vmax;
+  border-radius: 999px;
+  pointer-events: none;
+  content: "";
+  filter: blur(58px);
+  opacity: 0.56;
+  transform: translate3d(0, 0, 0);
+}
+
+body::before {
+  left: -18vmax;
+  bottom: -20vmax;
+  background:
+    radial-gradient(circle at 38% 38%, rgba(59, 130, 246, 0.4), transparent 48%),
+    radial-gradient(circle at 68% 62%, rgba(45, 212, 191, 0.24), transparent 42%);
+  animation: floatGlow 18s ease-in-out infinite alternate;
+}
+
+body::after {
+  top: -18vmax;
+  right: -16vmax;
+  background:
+    radial-gradient(circle at 45% 44%, rgba(147, 197, 253, 0.62), transparent 46%),
+    radial-gradient(circle at 68% 58%, rgba(196, 181, 253, 0.26), transparent 40%);
+  animation: floatGlow 22s ease-in-out infinite alternate-reverse;
+}
+
+html[data-effects="lite"] body::before,
+html[data-effects="lite"] body::after {
+  display: none;
+}
+
+@keyframes floatGlow {
+  from {
+    transform: translate3d(-1.5%, 1%, 0) scale(1);
+  }
+  to {
+    transform: translate3d(2%, -2.4%, 0) scale(1.06);
+  }
+}
+
+#app {
+  position: relative;
+  z-index: 1;
+  height: 100%;
+}

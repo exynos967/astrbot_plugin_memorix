@@ -1,16 +1,15 @@
 """
 OpenAI-compatible embedding adapter.
 
-This adapter keeps the old EmbeddingAPIAdapter interface while removing MaiBot
+This adapter keeps the old EmbeddingAPIAdapter interface while removing host
 runtime dependencies.
 """
 
 from __future__ import annotations
 
 import asyncio
-import os
 import time
-from typing import Any, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import httpx
 import numpy as np
@@ -19,14 +18,6 @@ from openai import AsyncOpenAI
 from ...amemorix.common.logging import get_logger
 
 logger = get_logger("A_Memorix.EmbeddingAPIAdapter")
-
-
-def _first_env(*keys: str) -> str:
-    for key in keys:
-        value = str(os.getenv(key, "") or "").strip()
-        if value:
-            return value
-    return ""
 
 
 def _normalize_openai_base_url(raw: str) -> str:
@@ -90,7 +81,6 @@ class EmbeddingAPIAdapter:
         batch_size: int = 32,
         max_concurrent: int = 5,
         default_dimension: int = 1024,
-        enable_cache: bool = False,
         model_name: str = "auto",
         retry_config: Optional[dict] = None,
         base_url: str = "",
@@ -102,27 +92,18 @@ class EmbeddingAPIAdapter:
         self.batch_size = max(1, int(batch_size))
         self.max_concurrent = max(1, int(max_concurrent))
         self.default_dimension = max(1, int(default_dimension))
-        self.enable_cache = bool(enable_cache)
         self.model_name = str(model_name or "auto")
         self.timeout_seconds = float(timeout_seconds or 30.0)
         self.max_retries = max(1, int(max_retries))
 
-        self.base_url = _normalize_openai_base_url(base_url or _first_env("OPENAPI_BASE_URL", "OPENAI_BASE_URL"))
-        self.api_key = str(api_key or _first_env("OPENAPI_API_KEY", "OPENAI_API_KEY")).strip()
+        self.base_url = _normalize_openai_base_url(base_url)
+        self.api_key = str(api_key or "").strip()
         if openai_model:
             self.openai_model = str(openai_model).strip()
         elif self.model_name and self.model_name.lower() != "auto":
             self.openai_model = self.model_name
         else:
-            self.openai_model = str(
-                _first_env(
-                    "OPENAPI_EMBEDDING_MODEL",
-                    "OPENAI_EMBEDDING_MODEL",
-                    "OPENAPI_MODEL",
-                    "OPENAI_MODEL",
-                )
-                or "text-embedding-3-large"
-            ).strip()
+            self.openai_model = ""
 
         self.retry_config = retry_config or {}
         # `embedding.openapi.max_retries` is exposed in AstrBot UI; cap the
@@ -135,6 +116,12 @@ class EmbeddingAPIAdapter:
 
         self._dimension: Optional[int] = None
         self._dimension_detected = False
+        # 是否向远端发送 `dimensions` 参数。默认 True 保持旧行为（OpenAI 等支持该参数
+        # 的服务商借此返回稳定维度）；_detect_dimensions_support 探测若发现 provider 拒绝
+        # 该参数（如 SiliconFlow 返回 20015 parameter is invalid），则置 False，后续 encode
+        # 永不发送，避免每次写入都失败（issue #22）。
+        self._supports_dimensions: bool = True
+        self._dimensions_support_detected: bool = False
         self._client: Optional[AsyncOpenAI] = None
 
         self._total_encoded = 0
@@ -145,10 +132,14 @@ class EmbeddingAPIAdapter:
             "Embedding adapter initialized: model=%s, default_dim=%s, base_url=%s",
             self.openai_model,
             self.default_dimension,
-            self.base_url or "<default>",
+            self.base_url or "<not-configured>",
         )
 
     def _get_client(self) -> AsyncOpenAI:
+        if not self.base_url:
+            raise RuntimeError("Embedding API base_url is not configured")
+        if not self.openai_model:
+            raise RuntimeError("Embedding API model is not configured")
         if self._client is None:
             kwargs = {
                 "api_key": self.api_key or "EMPTY",
@@ -220,21 +211,46 @@ class EmbeddingAPIAdapter:
                 raise ValueError(f"embedding endpoint returned non-json body: {resp.text[:200]}") from exc
         return _coerce_embedding_rows(data)
 
+    async def _detect_dimensions_support(self) -> bool:
+        """探测 provider 是否接受 `dimensions` 请求参数（与维度探测解耦，issue #22）。
+
+        用一条 probe 文本带 dimensions 试请求：成功 → True；被拒（如 SiliconFlow 20015
+        parameter is invalid）→ False。结果缓存，进程生命周期内只探一次。
+
+        独立于 _detect_dimension 存在的原因：auto_detect_dimension 关闭时 _detect_dimension
+        不跑，但 dimensions 兼容性必须探——否则 SiliconFlow 仍每次写入撞 20015。encode 入口
+        保证此方法至少跑一次，不依赖任何 auto_detect 开关。
+        """
+        if self._dimensions_support_detected:
+            return self._supports_dimensions
+        try:
+            probed = await self._request_embeddings("dimension_probe", dimensions=self.default_dimension)
+            self._supports_dimensions = bool(probed and probed[0])
+        except Exception as exc:
+            logger.debug("Dimensions param probe failed, treat as unsupported: %s", exc)
+            self._supports_dimensions = False
+        self._dimensions_support_detected = True
+        return self._supports_dimensions
+
     async def _detect_dimension(self) -> int:
         if self._dimension_detected and self._dimension is not None:
             return self._dimension
 
-        # Probe with requested dimension first.
-        try:
-            probed = await self._request_embeddings("dimension_probe", dimensions=self.default_dimension)
-            if probed and probed[0]:
-                self._dimension = len(probed[0])
-                self._dimension_detected = True
-                return self._dimension
-        except Exception as exc:
-            logger.debug("Dimension probe with requested dimension failed: %s", exc)
+        # 先探 dimensions 兼容性（顺带复用第一次带 dimensions 的请求结果）。
+        supports = await self._detect_dimensions_support()
+        if supports:
+            # 带 dimensions 探测成功，直接取其向量维度。
+            try:
+                probed = await self._request_embeddings("dimension_probe", dimensions=self.default_dimension)
+                if probed and probed[0]:
+                    self._dimension = len(probed[0])
+                    self._dimension_detected = True
+                    return self._dimension
+            except Exception as exc:
+                logger.debug("Dimension probe with requested dimension failed: %s", exc)
 
-        # Probe with natural model dimension.
+        # Provider rejected `dimensions`（_supports_dimensions 已置 False）。用模型原生
+        # 维度重探，原生维度对写入是权威的（issue #22）。
         try:
             probed = await self._request_embeddings("dimension_probe", dimensions=None)
             if probed and probed[0]:
@@ -281,6 +297,12 @@ class EmbeddingAPIAdapter:
             target_dim = self._dimension or self.default_dimension
         target_dim = int(target_dim)
 
+        # dimensions 兼容性探测与维度探测解耦：即便 auto_detect_dimension 关闭、
+        # _detect_dimension 不跑，这里也保证至少探一次 SiliconFlow 等不支持 dimensions
+        # 参数的 provider 被识别，避免每次写入撞 20015（issue #22）。
+        if not self._dimensions_support_detected:
+            await self._detect_dimensions_support()
+
         if not input_texts:
             empty = np.zeros((0, target_dim), dtype=np.float32)
             return empty[0] if single else empty
@@ -291,9 +313,11 @@ class EmbeddingAPIAdapter:
         async def _encode_chunk(chunk: List[str]) -> np.ndarray:
             async with semaphore:
                 try:
-                    # Always send the effective target dimension so providers that
-                    # support OpenAI-compatible `dimensions` return stable vector size.
-                    vectors = await self._request_embeddings(chunk, dimensions=target_dim)
+                    # 仅当 provider 真正接受 `dimensions` 时才发送。_detect_dimension 探测过
+                    # 一次并缓存结果：SiliconFlow 等不支持的 provider 探测即失败 → 标志 False →
+                    # 此处不发，避免每次写入撞 20015 parameter is invalid（issue #22）。
+                    send_dim = target_dim if self._supports_dimensions else None
+                    vectors = await self._request_embeddings(chunk, dimensions=send_dim)
                     arr = np.asarray(vectors, dtype=np.float32)
                     if arr.ndim == 1:
                         arr = arr.reshape(1, -1)
@@ -340,6 +364,14 @@ class EmbeddingAPIAdapter:
         if self._dimension is not None:
             return int(self._dimension)
         return int(self.default_dimension)
+
+    def get_embedding_fingerprint(self, *, dimension: Optional[int] = None) -> Dict[str, Any]:
+        """embedding 指纹校验暂未启用（本期 vendored 无消费者），返回空 dict 降级。
+
+        上游用此指纹做向量池 embedding 一致性校验；vendored 重写为 AsyncOpenAI+httpx
+        无 provider，且 dual-pool 不依赖指纹，留接口空位待后续启用。
+        """
+        return {}
 
     def get_model_info(self) -> dict:
         avg_time = self._total_time / self._total_encoded if self._total_encoded > 0 else 0.0

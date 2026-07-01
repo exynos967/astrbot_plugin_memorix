@@ -2,13 +2,15 @@
 
 # 存储模块（已实现）
 from .storage import (
-    VectorStore, 
-    GraphStore, 
+    VectorStore,
+    GraphStore,
     MetadataStore,
     ImportStrategy,
     KnowledgeType,
     parse_import_strategy,
+    resolve_stored_knowledge_type,
     detect_knowledge_type,
+    select_import_strategy,
     should_extract_relations,
     get_type_display_name,
 )
@@ -27,6 +29,7 @@ from .retrieval import (
     DualPathRetrieverConfig,
     TemporalQueryOptions,
     FusionConfig,
+    GraphRelationRecallConfig,
     RelationIntentConfig,
     PersonalizedPageRank,
     PageRankConfig,
@@ -36,8 +39,10 @@ from .retrieval import (
     ThresholdConfig,
     SparseBM25Index,
     SparseBM25Config,
-    GraphRelationRecallConfig,
-    GraphRelationRecallService,
+)
+from .utils import (
+    RelationWriteService,
+    RelationWriteResult,
 )
 
 __all__ = [
@@ -48,7 +53,9 @@ __all__ = [
     "ImportStrategy",
     "KnowledgeType",
     "parse_import_strategy",
+    "resolve_stored_knowledge_type",
     "detect_knowledge_type",
+    "select_import_strategy",
     "should_extract_relations",
     "get_type_display_name",
     # Embedding
@@ -61,6 +68,7 @@ __all__ = [
     "DualPathRetrieverConfig",
     "TemporalQueryOptions",
     "FusionConfig",
+    "GraphRelationRecallConfig",
     "RelationIntentConfig",
     "PersonalizedPageRank",
     "PageRankConfig",
@@ -70,6 +78,6 @@ __all__ = [
     "ThresholdConfig",
     "SparseBM25Index",
     "SparseBM25Config",
-    "GraphRelationRecallConfig",
-    "GraphRelationRecallService",
+    "RelationWriteService",
+    "RelationWriteResult",
 ]

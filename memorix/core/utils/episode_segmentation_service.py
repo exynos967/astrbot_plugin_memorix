@@ -1,8 +1,10 @@
-"""Standalone Episode semantic segmentation service.
+"""
+Episode 语义切分服务（LLM 主路径）。
 
-The service can use an OpenAI-compatible ``LLMClient`` supplied through
-``plugin_config["llm_client"]``. If no client is available, callers should fall
-back to deterministic rule-based episode generation.
+职责：
+1. 组装语义切分提示词
+2. 调用 LLM 生成结构化 episode JSON
+3. 严格校验输出结构，返回标准化结果
 """
 
 from __future__ import annotations
@@ -12,16 +14,20 @@ from typing import Any, Dict, List, Optional
 
 from ...amemorix.common.logging import get_logger
 
+from .model_routing import generate_text
+
 logger = get_logger("A_Memorix.EpisodeSegmentationService")
 
 
 class EpisodeSegmentationService:
-    """LLM-backed episode segmentation with strict JSON normalization."""
+    """基于 LLM 的 episode 语义切分服务。"""
 
     SEGMENTATION_VERSION = "episode_mvp_v1"
 
-    def __init__(self, plugin_config: Optional[dict] = None):
+    def __init__(self, plugin_config: Optional[dict] = None, ctx: Any = None):
         self.plugin_config = plugin_config or {}
+        # 本土化命脉：segment() 调 generate_text 时据此取 provider_bridge。
+        self._ctx = ctx
 
     def _cfg(self, key: str, default: Any = None) -> Any:
         current: Any = self.plugin_config
@@ -38,7 +44,11 @@ class EpisodeSegmentationService:
             num = float(value)
         except Exception:
             num = default
-        return max(0.0, min(1.0, num))
+        if num < 0.0:
+            return 0.0
+        if num > 1.0:
+            return 1.0
+        return num
 
     @staticmethod
     def _safe_json_loads(text: str) -> Dict[str, Any]:
@@ -48,7 +58,8 @@ class EpisodeSegmentationService:
 
         if "```" in raw:
             raw = raw.replace("```json", "```").replace("```JSON", "```")
-            for part in raw.split("```"):
+            parts = raw.split("```")
+            for part in parts:
                 part = part.strip()
                 if part.startswith("{") and part.endswith("}"):
                     raw = part
@@ -64,9 +75,19 @@ class EpisodeSegmentationService:
         start = raw.find("{")
         end = raw.rfind("}")
         if start >= 0 and end > start:
-            data = json.loads(raw[start : end + 1])
+            candidate = raw[start : end + 1]
+            data = json.loads(candidate)
             if isinstance(data, dict):
                 return data
+
+        try:
+            from json_repair import repair_json
+
+            repaired = repair_json(raw, return_objects=True)
+            if isinstance(repaired, dict):
+                return repaired
+        except Exception:
+            pass
 
         raise ValueError("invalid_json_response")
 
@@ -82,13 +103,17 @@ class EpisodeSegmentationService:
         for idx, item in enumerate(paragraphs, 1):
             p_hash = str(item.get("hash", "") or "").strip()
             content = str(item.get("content", "") or "").strip().replace("\r\n", "\n")
+            content = content[:800]
+            event_start = item.get("event_time_start")
+            event_end = item.get("event_time_end")
+            event_time = item.get("event_time")
             rows.append(
                 (
                     f"[{idx}] hash={p_hash}\n"
-                    f"event_time={item.get('event_time')}\n"
-                    f"event_time_start={item.get('event_time_start')}\n"
-                    f"event_time_end={item.get('event_time_end')}\n"
-                    f"content={content[:800]}"
+                    f"event_time={event_time}\n"
+                    f"event_time_start={event_start}\n"
+                    f"event_time_end={event_end}\n"
+                    f"content={content}"
                 )
             )
 
@@ -96,7 +121,8 @@ class EpisodeSegmentationService:
         return (
             "You are an episode segmentation engine.\n"
             "Group the given paragraphs into one or more coherent episodes.\n"
-            "Return JSON ONLY. No markdown, no explanation.\n\n"
+            "Return JSON ONLY. No markdown, no explanation.\n"
+            "\n"
             "Hard JSON schema:\n"
             "{\n"
             '  "episodes": [\n'
@@ -110,12 +136,14 @@ class EpisodeSegmentationService:
             '      "llm_confidence": 0.0\n'
             "    }\n"
             "  ]\n"
-            "}\n\n"
+            "}\n"
+            "\n"
             "Rules:\n"
             "1) paragraph_hashes must come from input only.\n"
             "2) title and summary must be non-empty.\n"
             "3) keep participants/keywords concise and deduplicated.\n"
-            "4) if uncertain, still provide best effort confidence values.\n\n"
+            "4) if uncertain, still provide best effort confidence values.\n"
+            "\n"
             f"source={source_text}\n"
             f"window_start={window_start}\n"
             f"window_end={window_end}\n"
@@ -141,27 +169,42 @@ class EpisodeSegmentationService:
 
             title = str(item.get("title", "") or "").strip()
             summary = str(item.get("summary", "") or "").strip()
+            if not title or not summary:
+                continue
+
             raw_hashes = item.get("paragraph_hashes")
-            if not title or not summary or not isinstance(raw_hashes, list):
+            if not isinstance(raw_hashes, list):
                 continue
 
-            paragraph_hashes: List[str] = []
-            seen = set()
-            for raw_hash in raw_hashes:
-                token = str(raw_hash or "").strip()
-                if token and token in valid_hashes and token not in seen:
-                    seen.add(token)
-                    paragraph_hashes.append(token)
-            if not paragraph_hashes:
+            dedup_hashes: List[str] = []
+            seen_hashes = set()
+            for h in raw_hashes:
+                token = str(h or "").strip()
+                if not token or token in seen_hashes or token not in valid_hashes:
+                    continue
+                seen_hashes.add(token)
+                dedup_hashes.append(token)
+
+            if not dedup_hashes:
                 continue
 
-            participants = [str(x).strip() for x in (item.get("participants") or []) if str(x).strip()]
-            keywords = [str(x).strip() for x in (item.get("keywords") or []) if str(x).strip()]
+            participants = []
+            for p in item.get("participants", []) or []:
+                token = str(p or "").strip()
+                if token:
+                    participants.append(token)
+
+            keywords = []
+            for kw in item.get("keywords", []) or []:
+                token = str(kw or "").strip()
+                if token:
+                    keywords.append(token)
+
             normalized.append(
                 {
                     "title": title,
                     "summary": summary,
-                    "paragraph_hashes": paragraph_hashes,
+                    "paragraph_hashes": dedup_hashes,
                     "participants": participants[:16],
                     "keywords": keywords[:20],
                     "time_confidence": self._clamp_score(item.get("time_confidence"), default=1.0),
@@ -184,27 +227,26 @@ class EpisodeSegmentationService:
         if not paragraphs:
             raise ValueError("paragraphs_empty")
 
-        llm_client = self.plugin_config.get("llm_client") if isinstance(self.plugin_config, dict) else None
-        if llm_client is None:
-            raise RuntimeError("episode segmentation llm client unavailable")
-
         prompt = self._build_prompt(
             source=source,
             window_start=window_start,
             window_end=window_end,
             paragraphs=paragraphs,
         )
-        raw = await llm_client.complete(
+        result = await generate_text(
+            self._ctx,
             prompt,
-            temperature=float(self._cfg("episode.segmentation_temperature", 0.2)),
-            max_tokens=int(self._cfg("episode.segmentation_max_tokens", 1500)),
+            request_type="A_Memorix.EpisodeSegmentation",
         )
-        payload = self._safe_json_loads(str(raw))
+        if not result.success or not result.text:
+            raise RuntimeError("llm_generate_failed")
+
+        payload = self._safe_json_loads(str(result.text))
         input_hashes = [str(p.get("hash", "") or "").strip() for p in paragraphs]
         episodes = self._normalize_episodes(payload=payload, input_hashes=input_hashes)
 
         return {
             "episodes": episodes,
-            "segmentation_model": getattr(llm_client, "model", "standalone_llm"),
+            "segmentation_model": "auto",
             "segmentation_version": self.SEGMENTATION_VERSION,
         }

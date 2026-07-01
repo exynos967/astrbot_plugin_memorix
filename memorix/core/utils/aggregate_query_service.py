@@ -302,7 +302,7 @@ class AggregateQueryService:
             )
             for (branch_name, _), payload in zip(scheduled, done):
                 if isinstance(payload, Exception):
-                    logger.error("aggregate branch failed: branch=%s error=%s", branch_name, payload)
+                    logger.error(f"aggregate branch failed: branch={branch_name} error={payload}")
                     normalized = self._normalize_branch_payload(
                         branch_name,
                         {

@@ -24,12 +24,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "quantization_type": "int8",
         "batch_size": 32,
         "max_concurrent": 5,
-        "model_name": "auto",
         "retry": {"max_attempts": 5, "max_wait_seconds": 30, "min_wait_seconds": 2},
         "openai": {
-            "base_url": "https://api.openai.com/v1",
+            "base_url": "",
             "api_key": "",
-            "model": "text-embedding-3-large",
+            "model": "",
             "timeout_seconds": 30,
             "max_retries": 3,
         },
@@ -52,8 +51,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "relation_semantic_fallback": True,
         "relation_fallback_min_score": 0.3,
         "relation_vectorization": {
-            "enabled": True,
-            "backfill_enabled": True,
+            "enabled": False,
+            "backfill_enabled": False,
+            "write_on_import": True,
             "backfill_batch_size": 50,
             "max_retry": 3,
         },
@@ -128,16 +128,40 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "normalize_score": True,
             "normalize_method": "minmax",
         },
+        # 双池检索配置：默认 dual，与上游 A_memorix 对齐；manifest 缺失时运行时降级 single。
+        # mode=dual 时需 ready manifest 就绪，否则降级为 single。
+        "vector_pools": {
+            "mode": "dual",
+            "paragraph_top_k": 20,
+            "graph_top_k": 40,
+            "graph_expand_paragraph_k": 80,
+            "relation_expand_per_hit": 5,
+            "entity_expand_per_hit": 8,
+            "relation_evidence_weight": 1.0,
+            "entity_evidence_weight": 0.55,
+            "semantic_weight": 0.65,
+            "sparse_weight": 0.20,
+            "graph_weight": 0.15,
+            "relation_intent": {
+                "graph_top_k": 80,
+                "semantic_weight": 0.45,
+                "sparse_weight": 0.15,
+                "graph_weight": 0.40,
+                "return_relation_items": False,
+            },
+        },
+    },
+    "runtime": {
+        # 双池就绪标志：bootstrap 在构造时根据 manifest 探测结果回填。
+        "vector_pools_ready": False,
     },
     "threshold": {
         "min_threshold": 0.3,
         "max_threshold": 0.95,
         "percentile": 75.0,
-        "std_multiplier": 1.5,
         "min_results": 3,
         "enable_auto_adjust": True,
     },
-    "graph": {"sparse_matrix_format": "csr"},
     "advanced": {
         "enable_auto_save": True,
         "auto_save_interval_minutes": 5,
@@ -237,6 +261,32 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "queue_maxsize": 1024,
         "summary_poll_interval_seconds": 1,
     },
+    "integration": {
+        "feedback_correction_enabled": False,
+        "feedback_correction_window_hours": 12.0,
+        "feedback_correction_check_interval_minutes": 30,
+        "feedback_correction_batch_size": 20,
+        "feedback_correction_auto_apply_threshold": 0.85,
+        "feedback_correction_max_feedback_messages": 30,
+        "feedback_correction_prefilter_enabled": True,
+        "feedback_correction_paragraph_mark_enabled": True,
+        "feedback_correction_paragraph_hard_filter_enabled": True,
+        "feedback_correction_profile_refresh_enabled": True,
+        "feedback_correction_profile_force_refresh_on_read": True,
+        "feedback_correction_episode_rebuild_enabled": True,
+        "feedback_correction_episode_query_block_enabled": True,
+        "feedback_correction_reconcile_interval_minutes": 5,
+        "feedback_correction_reconcile_batch_size": 20,
+        # 记忆模糊修正：默认启用，与上游 A_memorix 对齐；执行仍需显式确认
+        "fuzzy_modify": {
+            "enabled": True,
+            "candidate_limit": 20,
+            "confirm_threshold": 0.85,
+            "auto_execute_enabled": False,
+            "max_targets": 5,
+            "allow_global_scope": False,
+        },
+    },
 }
 
 
@@ -313,14 +363,6 @@ def _overlay_non_empty(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[st
     return out
 
 
-def _first_non_empty_env(keys: list[str]) -> Optional[str]:
-    for key in keys:
-        value = str(os.getenv(key, "") or "").strip()
-        if value:
-            return value
-    return None
-
-
 def resolve_openapi_endpoint_config(config: Dict[str, Any], *, section: str = "embedding") -> Dict[str, Any]:
     """
     Resolve OpenAI-compatible endpoint config.
@@ -328,7 +370,6 @@ def resolve_openapi_endpoint_config(config: Dict[str, Any], *, section: str = "e
     Compatibility rules:
     - Preferred: `[embedding.openapi]`
     - Legacy compatible: `[embedding.openai]`
-    - Env aliases: `OPENAPI_*` first, then `OPENAI_*`
     """
     root = config.get(section, {}) if isinstance(config, dict) else {}
     if not isinstance(root, dict):
@@ -345,37 +386,6 @@ def resolve_openapi_endpoint_config(config: Dict[str, Any], *, section: str = "e
     # Start from legacy config, then apply non-empty openapi overrides.
     merged = _overlay_non_empty(legacy_cfg, openapi_cfg)
 
-    env_aliases: Dict[str, list[str]] = {
-        "base_url": ["OPENAPI_BASE_URL", "OPENAI_BASE_URL"],
-        "api_key": ["OPENAPI_API_KEY", "OPENAI_API_KEY"],
-        "model": [
-            "OPENAPI_EMBEDDING_MODEL",
-            "OPENAI_EMBEDDING_MODEL",
-            "OPENAPI_MODEL",
-            "OPENAI_MODEL",
-        ],
-        "chat_model": [
-            "OPENAPI_CHAT_MODEL",
-            "OPENAI_CHAT_MODEL",
-            "OPENAPI_MODEL",
-            "OPENAI_MODEL",
-        ],
-        "timeout_seconds": ["OPENAPI_TIMEOUT_SECONDS", "OPENAI_TIMEOUT_SECONDS"],
-        "max_retries": ["OPENAPI_MAX_RETRIES", "OPENAI_MAX_RETRIES"],
-    }
-
-    for field, keys in env_aliases.items():
-        current = merged.get(field)
-        missing = current is None or (isinstance(current, str) and not current.strip())
-        if not missing:
-            continue
-        env_value = _first_non_empty_env(keys)
-        if env_value is not None:
-            merged[field] = _parse_env_value(env_value)
-
-    # Sensible defaults for OpenAI-compatible providers.
-    if not str(merged.get("base_url", "") or "").strip():
-        merged["base_url"] = "https://api.openai.com/v1"
     if "timeout_seconds" not in merged:
         merged["timeout_seconds"] = 30
     if "max_retries" not in merged:

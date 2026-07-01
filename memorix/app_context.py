@@ -155,7 +155,7 @@ class ScopeRuntimeManager:
 
         def add(value: str) -> None:
             key = str(value or "").strip()
-            if key and key not in keys:
+            if key and not self._is_internal_scope_key(key) and key not in keys:
                 keys.append(key)
 
         for key in self._runtimes:
@@ -179,6 +179,11 @@ class ScopeRuntimeManager:
             logger.debug("list scope keys failed", exc_info=True)
 
         return keys
+
+    @staticmethod
+    def _is_internal_scope_key(scope_key: str) -> bool:
+        platform = str(scope_key or "").split(":", 1)[0].strip().lower()
+        return platform == "cron"
 
     def _build_scope_config(self, scope_key: str) -> Dict[str, Any]:
         cfg = _deep_merge(DEFAULT_CONFIG, self.plugin_config)
@@ -242,8 +247,8 @@ class ScopeRuntimeManager:
                 logger.info(
                     "openapi embedding enabled: scope=%s base_url=%s model=%s",
                     key,
-                    str(endpoint_cfg.get("base_url", "") or "<default>"),
-                    str(endpoint_cfg.get("model", "") or "<default>"),
+                    str(endpoint_cfg.get("base_url", "") or "<not-configured>"),
+                    str(endpoint_cfg.get("model", "") or "<not-configured>"),
                 )
             else:
                 self._patch_local_embedding(runtime)

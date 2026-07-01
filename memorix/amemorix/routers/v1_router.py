@@ -147,6 +147,24 @@ class PersonRegistryUpsertRequest(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
+class TuningAdminRequest(BaseModel):
+    action: str
+    payload: Dict[str, Any] = Field(default_factory=dict)
+
+
+class FeedbackAdminRequest(BaseModel):
+    action: str
+    payload: Dict[str, Any] = Field(default_factory=dict)
+
+
+class FuzzyModifyAdminRequest(BaseModel):
+    # 镜像 FeedbackAdminRequest：action 决定调度分支，可变参数走 payload 透传
+    # payload 支持 request_text / plan_id / person_id / person_keyword / chat_id /
+    # limit / confirmed / requested_by / reason / status 等字段
+    action: str
+    payload: Dict[str, Any] = Field(default_factory=dict)
+
+
 def _ctx(request: Request):
     return request.app.state.context
 
@@ -162,6 +180,17 @@ def _task_or_404(task):
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     return task
+
+
+def _admin_service(request: Request):
+    service = getattr(request.app.state, "admin_service", None)
+    if service is None:
+        raise HTTPException(status_code=503, detail="admin service not initialized")
+    return service
+
+
+def _scope_key(request: Request) -> str:
+    return str(getattr(request.app.state, "scope_key", "") or "")
 
 
 def _record_query_event(request: Request, query_type: str) -> None:
@@ -621,3 +650,33 @@ async def create_summary_task(request: Request, body: SummaryTaskCreateRequest):
 async def get_summary_task(request: Request, task_id: str):
     manager = _task_manager(request)
     return _task_or_404(manager.get_task(task_id))
+
+
+@router.post("/tuning")
+async def tuning_admin(request: Request, body: TuningAdminRequest):
+    service = _admin_service(request)
+    scope = _scope_key(request)
+    try:
+        return await service.tuning_admin(scope_key=scope, action=body.action, **(body.payload or {}))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/feedback")
+async def feedback_admin(request: Request, body: FeedbackAdminRequest):
+    service = _admin_service(request)
+    scope = _scope_key(request)
+    try:
+        return await service.feedback_admin(scope_key=scope, action=body.action, **(body.payload or {}))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/fuzzy_modify")
+async def fuzzy_modify_admin(request: Request, body: FuzzyModifyAdminRequest):
+    service = _admin_service(request)
+    scope = _scope_key(request)
+    try:
+        return await service.fuzzy_modify_admin(scope_key=scope, action=body.action, **(body.payload or {}))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

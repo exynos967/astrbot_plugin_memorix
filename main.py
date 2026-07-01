@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 from dataclasses import dataclass
+from typing import cast
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -14,14 +16,21 @@ except Exception:  # pragma: no cover - only used by lightweight unit-test stubs
     class TextPart:  # type: ignore[no-redef]
         def __init__(self, text: str):
             self.text = text
+            self._no_save = False
 
         def mark_as_temp(self):
+            self._no_save = True
             return self
 
         def model_dump_for_context(self):
-            return {"type": "text", "text": self.text}
+            data = {"type": "text", "text": self.text}
+            if self._no_save:
+                data["_no_save"] = True
+            return data
 
 from .memorix.adapters.astrbot_event_adapter import AstrbotEventAdapter, MemorixEvent
+from .memorix.amemorix.services.feedback_service import FeedbackService
+from .memorix.amemorix.services.fuzzy_modify_service import FuzzyModifyService
 from .memorix.app_context import ScopeRuntimeManager
 from .memorix.scope_router import ScopeRouter
 from .memorix.services import (
@@ -36,6 +45,8 @@ from .memorix.services import (
 )
 from .memorix.tools import _format_search_result_for_llm, build_memorix_tools
 from .memorix.utils.message_formatting import (
+    copy_images_to_safe_dir,
+    enrich_text_with_captions,
     format_astrbot_event_message,
     message_format_options_from_config,
 )
@@ -73,11 +84,26 @@ class MemorixPlugin(Star):
         self.profile_service = ProfileService(self.runtime_manager)
         self.summary_service = SummaryService(self.runtime_manager)
         self.person_fact_writeback_service = PersonFactWritebackService(self.runtime_manager, self.config)
-        self.admin_service = AdminService(self.runtime_manager)
+        self.feedback_service = FeedbackService(
+            self.runtime_manager,
+            self.config,
+            ingest_service=self.ingest_service,
+        )
+        # 模糊修正服务：无后台 loop，按需触发 preview/execute/rollback/reconcile
+        self.fuzzy_modify_service = FuzzyModifyService(self.runtime_manager, self.config)
+        self.admin_service = AdminService(
+            self.runtime_manager,
+            feedback_service=self.feedback_service,
+            fuzzy_modify_service=self.fuzzy_modify_service,
+        )
         self.webui_page_bridge = PluginPageWebUIBridge(
             runtime_manager=self.runtime_manager,
             scope_resolver=self._resolve_dashboard_webui_scope,
+            admin_service=self.admin_service,
         )
+        # 持有后台 ingest 任务引用，避免被 GC 回收（asyncio 未持有的 task 在调度紧迫时可能被回收）。
+        # done 回调自动从集合移除，单任务异常不外泄（任务体内已有 try/except 兜底）。
+        self._background_tasks: set[asyncio.Task] = set()
 
     async def initialize(self):
         logger.info("[memorix] initialize start")
@@ -85,16 +111,64 @@ class MemorixPlugin(Star):
         self._llm_tools = build_memorix_tools(self)
         self.context.add_llm_tools(*self._llm_tools)
         await self.person_fact_writeback_service.start()
+        await self.feedback_service.start_background_loops()
         logger.info("[memorix] initialize done")
 
     async def terminate(self):
         logger.info("[memorix] terminate start")
         self._remove_llm_tools()
+        # 等待进行中的后台 ingest 任务完成（最多 5s），超时则取消，避免插件关闭丢消息。
+        pending = [t for t in self._background_tasks if not t.done()]
+        if pending:
+            try:
+                await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=5.0)
+            except asyncio.TimeoutError:
+                for t in pending:
+                    t.cancel()
         await self.person_fact_writeback_service.close()
         await self.webui_page_bridge.close()
+        await self.feedback_service.stop_background_loops()
         await self.admin_service.close()
         await self.runtime_manager.close_all()
         logger.info("[memorix] terminate done")
+
+    async def feedback_service_enabled(self, scope_key: str) -> bool:
+        """该 scope 是否启用反馈纠错（读 integration.feedback_correction_enabled）。"""
+        try:
+            runtime = await self.runtime_manager.get_runtime(scope_key)
+            ctx = runtime.context
+            return bool(ctx.get_config("integration.feedback_correction_enabled", False))
+        except Exception:
+            return False
+
+    async def enqueue_feedback(
+        self,
+        *,
+        scope_key: str,
+        query: str,
+        chat_id: str,
+        group_id: str = "",
+        user_id: str = "",
+        hit_hashes: list | None = None,
+    ) -> dict:
+        """检索命中后入队反馈纠错任务（失败不影响检索结果）。"""
+        if self.feedback_service is None:
+            return {"success": False, "queued": False, "reason": "feedback_service_unavailable"}
+        query_tool_id = f"search:{time.time_ns()}"
+        structured_content = {
+            "query": str(query or ""),
+            "chat_id": str(chat_id or ""),
+            "group_id": str(group_id or ""),
+            "user_id": str(user_id or ""),
+            "hits": [{"hash": h, "type": "paragraph"} for h in (hit_hashes or []) if h],
+        }
+        return await self.feedback_service.enqueue_feedback(
+            scope_key=scope_key,
+            query_tool_id=query_tool_id,
+            session_id=str(chat_id or ""),
+            query_timestamp=time.time(),
+            structured_content=structured_content,
+        )
 
     def _remove_llm_tools(self) -> None:
         tool_manager = getattr(self.context, "get_llm_tool_manager", lambda: None)()
@@ -108,6 +182,20 @@ class MemorixPlugin(Star):
 
     def _resolve_scope(self, event: AstrMessageEvent) -> str:
         return self.scope_router.resolve(event)
+
+    @staticmethod
+    def _is_cron_event(event: AstrMessageEvent) -> bool:
+        return str(getattr(event, "get_platform_name", lambda: "")() or "").strip() == "cron"
+
+    def _spawn_background_task(self, coro) -> asyncio.Task:
+        """创建并持有后台任务，避免未持有 task 被 GC 回收（Sourcery #2）。
+
+        done 回调自动从集合移除；任务体内已 try/except，异常不外泄。
+        """
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     def _resolve_dashboard_webui_scope(self) -> str:
         known_scopes = self.runtime_manager.get_known_scopes()
@@ -147,6 +235,7 @@ class MemorixPlugin(Star):
         if max_value is not None:
             value = min(max_value, value)
         return value
+
 
     @staticmethod
     def _truncate_reference_text(text: str, max_chars: int) -> str:
@@ -356,6 +445,8 @@ class MemorixPlugin(Star):
         parts.append(part)
 
     async def _build_profile_injection_block(self, event: AstrMessageEvent, adapted: MemorixEvent) -> str:
+        if self._is_cron_event(event):
+            return ""
         if not self._bool_cfg(self.config, "person_profile.enabled", True):
             return ""
         if not adapted.sender_id:
@@ -388,22 +479,30 @@ class MemorixPlugin(Star):
         )
         candidates = self._collect_profile_injection_candidates(event, adapted, max_profiles=max_profiles)
         blocks: list[str] = []
-        for candidate in candidates:
-            payload = await self.profile_service.query(
-                scope_key=adapted.scope_key,
-                person_id=candidate.person_id,
-                person_keyword=candidate.person_name or candidate.user_id,
-                top_k=4,
-                force_refresh=False,
-            )
-            profile_text = build_profile_injection_text(self._profile_text_from_payload(payload))
-            if not profile_text:
-                continue
-            display_name = str(payload.get("person_name") or candidate.person_name or candidate.user_id or candidate.person_id).strip()
-            blocks.append(
-                f"- {display_name}（person_id: {candidate.person_id}，来源: {candidate.source}）\n"
-                f"  {self._truncate_reference_text(profile_text, PROFILE_INJECTION_MAX_CHARS)}"
-            )
+        if candidates:
+            tasks = [
+                self.profile_service.query(
+                    scope_key=adapted.scope_key,
+                    person_id=c.person_id,
+                    person_keyword=c.person_name or c.user_id,
+                    top_k=4,
+                    force_refresh=False,
+                )
+                for c in candidates
+            ]
+            for candidate, result in zip(candidates, await asyncio.gather(*tasks, return_exceptions=True)):
+                if isinstance(result, Exception):
+                    logger.debug("[memorix] profile query skipped: %s", result, exc_info=True)
+                    continue
+                payload = cast(dict, result)
+                profile_text = build_profile_injection_text(self._profile_text_from_payload(payload))
+                if not profile_text:
+                    continue
+                display_name = str(payload.get("person_name") or candidate.person_name or candidate.user_id or candidate.person_id).strip()
+                blocks.append(
+                    f"- {display_name}（person_id: {candidate.person_id}，来源: {candidate.source}）\n"
+                    f"  {self._truncate_reference_text(profile_text, PROFILE_INJECTION_MAX_CHARS)}"
+                )
         return self._format_profile_reference_block(blocks)
 
     async def _build_memory_search_injection_block(self, adapted: MemorixEvent, query_text: str) -> str:
@@ -456,19 +555,22 @@ class MemorixPlugin(Star):
 
         query_text = self._memory_injection_query_text(event, request)
         sections: list[str] = []
-        try:
-            profile_block = await self._build_profile_injection_block(event, adapted)
-            if profile_block:
-                sections.append(profile_block)
-        except Exception as exc:
-            logger.debug("[memorix] profile injection skipped: %s", exc, exc_info=True)
 
-        try:
-            memory_block = await self._build_memory_search_injection_block(adapted, query_text)
-            if memory_block:
-                sections.append(memory_block)
-        except Exception as exc:
-            logger.debug("[memorix] memory search injection skipped: %s", exc, exc_info=True)
+        profile_task = self._build_profile_injection_block(event, adapted)
+        memory_task = self._build_memory_search_injection_block(adapted, query_text)
+        profile_result, memory_result = await asyncio.gather(
+            profile_task, memory_task, return_exceptions=True
+        )
+
+        if isinstance(profile_result, Exception):
+            logger.debug("[memorix] profile injection skipped: %s", profile_result, exc_info=True)
+        elif profile_result:
+            sections.append(cast(str, profile_result))
+
+        if isinstance(memory_result, Exception):
+            logger.debug("[memorix] memory search injection skipped: %s", memory_result, exc_info=True)
+        elif memory_result:
+            sections.append(cast(str, memory_result))
 
         if not sections:
             return ""
@@ -544,11 +646,21 @@ class MemorixPlugin(Star):
                 return current
             current = updated
 
-    def _is_command_message(self, text: str) -> bool:
+    def _command_prefixes(self) -> list[str]:
+        # 缓存带配置指纹校验：ingest.command_prefixes 热更新后自动失效重算（Sourcery #1）。
         ingest_cfg = self.config.get("ingest", {}) if isinstance(self.config.get("ingest"), dict) else {}
-        prefixes = self._normalize_command_prefixes(
-            ingest_cfg.get("command_prefixes", ingest_cfg.get("command_prefix", ["/"]))
-        )
+        raw = ingest_cfg.get("command_prefixes", ingest_cfg.get("command_prefix", ["/"]))
+        fingerprint = repr(raw)
+        cached = getattr(self, "_cached_command_prefixes", None)
+        cached_fp = getattr(self, "_cached_command_prefixes_fp", None)
+        if cached is not None and cached_fp == fingerprint:
+            return cached
+        self._cached_command_prefixes = self._normalize_command_prefixes(raw)
+        self._cached_command_prefixes_fp = fingerprint
+        return self._cached_command_prefixes
+
+    def _is_command_message(self, text: str) -> bool:
+        prefixes = self._command_prefixes()
         content = str(text or "").lstrip()
         if not content:
             return False
@@ -595,11 +707,14 @@ class MemorixPlugin(Star):
             logger.warning("[memorix] chat filter check failed: scope=%s", adapted.scope_key, exc_info=True)
             return True
 
-    async def _format_event_text_for_memory(self, event: AstrMessageEvent) -> str:
+    async def _format_event_text_for_memory(self, event: AstrMessageEvent, *, skip_image_caption: bool = False) -> str:
+        opts = message_format_options_from_config(self.config)
+        if skip_image_caption:
+            opts.include_image_caption = False
         formatted = await format_astrbot_event_message(
             event,
             context=self.context,
-            options=message_format_options_from_config(self.config),
+            options=opts,
         )
         self_id = str(
             getattr(event, "get_self_id", lambda: "")()
@@ -685,12 +800,20 @@ class MemorixPlugin(Star):
     async def on_all_messages(self, event: AstrMessageEvent):
         if not self._bool_cfg(self.config, "ingest.record_all_events", True):
             return
+        if self._is_cron_event(event):
+            return
+        safe_paths = await copy_images_to_safe_dir(event)
+        text = await self._format_event_text_for_memory(event, skip_image_caption=True)
+        self._spawn_background_task(self._record_message_background(event, text, safe_paths))
+
+    async def _record_message_background(self, event: AstrMessageEvent, text: str, safe_paths: list[str] | None = None):
         try:
+            if safe_paths:
+                text = await enrich_text_with_captions(text, safe_paths, self.context, self.config, event)
             adapted = AstrbotEventAdapter.from_event(event, self._resolve_scope(event))
             if not await self._is_adapted_chat_enabled(adapted, adapted.sender_id):
                 logger.debug("[memorix] skip chat-filtered message %s", self._event_ctx_text(event, adapted.scope_key))
                 return
-            text = await self._format_event_text_for_memory(event)
             if not text and self._bool_cfg(self.config, "ingest.skip_empty_text", True):
                 logger.debug("[memorix] skip empty/placeholder message %s", self._event_ctx_text(event))
                 return
@@ -713,16 +836,24 @@ class MemorixPlugin(Star):
         text = str(getattr(resp, "completion_text", "") or "").strip()
         if not text:
             return
-        adapted = AstrbotEventAdapter.from_event(event, self._resolve_scope(event))
-        if not await self._is_adapted_chat_enabled(adapted, adapted.sender_id):
-            logger.debug("[memorix] skip chat-filtered LLM response %s", self._event_ctx_text(event, adapted.scope_key))
+        if self._is_cron_event(event):
             return
+        safe_paths = await copy_images_to_safe_dir(event)
+        user_text = await self._format_event_text_for_memory(event, skip_image_caption=True)
+        self._spawn_background_task(self._record_llm_response_background(event, text, user_text, safe_paths))
+
+    async def _record_llm_response_background(self, event: AstrMessageEvent, text: str, user_text: str, safe_paths: list[str] | None = None):
         try:
-            user_text = await self._format_event_text_for_memory(event)
+            if safe_paths:
+                user_text = await enrich_text_with_captions(user_text, safe_paths, self.context, self.config, event)
+            adapted = AstrbotEventAdapter.from_event(event, self._resolve_scope(event))
+            if not await self._is_adapted_chat_enabled(adapted, adapted.sender_id):
+                logger.debug("[memorix] skip chat-filtered LLM response %s", self._event_ctx_text(event, adapted.scope_key))
+                return
             ingested = await self._ingest_event_message(event, "assistant", text)
             if not ingested:
                 return
-            if user_text and not self._is_command_message(user_text):
+            if user_text and not self._is_cron_event(event) and not self._is_command_message(user_text):
                 await self.person_fact_writeback_service.enqueue(
                     PersonFactWritebackItem(
                         scope_key=adapted.scope_key,

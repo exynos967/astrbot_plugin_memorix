@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from typing import Any, Dict, Optional, Tuple
 
 from openai import AsyncOpenAI
@@ -12,14 +11,6 @@ from openai import AsyncOpenAI
 from .common.logging import get_logger
 
 logger = get_logger("A_Memorix.LLMClient")
-
-
-def _first_env(*keys: str) -> str:
-    for key in keys:
-        value = str(os.getenv(key, "") or "").strip()
-        if value:
-            return value
-    return ""
 
 
 class LLMClient:
@@ -32,23 +23,18 @@ class LLMClient:
         timeout_seconds: float = 60.0,
         max_retries: int = 3,
     ):
-        self.base_url = str(base_url or _first_env("OPENAPI_BASE_URL", "OPENAI_BASE_URL")).strip()
-        self.api_key = str(api_key or _first_env("OPENAPI_API_KEY", "OPENAI_API_KEY")).strip()
-        self.model = str(
-            model
-            or _first_env(
-                "OPENAPI_CHAT_MODEL",
-                "OPENAI_CHAT_MODEL",
-                "OPENAPI_MODEL",
-                "OPENAI_MODEL",
-            )
-            or "gpt-4o-mini"
-        ).strip()
+        self.base_url = str(base_url or "").strip()
+        self.api_key = str(api_key or "").strip()
+        self.model = str(model or "").strip()
         self.timeout_seconds = float(timeout_seconds or 60.0)
         self.max_retries = max(1, int(max_retries))
         self._client: Optional[AsyncOpenAI] = None
 
     def _get_client(self) -> AsyncOpenAI:
+        if not self.base_url:
+            raise RuntimeError("OpenAI-compatible chat base_url is not configured")
+        if not self.model:
+            raise RuntimeError("OpenAI-compatible chat model is not configured")
         if self._client is None:
             kwargs = {
                 "api_key": self.api_key or "EMPTY",

@@ -149,7 +149,7 @@ class ImportService:
         if not (s and p and o):
             raise ValueError("relation subject/predicate/object cannot be empty")
 
-        write_vector = bool(self.ctx.get_config("retrieval.relation_vectorization.enabled", True))
+        write_vector = bool(self.ctx.get_config("retrieval.relation_vectorization.enabled", False))
         result = await self.ctx.relation_write_service.upsert_relation_with_vector(
             subject=s,
             predicate=p,

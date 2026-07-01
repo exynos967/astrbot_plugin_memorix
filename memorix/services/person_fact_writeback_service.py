@@ -1,4 +1,4 @@
-"""MaiBot-style person fact writeback for AstrBot events."""
+"""Person fact writeback for AstrBot events."""
 
 from __future__ import annotations
 
@@ -265,14 +265,7 @@ class PersonFactWritebackService:
                 unified_msg_origin=item.unified_msg_origin,
             )
 
-        llm_client = getattr(ctx, "llm_client", None)
-        if llm_client is None or not callable(getattr(llm_client, "complete", None)):
-            return ""
-        return await llm_client.complete(
-            prompt,
-            temperature=float(self._cfg("person_fact_writeback.temperature", 0.1) or 0.1),
-            max_tokens=int(self._cfg("person_fact_writeback.max_tokens", 800) or 800),
-        )
+        return ""
 
     @staticmethod
     def _parse_fact_list(raw: str) -> List[str]:

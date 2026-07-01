@@ -88,7 +88,7 @@ class PersonalizedPageRank:
         self._total_iterations = 0
         self._convergence_history: List[int] = []
 
-        logger.info(
+        logger.debug(
             f"PersonalizedPageRank 初始化: "
             f"alpha={self.config.alpha}, "
             f"max_iter={self.config.max_iter}"

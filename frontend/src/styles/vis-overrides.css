@@ -1,0 +1,196 @@
+/* Graph 视图专属样式：从 legacy index.html 行 1211-1396, 1521-1532 迁移。
+ * 放单独文件便于 vis-network 相关样式集中管理（禁裸 @import，由 main.ts JS import 注入）。
+ */
+
+.graph-scope-field {
+  flex: 1.35 1 190px;
+  min-width: 190px;
+}
+
+/* range 滑块修正：信息密度滑块套了 .input（padding:9px 11px + min-height:42px + border），
+ * 原生 input[type=range] 的 padding 会压缩 thumb 可滑范围，右端被 padding 顶住 → 滑不到 max。
+ * 此处覆盖为透明无内边距，让 track 占满宽度、thumb 可滑到两端。特异性 0,1,1 压过 .input 的 0,1,0。 */
+.toolbar input[type="range"] {
+  padding: 0;
+  min-height: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  accent-color: var(--accent);
+}
+
+/* zoom 控件已移入 .graph-tools 行内（graph-zoom-inline），
+ * 去掉旧 .graph-zoom flex:1 大容器，改为紧凑的 inline-flex。 */
+
+.graph-zoom-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 7px;
+  border: 1px solid rgba(107, 139, 176, 0.26);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.58);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.68);
+}
+
+.graph-zoom-inline .btn.icon {
+  width: 30px;
+  min-width: 30px;
+  min-height: 30px;
+  border-radius: 10px;
+  line-height: 1;
+  padding: 0;
+}
+
+.zoom-value {
+  min-width: 38px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  text-align: right;
+}
+
+.graph-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(107, 139, 176, 0.18);
+}
+
+.graph-tools .tag {
+  min-height: 30px;
+  padding-inline: 10px;
+}
+
+/* view-graph 主区布局（GraphView.vue）：顶部工具栏 band（auto）+ 画布/详情主区（flex:1）。
+ * 高度由 view-stack 子项的 flex:1 撑满，不再把整个页面拉成整页滚动。 */
+.view-graph {
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* 工具栏 band 不收缩，剩余高度全部交给 graph-body。 */
+.view-graph .band {
+  flex-shrink: 0;
+}
+
+.graph-canvas {
+  /* 尺寸由 GraphView.vue scoped 的 grid 单元格拉伸决定（height:100%; min-height:0），
+   * 这里只保留视觉样式。删除 min-height:320px——固定底线导致画布不随窗口高度自适应、
+   * 且窗口小时下半部分被截断。 */
+  position: relative;
+  width: 100%;
+  border: 1px solid rgba(107, 139, 176, 0.24);
+  border-radius: 24px;
+  background:
+    radial-gradient(circle at 50% 46%, rgba(59, 130, 246, 0.14), transparent 32%),
+    radial-gradient(circle at 22% 18%, rgba(255, 255, 255, 0.9), transparent 26%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.72), rgba(239, 246, 255, 0.44));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.74), var(--shadow-xs);
+  overflow: hidden;
+  backdrop-filter: var(--blur-soft);
+  -webkit-backdrop-filter: var(--blur-soft);
+}
+
+html[data-theme="dark"] .graph-canvas {
+  border-color: var(--hairline);
+  background:
+    radial-gradient(circle at 50% 46%, rgba(96, 165, 250, 0.12), transparent 34%),
+    radial-gradient(circle at 22% 18%, rgba(30, 41, 59, 0.74), transparent 28%),
+    linear-gradient(180deg, rgba(15, 23, 42, 0.88), rgba(2, 6, 23, 0.7));
+}
+
+.graph-canvas::before {
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(37, 99, 235, 0.055) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(37, 99, 235, 0.055) 1px, transparent 1px);
+  background-size: 36px 36px;
+  content: "";
+  pointer-events: none;
+}
+
+html[data-theme="dark"] .graph-canvas::before {
+  background-image:
+    linear-gradient(rgba(96, 165, 250, 0.08) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(96, 165, 250, 0.08) 1px, transparent 1px);
+}
+
+/* vis-network 画布容器填满。这里是全局 CSS 文件，不能使用 SFC 专属的 :deep()/:global()。 */
+.graph-canvas-inner {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+}
+
+.graph-canvas .vis-network,
+.graph-canvas .vis-network canvas {
+  position: relative;
+  width: 100% !important;
+  height: 100% !important;
+}
+
+.graph-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-size: 13px;
+  pointer-events: none;
+}
+
+/* 加载指示器：角落小徽标，绝不 inset:0 覆盖画布。
+ * 仅在数据未就绪或渲染间隙显示，图谱一旦画出即隐藏（GraphView.vue loading||rendering）。 */
+.graph-loading-badge {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 2;
+  padding: 5px 12px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.78);
+  border: 1px solid rgba(107, 139, 176, 0.3);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  pointer-events: none;
+  box-shadow: 0 1px 3px rgba(15, 39, 64, 0.12);
+  backdrop-filter: var(--blur-soft);
+  -webkit-backdrop-filter: var(--blur-soft);
+  animation: graph-badge-pulse 1.4s ease-in-out infinite;
+}
+
+html[data-theme="dark"] .graph-loading-badge {
+  background: rgba(15, 23, 42, 0.82);
+  border-color: var(--hairline);
+  color: var(--muted);
+}
+
+@keyframes graph-badge-pulse {
+  0%, 100% { opacity: 0.72; }
+  50% { opacity: 1; }
+}
+
+.topology-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 9px 0;
+  border-top: 1px solid rgba(107, 139, 176, 0.18);
+}
+
+.topology-row:first-child {
+  border-top: 0;
+}

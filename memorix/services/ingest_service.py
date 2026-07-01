@@ -419,7 +419,7 @@ class IngestService:
             ctx.metadata_store.add_entity(name=name, source_paragraph=paragraph_hash)
 
         relation_hashes: list[str] = []
-        write_relation_vectors = bool(ctx.get_config("retrieval.relation_vectorization.enabled", True))
+        write_relation_vectors = bool(ctx.get_config("retrieval.relation_vectorization.enabled", False))
         relation_service = getattr(ctx, "relation_write_service", None)
         if relation_service is not None:
             for row in relation_rows:

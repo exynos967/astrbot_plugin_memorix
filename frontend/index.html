@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Memorix</title>
+    <!-- AstrBot 插件页桥接 SDK：注入 window.AstrBotPluginPage.apiPost，供 services/api.ts 调用。
+         与 legacy 一致显式引用（/api/plugin/page/bridge-sdk.js 是 AstrBot Web API 路由，
+         非 normalize_plugin_page_path 管辖的静态资源路径，不违反 base:'./' 约束）。
+         AstrBot 托管时 rewrite_plugin_page_html 会把它替换为带鉴权 query 的真实 URL。
+         放 module script 前同步加载，确保 main.ts 执行时 bridge 就绪（api.ts 另有 bridge.ready() 兜底）。 -->
+    <script src="/api/plugin/page/bridge-sdk.js"></script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

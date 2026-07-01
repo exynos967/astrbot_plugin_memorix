@@ -90,9 +90,9 @@ def find_paths_between_entities(
             else:
                 pred = "related"
                 direction = "->"
-                rels = metadata_store.get_relations(subject=u, object=v)
+                rels = metadata_store.get_relations(subject=u, object=v, include_inactive=False)
                 if not rels:
-                    rels = metadata_store.get_relations(subject=v, object=u)
+                    rels = metadata_store.get_relations(subject=v, object=u, include_inactive=False)
                     direction = "<-"
                 if rels:
                     best_rel = max(rels, key=lambda x: x.get("confidence", 1.0))

@@ -1,6 +1,10 @@
 import sqlite3
+import subprocess
+import sys
+from pathlib import Path
 
-from astrbot_plugin_memorix.memorix.core.storage.metadata_store import MetadataStore, SCHEMA_VERSION
+import pytest
+from astrbot_plugin_memorix.memorix.core.storage.metadata_store import SCHEMA_VERSION, MetadataStore
 
 
 def test_connect_patches_legacy_episode_position_column(tmp_path):
@@ -388,5 +392,313 @@ def test_connect_patches_037_metadata_columns_and_summary_state(tmp_path):
         )
         assert updated_state["last_task_id"] == "task-2"
         assert updated_state["summary_count"] == 1
+    finally:
+        store.close()
+
+
+# 历史 schema 迁移测试：用于校验老库平滑迁移与离线脚本兜底路径。
+_VNEXT_TABLES = (
+    "episodes",
+    "episode_paragraphs",
+    "episode_pending_paragraphs",
+    "episode_rebuild_sources",
+    "paragraph_vector_backfill",
+    "memory_feedback_tasks",
+    "memory_feedback_action_logs",
+    "paragraph_stale_relation_marks",
+    "person_profile_refresh_queue",
+    "external_memory_refs",
+    "memory_v5_operations",
+    "delete_operations",
+    "delete_operation_items",
+    "relation_hash_aliases",
+)
+
+
+@pytest.mark.skipif(SCHEMA_VERSION < 13, reason="vendored core 未升级到 2.0.0 (SCHEMA_VERSION>=13)")
+def test_v8_legacy_db_migrates_to_current_schema(tmp_path):
+    """模拟历史 v8 库，离线迁移后应出现全部 vNext 表且老数据保留。"""
+
+    db_path = tmp_path / "metadata.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at REAL NOT NULL);
+        INSERT INTO schema_migrations(version, applied_at) VALUES (8, 1.0);
+        CREATE TABLE paragraphs (
+            hash TEXT PRIMARY KEY,
+            content TEXT NOT NULL,
+            vector_index INTEGER,
+            created_at REAL,
+            updated_at REAL,
+            metadata TEXT,
+            source TEXT,
+            word_count INTEGER,
+            event_time REAL,
+            event_time_start REAL,
+            event_time_end REAL,
+            time_granularity TEXT,
+            time_confidence REAL DEFAULT 1.0,
+            knowledge_type TEXT DEFAULT 'mixed',
+            is_permanent BOOLEAN DEFAULT 0,
+            last_accessed REAL,
+            access_count INTEGER DEFAULT 0,
+            is_deleted INTEGER DEFAULT 0,
+            deleted_at REAL
+        );
+        CREATE TABLE relations (
+            hash TEXT PRIMARY KEY,
+            subject TEXT NOT NULL,
+            predicate TEXT NOT NULL,
+            object TEXT NOT NULL,
+            vector_index INTEGER,
+            confidence REAL DEFAULT 1.0,
+            created_at REAL,
+            source_paragraph TEXT,
+            metadata TEXT
+        );
+        INSERT INTO paragraphs(hash, content, created_at, updated_at, source, word_count)
+        VALUES ('p1', 'legacy paragraph', 1.0, 1.0, 'source-a', 2);
+        INSERT INTO relations(hash, subject, predicate, object, confidence, created_at)
+        VALUES ('r1', 'Alice', 'likes', 'cats', 0.9, 1.0);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = MetadataStore(tmp_path)
+    # enforce_schema=False 走离线迁移路径，避免 v8 库在 _assert_schema_compatible 直接抛错。
+    store.connect(enforce_schema=False)
+    try:
+        store._migrate_schema()
+        store.rebuild_relation_hash_aliases()
+        store.normalize_paragraph_knowledge_types()
+        store.set_schema_version(SCHEMA_VERSION)
+        if store._conn is not None:
+            store._conn.commit()
+    finally:
+        store.close()
+
+    after = sqlite3.connect(db_path)
+    try:
+        tables = {
+            row[0]
+            for row in after.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        for table in _VNEXT_TABLES:
+            assert table in tables, f"迁移后缺失 vNext 表: {table}"
+
+        version_row = after.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
+        assert int(version_row[0] or 0) == SCHEMA_VERSION
+
+        # 老数据应保留。
+        kept = after.execute("SELECT content FROM paragraphs WHERE hash='p1'").fetchone()
+        assert kept is not None and kept[0] == "legacy paragraph"
+        kept_rel = after.execute("SELECT subject FROM relations WHERE hash='r1'").fetchone()
+        assert kept_rel is not None and kept_rel[0] == "Alice"
+    finally:
+        after.close()
+
+
+def test_schema_migration_script_discovers_scope_dbs(tmp_path):
+    """不传 --db 时，脚本应自动扫描 plugin_data 下所有 scope metadata.db。"""
+
+    plugin_data_dir = tmp_path / "plugin_data" / "astrbot_plugin_memorix"
+    metadata_dir = plugin_data_dir / "scopes" / "scope_a" / "metadata"
+    metadata_dir.mkdir(parents=True)
+    (metadata_dir.parent / ".scope.json").write_text(
+        '{"scope_key": "aiocqhttp:group:123"}',
+        encoding="utf-8",
+    )
+    db_path = metadata_dir / "metadata.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at REAL NOT NULL);
+        INSERT INTO schema_migrations(version, applied_at) VALUES (8, 1.0);
+        CREATE TABLE paragraphs (
+            hash TEXT PRIMARY KEY,
+            content TEXT NOT NULL,
+            vector_index INTEGER,
+            created_at REAL,
+            updated_at REAL,
+            metadata TEXT,
+            source TEXT,
+            word_count INTEGER,
+            event_time REAL,
+            event_time_start REAL,
+            event_time_end REAL,
+            time_granularity TEXT,
+            time_confidence REAL DEFAULT 1.0,
+            knowledge_type TEXT DEFAULT 'mixed',
+            is_permanent BOOLEAN DEFAULT 0,
+            last_accessed REAL,
+            access_count INTEGER DEFAULT 0,
+            is_deleted INTEGER DEFAULT 0,
+            deleted_at REAL
+        );
+        CREATE TABLE relations (
+            hash TEXT PRIMARY KEY,
+            subject TEXT NOT NULL,
+            predicate TEXT NOT NULL,
+            object TEXT NOT NULL,
+            vector_index INTEGER,
+            confidence REAL DEFAULT 1.0,
+            created_at REAL,
+            source_paragraph TEXT,
+            metadata TEXT
+        );
+        INSERT INTO paragraphs(hash, content, created_at, updated_at, source, word_count)
+        VALUES ('p-script', 'script paragraph', 1.0, 1.0, 'source-script', 2);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "scripts" / "migrate_schema_v8_to_v13.py"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--plugin-data-dir",
+            str(plugin_data_dir),
+        ],
+        cwd=repo_root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert "发现 1 个 scope metadata.db" in result.stdout
+    assert "aiocqhttp:group:123" in result.stdout
+
+    after = sqlite3.connect(db_path)
+    try:
+        version_row = after.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
+        assert int(version_row[0] or 0) == SCHEMA_VERSION
+        kept = after.execute("SELECT content FROM paragraphs WHERE hash='p-script'").fetchone()
+        assert kept is not None and kept[0] == "script paragraph"
+    finally:
+        after.close()
+
+
+def test_schema_13_db_runtime_auto_migrates_to_15(tmp_path):
+    """模拟上一版 schema=13 库，connect() 应自动迁移到当前 schema=15。"""
+
+    assert SCHEMA_VERSION == 15
+    db_path = tmp_path / "metadata.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at REAL NOT NULL);
+        INSERT INTO schema_migrations(version, applied_at) VALUES (13, 1.0);
+        CREATE TABLE paragraphs (
+            hash TEXT PRIMARY KEY,
+            content TEXT NOT NULL,
+            vector_index INTEGER,
+            created_at REAL,
+            updated_at REAL,
+            metadata TEXT,
+            source TEXT,
+            word_count INTEGER,
+            event_time REAL,
+            event_time_start REAL,
+            event_time_end REAL,
+            time_granularity TEXT,
+            time_confidence REAL DEFAULT 1.0,
+            knowledge_type TEXT DEFAULT 'mixed',
+            is_permanent BOOLEAN DEFAULT 0,
+            last_accessed REAL,
+            access_count INTEGER DEFAULT 0,
+            is_deleted INTEGER DEFAULT 0,
+            deleted_at REAL
+        );
+        CREATE TABLE relations (
+            hash TEXT PRIMARY KEY,
+            subject TEXT NOT NULL,
+            predicate TEXT NOT NULL,
+            object TEXT NOT NULL,
+            vector_index INTEGER,
+            confidence REAL DEFAULT 1.0,
+            created_at REAL,
+            source_paragraph TEXT,
+            metadata TEXT
+        );
+        CREATE TABLE paragraph_stale_relation_marks (
+            paragraph_hash TEXT NOT NULL,
+            relation_hash TEXT NOT NULL,
+            reason TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (paragraph_hash, relation_hash)
+        );
+        INSERT INTO paragraphs(hash, content, created_at, updated_at, source, word_count)
+        VALUES ('p13', 'schema 13 paragraph', 1.0, 1.0, 'source-13', 3);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = MetadataStore(tmp_path)
+    store.connect()
+    try:
+        assert store.get_schema_version() == 15
+        tables = {
+            row[0]
+            for row in store._conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        assert "memory_fuzzy_modify_plans" in tables
+
+        stale_columns = {
+            row[1]
+            for row in store._conn.execute("PRAGMA table_info(paragraph_stale_relation_marks)").fetchall()
+        }
+        assert {"source_type", "source_id", "source_operation_id"} <= stale_columns
+
+        kept = store._conn.execute("SELECT content FROM paragraphs WHERE hash='p13'").fetchone()
+        assert kept is not None and kept[0] == "schema 13 paragraph"
+    finally:
+        store.close()
+
+
+@pytest.mark.skipif(SCHEMA_VERSION < 13, reason="vendored core 未升级到 2.0.0 (SCHEMA_VERSION>=13)")
+def test_message_api_shim_reads_transcript_window(tmp_path):
+    """feedback 垫片 MessageAPI 应从 transcript 表按时间窗取消息并解析身份。"""
+
+    from astrbot_plugin_memorix.memorix.amemorix.common.message_api import MessageAPI
+
+    store = MetadataStore(tmp_path)
+    store.connect()
+    try:
+        store.upsert_transcript_session(
+            session_id="s1",
+            source="chat",
+            metadata={"user_id": "u1", "group_id": "g1", "platform": "aiocqhttp"},
+        )
+        store.append_transcript_messages(
+            session_id="s1",
+            messages=[
+                {"role": "user", "content": "earlier", "created_at": 5.0},
+                {"role": "user", "content": "wrong, he is from Beijing", "created_at": 10.0},
+                {"role": "user", "content": "/cmd", "created_at": 11.0},
+            ],
+        )
+
+        api = MessageAPI(store)
+        messages = api.get_messages_by_time_in_chat(
+            chat_id="s1", start_time=6.0, end_time=12.0, limit=50, filter_command=True
+        )
+        contents = [m.processed_plain_text for m in messages]
+        assert "earlier" not in contents  # 早于窗口
+        assert "wrong, he is from Beijing" in contents
+        assert "/cmd" not in contents  # 指令被过滤
+        assert all(m.session_id == "s1" for m in messages)
+
+        identity = api.get_existing_session_by_session_id("s1")
+        assert identity is not None
+        assert identity.user_id == "u1"
+        assert identity.group_id == "g1"
     finally:
         store.close()

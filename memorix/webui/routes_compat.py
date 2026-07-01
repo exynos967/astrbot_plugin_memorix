@@ -167,7 +167,18 @@ class MemorixServer:
         
         @self.app.get("/api/graph")
         async def get_graph(exclude_leaf: bool = False, source: Optional[str] = None, density: float = 1.0):
-            """获取图谱数据，支持过滤叶子节点、来源及信息密度控制"""
+            """获取图谱数据，支持过滤叶子节点、来源及信息密度控制
+
+            重计算（遍历段落/实体/关系、PageRank 显著性过滤、批量元数据状态查询）为 CPU 密集且
+            全程无 await 的同步逻辑。若直接跑在事件循环上，大 metadata.db 时会阻塞整个 AstrBot
+            webui——其余请求排队、刷新出不来、CPU 单核吃满、关浏览器也不释放（issue #19）。
+            用 asyncio.to_thread 把同步构建丢进线程池 offload，事件循环立刻释放，其余请求恢复
+            响应。同步函数内抛出的 HTTPException 会随 to_thread 传播回事件循环，FastAPI 仍正常捕获。
+            """
+            return await asyncio.to_thread(_build_graph_sync, exclude_leaf, source, density)
+
+        def _build_graph_sync(exclude_leaf: bool, source: Optional[str], density: float):
+            """图谱同步构建（CPU 密集），由 get_graph 经 asyncio.to_thread 在线程池执行。"""
             
             # --- 分支 1: 按来源过滤 (Batch Filtering) ---
             if source:
@@ -256,7 +267,7 @@ class MemorixServer:
                 raise HTTPException(status_code=503, detail="Graph store not initialized")
             
             node_names = self.plugin.graph_store.get_nodes()
-            
+
             # --- 智能显著性过滤 (Saliency Filtering) ---
             if exclude_leaf:
                 # 1. 获取 PageRank 得分
@@ -287,11 +298,19 @@ class MemorixServer:
                     ghost_threshold_idx = max(0, threshold_idx - int(n * 0.2))
                     ghost_min_score = sorted_scores[ghost_threshold_idx] if sorted_scores else 0
 
+                    # 瓶颈2优化：旧逻辑对每个节点遍历所有 hub 调 get_edge_weight = O(N×Hubs)
+                    # （1万节点×1千hub=1000万次调用，CPU 卡死）。改为预构建 hub 邻居集合，
+                    # 一次遍历 hub 的出/入邻居 O(H×avg_degree)，后续判断 O(1)。
+                    gst = self.plugin.graph_store
+                    hub_neighbor_set = set()
+                    for hub in hubs:
+                        hub_neighbor_set.update(gst.get_neighbors(hub))
+                        hub_neighbor_set.update(gst.get_in_neighbors(hub))
+
                     for name in node_names:
                         score = scores.get(name, 0)
-                        is_hub_neighbor = any(self.plugin.graph_store.get_edge_weight(name, hub) > 0 for hub in hubs) or \
-                                          any(self.plugin.graph_store.get_edge_weight(hub, name) > 0 for hub in hubs)
-                        
+                        is_hub_neighbor = name in hub_neighbor_set
+
                         if score >= min_score or is_hub_neighbor:
                             # 正常保留
                             filtered_nodes.append(name)
@@ -334,7 +353,9 @@ class MemorixServer:
                         cache = {}
                         count = 0
                         for s, p, o, _ in raw_triples: # _ 用于忽略 hash 字段
-                            key = (s, o)
+                            # 键用规范化小写，查询时也用小写 O(1) 查找，
+                            # 彻底替代旧的 O(E) 线性大小写扫描（瓶颈3，几万边 O(n²) 卡死）
+                            key = (s.strip().lower(), o.strip().lower())
                             if key not in cache: cache[key] = []
                             cache[key].append(p)
                             count += 1
@@ -360,18 +381,10 @@ class MemorixServer:
                     edge_key = (source, target)
                     if edge_key not in processed_edges:
                         weight = self.plugin.graph_store.get_edge_weight(source, target)
-                        # 获取谓语描述
-                        # 尝试精确匹配
-                        predicates = edge_predicates.get((source, target), [])
-                        
-                        # 如果没有找到，尝试不区分大小写的匹配 (慢速路径，但有助于调试)
-                        if not predicates:
-                            for (ks, ko), preds in edge_predicates.items():
-                                if ks.lower() == source.lower() and ko.lower() == target.lower():
-                                    predicates = preds
-                                    logger.info(f"[DEBUG] Found case-insensitive match for {source}->{target}: {preds}")
-                                    break
-                        
+                        # 获取谓语描述：缓存键已规范化小写，此处 O(1) 查找
+                        # （删除旧的 O(E) 大小写线性扫描——瓶颈3，几万边 O(n²) 卡死）
+                        predicates = edge_predicates.get((source.strip().lower(), target.strip().lower()), [])
+
                         # 如果有谓语，优先显示谓语；否则显示权重
                         if predicates:
                             # 限制长度，防止 label 太长
@@ -411,8 +424,8 @@ class MemorixServer:
                         if s_name in filtered_node_set and t_name in filtered_node_set:
                             edge_key = (s_name, t_name)
                             if edge_key not in processed_edges:
-                                # 找到一条非活跃边
-                                predicates = edge_predicates.get(edge_key, [])
+                                # 找到一条非活跃边（缓存键为小写，此处用小写查找）
+                                predicates = edge_predicates.get((s_name.strip().lower(), t_name.strip().lower()), [])
                                 display_label = ", ".join(predicates[:3]) if predicates else "(冷冻)"
                                 
                                 edges.append({
@@ -568,9 +581,9 @@ class MemorixServer:
                 "relation_count": relation_count,
                 "sample_key": list(edge_predicates.keys())[0] if edge_predicates else None,
                 "edge_count": len(edges),
-                "exclude_leaf": exclude_leaf
+                "exclude_leaf": exclude_leaf,
             }
-                
+
             return {"nodes": nodes, "edges": edges, "debug": debug_info}
 
         @self.app.post("/api/edge/weight")

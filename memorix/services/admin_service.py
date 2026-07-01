@@ -13,19 +13,92 @@ from ..amemorix.services import DeleteService, PersonProfileApiService
 from ..amemorix.services import MemoryService as BaseMemoryService
 from ..amemorix.services.import_task_manager import ImportTaskManager
 from ..app_context import ScopeRuntimeManager
+from ..core.utils.retrieval_tuning_manager import RetrievalTuningManager
 from ..core.utils.runtime_self_check import ensure_runtime_self_check
 
 
+class _TuningPluginAdapter:
+    """把 AppContext 适配成 RetrievalTuningManager 期望的 plugin 句柄。
+
+    RetrievalTuningManager 原为单 ctx 内核设计，期望 plugin 持 config 与各 store；
+    封装层等价物是 AppContext，本适配器桥接二者，并在 runtime 重建后刷新 ctx 引用。
+    """
+
+    def __init__(self, ctx: Any) -> None:
+        self.bind(ctx)
+
+    def bind(self, ctx: Any) -> None:
+        self._ctx = ctx
+        # config 须为可写 dict，apply_profile 通过 _nested_set 直接改它以影响该 scope 检索。
+        self.config = ctx.config
+        self._plugin_config = None
+
+    def get_config(self, key: str, default: Any = None) -> Any:
+        return self._ctx.get_config(key, default)
+
+    @property
+    def metadata_store(self) -> Any:
+        return self._ctx.metadata_store
+
+    @property
+    def vector_store(self) -> Any:
+        return self._ctx.vector_store
+
+    # 双池向量存储透传：ctx 暂未挂载时降级为 None，供内核检索调谐探测。
+    @property
+    def paragraph_vector_store(self) -> Any:
+        return getattr(self._ctx, "paragraph_vector_store", None)
+
+    @property
+    def graph_vector_store(self) -> Any:
+        return getattr(self._ctx, "graph_vector_store", None)
+
+    def _dual_vector_pools_enabled(self) -> bool:
+        # 双保险：ctx 暴露方法则调用，否则回退读 _dual_vector_pools_ready 字段。
+        checker = getattr(self._ctx, "_dual_vector_pools_enabled", None)
+        if callable(checker):
+            return bool(checker())
+        return bool(getattr(self._ctx, "_dual_vector_pools_ready", False))
+
+    @property
+    def graph_store(self) -> Any:
+        return self._ctx.graph_store
+
+    @property
+    def embedding_manager(self) -> Any:
+        return self._ctx.embedding_manager
+
+    @property
+    def sparse_index(self) -> Any:
+        return self._ctx.sparse_index
+
+    def is_runtime_ready(self) -> bool:
+        return True
+
+
 class AdminService:
-    def __init__(self, runtime_manager: ScopeRuntimeManager):
+    def __init__(
+        self,
+        runtime_manager: ScopeRuntimeManager,
+        *,
+        feedback_service: Any = None,
+        fuzzy_modify_service: Any = None,
+    ):
         self.runtime_manager = runtime_manager
+        self.feedback_service = feedback_service
+        self.fuzzy_modify_service = fuzzy_modify_service
         self._import_managers: dict[str, ImportTaskManager] = {}
+        self._tuning_managers: dict[str, RetrievalTuningManager] = {}
 
     async def close(self) -> None:
-        managers = list(self._import_managers.values())
+        import_managers = list(self._import_managers.values())
         self._import_managers.clear()
-        for manager in managers:
+        tuning_managers = list(self._tuning_managers.values())
+        self._tuning_managers.clear()
+        for manager in import_managers:
             await manager.stop()
+        for manager in tuning_managers:
+            await manager.shutdown()
 
     async def graph_admin(self, *, scope_key: str, action: str, **kwargs) -> Dict[str, Any]:
         runtime = await self.runtime_manager.get_runtime(scope_key)
@@ -239,12 +312,110 @@ class AdminService:
         return self._unsupported("import", act)
 
     async def tuning_admin(self, *, scope_key: str, action: str, **kwargs) -> Dict[str, Any]:
-        del scope_key, kwargs
-        return self._err(f"当前 AstrBot 内嵌运行时暂不支持 tuning action: {self._action(action)}")
+        runtime = await self.runtime_manager.get_runtime(scope_key)
+        ctx = runtime.context
+        manager = self._tuning_manager(scope_key, ctx)
+        act = self._action(action)
+        if act in {"settings", "get_settings"}:
+            return {"success": True, "settings": manager.get_runtime_settings(), "profile": manager.get_profile_snapshot()}
+        if act in {"profile", "get_profile"}:
+            return {"success": True, "profile": manager.get_profile_snapshot()}
+        if act in {"export_toml", "export"}:
+            return {"success": True, "toml": manager.export_toml_snippet()}
+        if act == "apply":
+            profile = kwargs.get("profile") if isinstance(kwargs.get("profile"), dict) else kwargs
+            return {"success": True, **await manager.apply_profile(profile, reason=str(kwargs.get("reason", "admin:apply") or "admin:apply"))}
+        if act == "rollback":
+            return {"success": True, **await manager.rollback_profile()}
+        if act in {"create", "create_task"}:
+            payload = kwargs.get("payload") if isinstance(kwargs.get("payload"), dict) else kwargs
+            return {"success": True, "task": await manager.create_task(payload)}
+        if act == "list":
+            items = await manager.list_tasks(limit=self._int(kwargs.get("limit"), 50, 1, 500))
+            return {"success": True, "items": items, "count": len(items)}
+        if act == "get":
+            task = await manager.get_task(str(kwargs.get("task_id", "") or ""), include_rounds=bool(kwargs.get("include_rounds", False)))
+            return {"success": task is not None, "task": task, "error": "" if task is not None else "任务不存在"}
+        if act in {"rounds", "get_rounds"}:
+            payload = await manager.get_rounds(
+                str(kwargs.get("task_id", "") or ""),
+                offset=self._int(kwargs.get("offset"), 0, 0, 1000000),
+                limit=self._int(kwargs.get("limit"), 50, 1, 500),
+            )
+            return {"success": payload is not None, **(payload or {}), "error": "" if payload is not None else "任务不存在"}
+        if act == "cancel":
+            task = await manager.cancel_task(str(kwargs.get("task_id", "") or ""))
+            return {"success": task is not None, "task": task, "error": "" if task is not None else "任务不存在"}
+        if act in {"apply_best", "apply_best_profile"}:
+            return {"success": True, **await manager.apply_best(str(kwargs.get("task_id", "") or ""))}
+        if act in {"report", "get_report"}:
+            fmt = str(kwargs.get("format", kwargs.get("fmt", "md")) or "md").strip().lower()
+            payload = await manager.get_report(str(kwargs.get("task_id", "") or ""), fmt=fmt)
+            return {"success": payload is not None, **(payload or {}), "error": "" if payload is not None else "任务不存在"}
+        return self._unsupported("tuning", act)
+
+    def _tuning_manager(self, scope_key: str, ctx: Any) -> RetrievalTuningManager:
+        manager = self._tuning_managers.get(scope_key)
+        if manager is None:
+            adapter = _TuningPluginAdapter(ctx)
+            manager = RetrievalTuningManager(adapter, ctx_provider=lambda: adapter._ctx)
+            self._tuning_managers[scope_key] = manager
+        else:
+            manager.plugin.bind(ctx)
+        return manager
 
     async def feedback_admin(self, *, scope_key: str, action: str, **kwargs) -> Dict[str, Any]:
-        del scope_key, kwargs
-        return self._err(f"当前 AstrBot 内嵌运行时暂不支持 feedback action: {self._action(action)}")
+        if self.feedback_service is None:
+            return self._err("反馈纠错服务未启用")
+        runtime = await self.runtime_manager.get_runtime(scope_key)
+        ctx = runtime.context
+        act = self._action(action)
+        if act == "list":
+            return await self.feedback_service.list_feedback_tasks(
+                ctx,
+                limit=self._int(kwargs.get("limit"), 50, 1, 500),
+                statuses=self._tokens(kwargs.get("status") or kwargs.get("statuses")),
+                rollback_statuses=self._tokens(kwargs.get("rollback_status") or kwargs.get("rollback_statuses")),
+                query=str(kwargs.get("query", "") or "").strip(),
+            )
+        if act == "get":
+            return await self.feedback_service.get_feedback_task(ctx, int(kwargs.get("task_id", 0) or 0))
+        if act == "rollback":
+            return await self.feedback_service.rollback_feedback_task(
+                ctx,
+                task_id=int(kwargs.get("task_id", 0) or 0),
+                requested_by=str(kwargs.get("requested_by", "") or "").strip(),
+                reason=str(kwargs.get("reason", "") or "").strip(),
+            )
+        if act in {"logs", "list_logs", "action_logs"}:
+            task_id = int(kwargs.get("task_id", 0) or 0)
+            if task_id <= 0:
+                return self._err("task_id 不能为空")
+            return {"success": True, "items": ctx.metadata_store.list_feedback_action_logs(task_id), "task_id": task_id}
+        if act in {"reconcile", "trigger_reconcile"}:
+            return {"success": True, "result": await self.feedback_service.trigger_reconcile(scope_key)}
+        return self._unsupported("feedback", act)
+
+    async def fuzzy_modify_admin(self, *, scope_key: str, action: str, **kwargs) -> Dict[str, Any]:
+        # 模糊修改服务调度入口，镜像 feedback_admin 的 ctx 获取与 action 归一化方式
+        if self.fuzzy_modify_service is None:
+            return self._err("模糊修改服务未启用")
+        runtime = await self.runtime_manager.get_runtime(scope_key)
+        ctx = runtime.context
+        act = self._action(action)
+        if act == "preview":
+            return await self.fuzzy_modify_service.preview(ctx, scope=scope_key, **kwargs)
+        if act == "execute":
+            return await self.fuzzy_modify_service.execute(ctx, **kwargs)
+        if act == "get":
+            return await self.fuzzy_modify_service.get(ctx, **kwargs)
+        if act == "list":
+            return await self.fuzzy_modify_service.list(ctx, scope=scope_key, **kwargs)
+        if act == "rollback":
+            return await self.fuzzy_modify_service.rollback(ctx, **kwargs)
+        if act == "reconcile":
+            return await self.fuzzy_modify_service.reconcile(ctx)
+        return self._unsupported("fuzzy_modify", act)
 
     async def v5_admin(self, *, scope_key: str, action: str, **kwargs) -> Dict[str, Any]:
         runtime = await self.runtime_manager.get_runtime(scope_key)

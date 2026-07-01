@@ -18,7 +18,6 @@ from ..core.utils.person_profile_service import PersonProfileService
 from ..core.utils.relation_write_service import RelationWriteService
 
 from .common.logging import get_logger
-from .llm_client import LLMClient
 from .settings import AppSettings
 
 logger = get_logger("A_Memorix.AppContext")
@@ -39,14 +38,19 @@ class AppContext:
     relation_write_service: RelationWriteService
     episode_service: EpisodeService
     episode_retrieval_service: EpisodeRetrievalService
-    llm_client: LLMClient
+    llm_client: Optional[Any]
     data_dir: Path
     config: Dict[str, Any]
+    provider_bridge: Optional[Any] = None
     _runtime_self_check_report: Optional[Dict[str, Any]] = None
     _runtime_auto_save: Optional[bool] = None
     _request_dedup_cache: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     _request_dedup_inflight: Dict[str, asyncio.Future] = field(default_factory=dict)
     _request_dedup_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # 双池子存储：始终构造，ready 标志决定是否启用双池检索/写入路径。
+    paragraph_vector_store: Optional[VectorStore] = None
+    graph_vector_store: Optional[VectorStore] = None
+    _dual_vector_pools_ready: bool = False
 
     def get_config(self, key: str, default: Any = None) -> Any:
         current: Any = self.config
@@ -176,10 +180,23 @@ class AppContext:
             logger.warning("Failed to reinforce relation access: %s", exc)
 
     async def save_all(self) -> None:
+        if self._dual_vector_pools_ready:
+            # 双池就绪：并行存主向量池 + 段落池 + 图谱池 + 图结构。
+            await asyncio.gather(
+                asyncio.to_thread(self.vector_store.save),
+                asyncio.to_thread(self.graph_store.save),
+                asyncio.to_thread(self.paragraph_vector_store.save),
+                asyncio.to_thread(self.graph_vector_store.save),
+            )
+            return
         await asyncio.gather(
             asyncio.to_thread(self.vector_store.save),
             asyncio.to_thread(self.graph_store.save),
         )
+
+    def _dual_vector_pools_enabled(self) -> bool:
+        """双池检索/写入路径是否就绪可用。"""
+        return self._dual_vector_pools_ready
 
     async def close(self) -> None:
         try:

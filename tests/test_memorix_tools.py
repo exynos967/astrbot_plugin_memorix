@@ -2,20 +2,19 @@ import asyncio
 from types import SimpleNamespace
 
 import numpy as np
-
 from astrbot_plugin_memorix.main import MEMORY_INJECTION_MARKER, MemorixPlugin
 from astrbot_plugin_memorix.memorix.adapters.astrbot_event_adapter import AstrbotEventAdapter
 from astrbot_plugin_memorix.memorix.amemorix.context import AppContext
 from astrbot_plugin_memorix.memorix.amemorix.services.query_service import QueryService
 from astrbot_plugin_memorix.memorix.core.storage.metadata_store import MetadataStore
 from astrbot_plugin_memorix.memorix.core.utils.summary_importer import SummaryImporter
-from astrbot_plugin_memorix.memorix.services.ingest_service import IngestService
 from astrbot_plugin_memorix.memorix.services.content_router import MemoryContentRouter
+from astrbot_plugin_memorix.memorix.services.ingest_service import IngestService
 from astrbot_plugin_memorix.memorix.services.person_fact_writeback_service import (
     PersonFactWritebackItem,
     PersonFactWritebackService,
 )
-from astrbot_plugin_memorix.memorix.tools import _format_search_result_for_llm, build_memorix_tools
+from astrbot_plugin_memorix.memorix.tools import MemorixIngestTextTool, _format_search_result_for_llm, build_memorix_tools
 from astrbot_plugin_memorix.memorix.utils.profile_injection import build_profile_injection_text
 
 
@@ -30,6 +29,16 @@ class DummyContext:
 
     def get_llm_tool_manager(self):
         return self._tool_manager
+
+
+class _FakeProviderRequest(SimpleNamespace):
+    async def assemble_context(self):
+        content = []
+        if self.prompt:
+            content.append({"type": "text", "text": self.prompt})
+        for part in self.extra_user_content_parts:
+            content.append(part.model_dump_for_context())
+        return {"role": "user", "content": content}
 
 
 class DummyPlugin:
@@ -159,8 +168,10 @@ EXPECTED_TOOL_NAMES = [
     "memory_runtime_admin",
     "memory_import_admin",
     "memory_tuning_admin",
+    "memory_feedback_admin",
     "memory_v5_admin",
     "memory_delete_admin",
+    "memory_fuzzy_modify_admin",
 ]
 
 
@@ -202,6 +213,37 @@ def test_astrbot_event_adapter_extracts_group_name():
     assert adapted.group_name == "测试群"
 
 
+def test_astrbot_event_adapter_restores_cron_original_session():
+    class _CronMessageObj:
+        session_id = "799462158"
+        message_id = "cron-msg"
+        timestamp = 123
+        message = []
+
+    class _CronEvent:
+        unified_msg_origin = "aiocqhttp:GroupMessage:799462158"
+        message_obj = _CronMessageObj()
+        message_str = "定时任务结果"
+
+        def get_platform_name(self):
+            return "cron"
+
+        def get_sender_id(self):
+            return "799462158"
+
+        def get_sender_name(self):
+            return "Scheduler"
+
+        def get_group_id(self):
+            return ""
+
+    adapted = AstrbotEventAdapter.from_event(_CronEvent(), "aiocqhttp:group:799462158")
+
+    assert adapted.platform == "aiocqhttp"
+    assert adapted.session_id == "799462158"
+    assert adapted.group_id == "799462158"
+
+
 def test_llm_request_injects_profile_and_auto_memory():
     plugin = MemorixPlugin(
         DummyContext(),
@@ -218,13 +260,20 @@ def test_llm_request_injects_profile_and_auto_memory():
         return True
 
     plugin._is_adapted_chat_enabled = _enabled
-    request = SimpleNamespace(prompt="我喜欢什么游戏？", system_prompt="原始系统提示", extra_user_content_parts=[])
+    request = _FakeProviderRequest(prompt="我喜欢什么游戏？", system_prompt="原始系统提示", extra_user_content_parts=[])
 
     asyncio.run(plugin.on_llm_request(_FakeEvent(), request))
 
     assert request.system_prompt == "原始系统提示"
+    assert request.prompt == "我喜欢什么游戏？"
     assert len(request.extra_user_content_parts) == 1
     injected_text = request.extra_user_content_parts[0].text
+    assert request.extra_user_content_parts[0].model_dump_for_context().get("_no_save") is True
+    assembled = asyncio.run(request.assemble_context())
+    # 真实 astrbot assemble_context 顺序：prompt 在前，extra_user_content_parts 在后。
+    assert assembled["content"][0] == {"type": "text", "text": "我喜欢什么游戏？"}
+    assert assembled["content"][1]["text"] == injected_text
+    assert assembled["content"][1].get("_no_save") is True
     assert MEMORY_INJECTION_MARKER in injected_text
     assert "【人物画像-内部参考】" in injected_text
     assert "小明喜欢深夜玩 RPG" in injected_text
@@ -439,8 +488,8 @@ class _FakeEmbeddingManager:
 
 
 class _StaticFactService(PersonFactWritebackService):
-    async def _complete(self, ctx, prompt):
-        del ctx, prompt
+    async def _complete(self, ctx, prompt, item):
+        del ctx, prompt, item
         return '["小明喜欢深夜打游戏"]'
 
 
@@ -652,6 +701,92 @@ def test_person_fact_writeback_respects_chat_filter():
     asyncio.run(service._handle_item(item))
 
 
+def test_cron_llm_response_skips_person_fact_writeback():
+    class _CronMessageObj:
+        session_id = "799462158"
+        message_id = "cron-msg"
+        timestamp = 123
+        message = []
+
+    class _CronEvent:
+        unified_msg_origin = "aiocqhttp:GroupMessage:799462158"
+        message_obj = _CronMessageObj()
+        message_str = "定时任务结果"
+
+        def get_platform_name(self):
+            return "cron"
+
+        def get_sender_id(self):
+            return "799462158"
+
+        def get_sender_name(self):
+            return "Scheduler"
+
+        def get_group_id(self):
+            return ""
+
+    class _PersonFactQueue:
+        async def enqueue(self, **_kwargs):
+            raise AssertionError("cron event should not enqueue person fact writeback")
+
+    class _SummaryService:
+        async def maybe_enqueue_auto_summary(self, **_kwargs):
+            return {"queued": False}
+
+    plugin = MemorixPlugin(DummyContext(), {"scope": {"mode": "group_global"}})
+    plugin.person_fact_writeback_service = _PersonFactQueue()
+    plugin.summary_service = _SummaryService()
+
+    async def _enabled(_adapted, _user_id=""):
+        return True
+
+    async def _format(_event, *, skip_image_caption: bool = False):
+        return "定时任务结果"
+
+    async def _ingest(_event, _role, _text):
+        return True
+
+    plugin._is_adapted_chat_enabled = _enabled
+    plugin._format_event_text_for_memory = _format
+    plugin._ingest_event_message = _ingest
+
+    asyncio.run(plugin.on_llm_response(_CronEvent(), SimpleNamespace(completion_text="已完成")))
+
+
+def test_tool_sender_upsert_skips_cron_event():
+    class _CronMessageObj:
+        session_id = "799462158"
+        message_id = "cron-msg"
+        timestamp = 123
+        message = []
+
+    class _CronEvent:
+        unified_msg_origin = "aiocqhttp:GroupMessage:799462158"
+        message_obj = _CronMessageObj()
+        message_str = "定时任务结果"
+
+        def get_platform_name(self):
+            return "cron"
+
+        def get_sender_id(self):
+            return "799462158"
+
+        def get_sender_name(self):
+            return "Scheduler"
+
+        def get_group_id(self):
+            return ""
+
+    class _ProfileService:
+        async def upsert_registry_from_event(self, **_kwargs):
+            raise AssertionError("cron tool call should not upsert current sender")
+
+    plugin = SimpleNamespace(profile_service=_ProfileService())
+    tool = MemorixIngestTextTool(plugin=plugin)
+
+    asyncio.run(tool._upsert_current_sender(_CronEvent(), "aiocqhttp:group:799462158", respect_filter=False))
+
+
 def test_episode_and_aggregate_queries_respect_chat_filter():
     service = QueryService(_RejectingChatCtx())
 
@@ -727,3 +862,34 @@ def test_passive_event_ingest_skips_filtered_chat():
     assert result is False
     assert plugin.profile_service.called is False
     assert plugin.ingest_service.called is False
+
+
+def test_spawn_background_task_holds_and_releases():
+    """后台任务被持有引用防 GC，完成后自动从集合移除（Sourcery #2）。"""
+    plugin = MemorixPlugin(DummyContext(), {"scope": {"mode": "group_global"}})
+
+    async def _main():
+        async def _work():
+            await asyncio.sleep(0.01)
+
+        task = plugin._spawn_background_task(_work())
+        assert task in plugin._background_tasks
+        await asyncio.wait_for(task, timeout=1.0)
+        assert task not in plugin._background_tasks
+
+    asyncio.run(_main())
+
+
+def test_command_prefixes_cache_invalidates_on_config_change():
+    """ingest.command_prefixes 热更新后缓存指纹失效，重算（Sourcery #1）。"""
+    plugin = MemorixPlugin(DummyContext(), {"scope": {"mode": "group_global"}})
+    plugin.config = {"ingest": {"command_prefixes": ["/"]}}
+    first = plugin._command_prefixes()
+    assert first == ["/"]
+    # 配置未变 → 命中缓存
+    assert plugin._command_prefixes() is first
+    # 热更新配置 → 指纹失效，重算
+    plugin.config = {"ingest": {"command_prefixes": ["/", "！"]}}
+    second = plugin._command_prefixes()
+    assert second == ["/", "！"]
+    assert second is not first

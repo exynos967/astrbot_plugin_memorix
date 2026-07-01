@@ -1,15 +1,23 @@
+from typing import Any, Dict, List
+
 import re
-from typing import List, Dict, Any
+
 from .base import BaseStrategy, ProcessedChunk, KnowledgeType, SourceInfo, ChunkContext
 
 class FactualStrategy(BaseStrategy):
+    DEFAULT_TARGET_SIZE = 1200
+
+    def __init__(self, filename: str, target_size: int = DEFAULT_TARGET_SIZE):
+        super().__init__(filename)
+        self.target_size = max(200, int(target_size or self.DEFAULT_TARGET_SIZE))
+
     def split(self, text: str) -> List[ProcessedChunk]:
         # 结构感知切分
         lines = text.split('\n')
         chunks = []
         current_chunk_lines = []
         current_len = 0
-        target_size = 600
+        target_size = self.target_size
         
         for i, line in enumerate(lines):
             # 判断是否应当切分

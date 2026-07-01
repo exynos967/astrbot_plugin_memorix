@@ -10,7 +10,7 @@ import hashlib
 import shutil
 import time
 from pathlib import Path
-from typing import Optional, Union, Tuple, List, Dict, Set, Any
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 import random
 import threading  # Added threading import
 
@@ -76,24 +76,25 @@ class VectorStore:
                 "vNext 仅支持 index_type=sq8。"
                 " 请更新配置并执行 scripts/release_vnext_migrate.py migrate。"
             )
-        self.quantization_type = QuantizationType.INT8 
-        self.index_type = "sq8" 
+        self.quantization_type = QuantizationType.INT8
+        self.index_type = "sq8"
         self.buffer_size = buffer_size
+        self.min_train_threshold = self.DEFAULT_MIN_TRAIN
 
         self._index: Optional[faiss.IndexIDMap2] = None
         self._init_index()
 
         self._is_trained = False
         self._vector_norm = "l2"
-        
+
         # Fallback Index (Flat) - 用于在 SQ8 训练完成前提供检索能力
         # 必须使用 IndexIDMap2 以保证 ID 与主索引一致
         self._fallback_index: Optional[faiss.IndexIDMap2] = None
         self._init_fallback_index()
-        
+
         self._known_hashes: Set[str] = set()
         self._deleted_ids: Set[int] = set()
-        
+
         self._reservoir_buffer: List[np.ndarray] = []
         self._seen_count_for_reservoir = 0
 
@@ -102,18 +103,18 @@ class VectorStore:
 
         self._total_added = 0
         self._total_deleted = 0
-        self._bin_count = 0 
-        
+        self._bin_count = 0
+
         # Thread safety lock
         self._lock = threading.RLock()
 
-        logger.info(f"VectorStore Init: dim={dimension}, SQ8 Mode, Append-Only Storage")
+        logger.info(f"向量存储初始化: dim={dimension}, mode=SQ8")
 
     def _init_index(self):
         """初始化空的 Faiss 索引"""
         quantizer = faiss.IndexScalarQuantizer(
-            self.dimension, 
-            faiss.ScalarQuantizer.QT_8bit, 
+            self.dimension,
+            faiss.ScalarQuantizer.QT_8bit,
             faiss.METRIC_INNER_PRODUCT
         )
         self._index = faiss.IndexIDMap2(quantizer)
@@ -135,7 +136,7 @@ class VectorStore:
     @property
     def _bin_path(self) -> Path:
         return self.data_dir / "vectors.bin"
-    
+
     @property
     def _ids_bin_path(self) -> Path:
         return self.data_dir / "vectors_ids.bin"
@@ -160,14 +161,14 @@ class VectorStore:
 
             processed_vecs = []
             processed_int_ids = []
-            
+
             for i, str_id in enumerate(ids):
                 if str_id in self._known_hashes:
                     continue
-                
+
                 int_id = self._generate_id(str_id)
                 self._known_hashes.add(str_id)
-                
+
                 processed_vecs.append(vectors[i])
                 processed_int_ids.append(int_id)
 
@@ -186,7 +187,7 @@ class VectorStore:
             if not self._is_trained:
                 # 双写到回退索引
                 self._fallback_index.add_with_ids(batch_vecs, batch_ids)
-                
+
                 self._update_reservoir(batch_vecs)
                 # 这里的 TRAIN_SIZE 取默认 10k，或者根据当前数据量动态判断
                 if len(self._reservoir_buffer) >= 10000:
@@ -195,7 +196,7 @@ class VectorStore:
 
             self._total_added += len(batch_ids)
             return len(batch_ids)
-    
+
     def _flush_write_buffer(self):
         with self._lock:
             self._flush_write_buffer_unlocked()
@@ -208,14 +209,14 @@ class VectorStore:
         batch_ids = np.array(self._write_buffer_ids, dtype=np.int64)
 
         vecs_fp16 = batch_vecs.astype(np.float16)
-        
+
         with open(self._bin_path, "ab") as f:
             f.write(vecs_fp16.tobytes())
-        
+
         ids_bytes = batch_ids.astype('>i8').tobytes()
         with open(self._ids_bin_path, "ab") as f:
             f.write(ids_bytes)
-            
+
         self._bin_count += len(batch_ids)
 
         if self._is_trained and self._index.is_trained:
@@ -249,7 +250,7 @@ class VectorStore:
 
         train_data = np.array(self._reservoir_buffer, dtype=np.float32)
         logger.info(f"Training Index with {len(train_data)} samples...")
-        
+
         try:
             self._index.train(train_data)
         except Exception as e:
@@ -278,27 +279,27 @@ class VectorStore:
 
         vec_item_size = self.dimension * 2
         id_item_size = 8
-        chunk_size = 10000 
-        
+        chunk_size = 10000
+
         with open(self._bin_path, "rb") as f_vec, open(self._ids_bin_path, "rb") as f_id:
             while True:
                 vec_data = f_vec.read(chunk_size * vec_item_size)
                 id_data = f_id.read(chunk_size * id_item_size)
-                
+
                 if not vec_data:
                     break
-                
+
                 batch_fp16 = np.frombuffer(vec_data, dtype=np.float16).reshape(-1, self.dimension)
                 batch_fp32 = batch_fp16.astype(np.float32)
                 faiss.normalize_L2(batch_fp32)
-                
+
                 batch_ids = np.frombuffer(id_data, dtype='>i8').astype(np.int64)
-                
+
                 valid_mask = [id_ not in self._deleted_ids for id_ in batch_ids]
                 if not all(valid_mask):
                     batch_fp32 = batch_fp32[valid_mask]
                     batch_ids = batch_ids[valid_mask]
-                
+
                 if len(batch_ids) > 0:
                     self._index.add_with_ids(batch_fp32, batch_ids)
 
@@ -343,17 +344,17 @@ class VectorStore:
                 return [], []
             # 执行检索
             dists, ids = search_index.search(query_local, k * 2)
-        
+
         # Faiss search 返回的是 (1, K) 的数组，取第一行
         dists = dists[0]
         ids = ids[0]
-        
+
         results = []
         for id_val, score in zip(ids, dists):
             if id_val == -1: continue
             if filter_deleted and id_val in self._deleted_ids:
                 continue
-            
+
             str_id = self._int_to_str_map.get(id_val)
             if str_id:
                 results.append((str_id, float(score)))
@@ -361,11 +362,136 @@ class VectorStore:
         # Sort and trim just in case filtering reduced count
         results.sort(key=lambda x: x[1], reverse=True)
         results = results[:k]
-        
+
         if not results:
             return [], []
-            
+
         return [r[0] for r in results], [r[1] for r in results]
+
+    def get_vectors(self, ids: Sequence[str]) -> Dict[str, np.ndarray]:
+        """按字符串 ID 读取已持久化向量，用于无 embedding 的池间迁移。"""
+        return {
+            key: vector
+            for batch in self.iter_vectors_by_ids(ids)
+            for key, vector in batch.items()
+        }
+
+    def iter_vectors_by_ids(
+        self,
+        ids: Sequence[str],
+        *,
+        batch_size: int = 1024,
+    ) -> Iterator[Dict[str, np.ndarray]]:
+        """按字符串 ID 分批读取持久化向量，避免迁移时把全部向量集中留在内存。"""
+        requested_ids = [
+            str(item or "").strip()
+            for item in ids
+            if str(item or "").strip()
+        ]
+        if not requested_ids:
+            return
+
+        safe_batch_size = max(1, int(batch_size or 1024))
+        unique_ids = list(dict.fromkeys(requested_ids))
+        with self._lock:
+            self._flush_write_buffer_unlocked()
+            known_hashes = set(self._known_hashes)
+            deleted_ids = set(self._deleted_ids)
+            bin_path = self._bin_path
+            ids_bin_path = self._ids_bin_path
+            dimension = int(self.dimension)
+
+        int_to_str: Dict[int, str] = {}
+        for str_id in unique_ids:
+            if str_id not in known_hashes:
+                continue
+            int_id = self._generate_id(str_id)
+            if int_id in deleted_ids:
+                continue
+            int_to_str[int_id] = str_id
+
+        if not int_to_str or not bin_path.exists() or not ids_bin_path.exists():
+            return
+
+        result: Dict[str, np.ndarray] = {}
+        vec_item_size = dimension * 2
+        id_item_size = 8
+        chunk_size = 10000
+
+        with open(bin_path, "rb") as f_vec, open(ids_bin_path, "rb") as f_id:
+            while True:
+                vec_data = f_vec.read(chunk_size * vec_item_size)
+                id_data = f_id.read(chunk_size * id_item_size)
+                if not vec_data:
+                    break
+
+                batch_fp16 = np.frombuffer(vec_data, dtype=np.float16).reshape(-1, dimension)
+                batch_fp32 = batch_fp16.astype(np.float32)
+                faiss.normalize_L2(batch_fp32)
+                batch_ids = np.frombuffer(id_data, dtype=">i8").astype(np.int64)
+
+                for index, int_id in enumerate(batch_ids):
+                    int_key = int(int_id)
+                    key = int_to_str.pop(int_key, None)
+                    if key is None or int_key in deleted_ids:
+                        continue
+                    result[key] = np.array(batch_fp32[index], dtype=np.float32, copy=True)
+                    if len(result) >= safe_batch_size:
+                        yield result
+                        result = {}
+                    if not int_to_str:
+                        break
+                if not int_to_str:
+                    break
+
+        if result:
+            yield result
+
+    def _get_vectors_chunk(self, requested_ids: Sequence[str]) -> Dict[str, np.ndarray]:
+        """读取一批向量，调用方负责控制 batch 大小。"""
+        if not requested_ids:
+            return {}
+
+        with self._lock:
+            self._flush_write_buffer_unlocked()
+            int_to_str: Dict[int, str] = {}
+            for str_id in requested_ids:
+                if str_id not in self._known_hashes:
+                    continue
+                int_id = self._generate_id(str_id)
+                if int_id in self._deleted_ids:
+                    continue
+                int_to_str[int_id] = str_id
+
+            if not int_to_str or not self._bin_path.exists() or not self._ids_bin_path.exists():
+                return {}
+
+            result: Dict[str, np.ndarray] = {}
+            vec_item_size = self.dimension * 2
+            id_item_size = 8
+            chunk_size = 10000
+
+            with open(self._bin_path, "rb") as f_vec, open(self._ids_bin_path, "rb") as f_id:
+                while True:
+                    vec_data = f_vec.read(chunk_size * vec_item_size)
+                    id_data = f_id.read(chunk_size * id_item_size)
+                    if not vec_data:
+                        break
+
+                    batch_fp16 = np.frombuffer(vec_data, dtype=np.float16).reshape(-1, self.dimension)
+                    batch_fp32 = batch_fp16.astype(np.float32)
+                    faiss.normalize_L2(batch_fp32)
+                    batch_ids = np.frombuffer(id_data, dtype=">i8").astype(np.int64)
+
+                    for index, int_id in enumerate(batch_ids):
+                        key = int_to_str.get(int(int_id))
+                        if key is None or key in result or int_id in self._deleted_ids:
+                            continue
+                        result[key] = np.array(batch_fp32[index], dtype=np.float32, copy=True)
+                        if len(result) >= len(int_to_str):
+                            return result
+
+            return result
 
     def warmup_index(self, force_train: bool = True) -> Dict[str, Any]:
         """
@@ -378,7 +504,7 @@ class VectorStore:
             预热状态摘要
         """
         started = time.perf_counter()
-        logger.info(f"metric.vector_index_prewarm_started=1 force_train={bool(force_train)}")
+        logger.debug(f"metric.vector_index_prewarm_started=1 force_train={bool(force_train)}")
 
         try:
             with self._lock:
@@ -434,7 +560,7 @@ class VectorStore:
             )
             return summary
 
-        logger.info(
+        logger.debug(
             "metric.vector_index_prewarm_success=1 "
             f"metric.vector_index_prewarm_duration_ms={summary['duration_ms']:.2f} "
             f"trained={summary['trained']} "
@@ -456,23 +582,23 @@ class VectorStore:
         logger.info("Replaying all disk vectors to fallback index...")
         vec_item_size = self.dimension * 2
         id_item_size = 8
-        chunk_size = 10000 
-        
+        chunk_size = 10000
+
         with open(self._bin_path, "rb") as f_vec, open(self._ids_bin_path, "rb") as f_id:
             while True:
                 vec_data = f_vec.read(chunk_size * vec_item_size)
                 id_data = f_id.read(chunk_size * id_item_size)
                 if not vec_data: break
-                
+
                 batch_fp16 = np.frombuffer(vec_data, dtype=np.float16).reshape(-1, self.dimension)
                 batch_fp32 = batch_fp16.astype(np.float32)
                 faiss.normalize_L2(batch_fp32)
                 batch_ids = np.frombuffer(id_data, dtype='>i8').astype(np.int64)
-                
+
                 valid_mask = [id_ not in self._deleted_ids for id_ in batch_ids]
                 if any(valid_mask):
                     self._fallback_index.add_with_ids(batch_fp32[valid_mask], batch_ids[valid_mask])
-        
+
         logger.info(f"Fallback index self-bootstrapped with {self._fallback_index.ntotal} items.")
 
     def _force_train_small_data(self):
@@ -481,11 +607,11 @@ class VectorStore:
 
     def _force_train_small_data_unlocked(self):
         logger.info("Forcing training on small dataset...")
-        self._reservoir_buffer = [] 
-        
+        self._reservoir_buffer = []
+
         chunk_size = 10000
         vec_item_size = self.dimension * 2
-        
+
         with open(self._bin_path, "rb") as f:
             while len(self._reservoir_buffer) < self.TRAIN_SIZE:
                 data = f.read(chunk_size * vec_item_size)
@@ -493,12 +619,12 @@ class VectorStore:
                 fp16 = np.frombuffer(data, dtype=np.float16).reshape(-1, self.dimension)
                 fp32 = fp16.astype(np.float32)
                 faiss.normalize_L2(fp32)
-                
+
                 for vec in fp32:
                     self._reservoir_buffer.append(vec)
                     if len(self._reservoir_buffer) >= self.TRAIN_SIZE:
                         break
-        
+
         self._train_and_replay_unlocked()
 
     def delete(self, ids: List[str]) -> int:
@@ -517,7 +643,7 @@ class VectorStore:
                          self._fallback_index.remove_ids(np.array([int_id], dtype=np.int64))
                     count += 1
             self._total_deleted += count
-            
+
             # Check GC
             self._check_rebuild_needed()
             return count
@@ -538,16 +664,16 @@ class VectorStore:
     def _rebuild_index_locked(self):
         """实际 GC 重建逻辑。"""
         logger.info("Starting Compaction (GC)...")
-        
+
         tmp_bin = self.data_dir / "vectors.bin.tmp"
         tmp_ids = self.data_dir / "vectors_ids.bin.tmp"
-        
+
         vec_item_size = self.dimension * 2
         id_item_size = 8
         chunk_size = 10000
-        
+
         new_count = 0
-        
+
         # 1. Compact Files
         with open(self._bin_path, "rb") as f_vec, open(self._ids_bin_path, "rb") as f_id, \
              open(tmp_bin, "wb") as w_vec, open(tmp_ids, "wb") as w_id:
@@ -555,44 +681,49 @@ class VectorStore:
                 vec_data = f_vec.read(chunk_size * vec_item_size)
                 id_data = f_id.read(chunk_size * id_item_size)
                 if not vec_data: break
-                
+
                 batch_fp16 = np.frombuffer(vec_data, dtype=np.float16).reshape(-1, self.dimension)
                 batch_ids = np.frombuffer(id_data, dtype='>i8').astype(np.int64)
-                
+
                 keep_mask = [id_ not in self._deleted_ids for id_ in batch_ids]
-                
+
                 if any(keep_mask):
                     keep_vecs = batch_fp16[keep_mask]
                     keep_ids = batch_ids[keep_mask]
-                    
+
                     w_vec.write(keep_vecs.tobytes())
                     w_id.write(keep_ids.astype('>i8').tobytes())
                     new_count += len(keep_ids)
 
         # 2. Reset State & Atomic Swap
         self._bin_count = new_count
-        
+
         # Close current index
         self._index.reset()
         if self._fallback_index: self._fallback_index.reset() # Also clear fallback
         self._is_trained = False
-        
+
         # Swap files
         shutil.move(str(tmp_bin), str(self._bin_path))
         shutil.move(str(tmp_ids), str(self._ids_bin_path))
-        
+
         # Reset Tombstones (Critical)
         self._deleted_ids.clear()
-        
+
         # 3. Reload/Rebuild Index (Fresh Train)
         # We need to re-train because data distribution might have changed significantly after deletion
         self._init_index()
         self._init_fallback_index() # Re-init fallback too
         self._force_train_small_data() # This will train and replay from the NEW compact file
-        
+
         logger.info("Compaction Complete.")
 
-    def save(self, data_dir: Optional[Union[str, Path]] = None) -> None:
+    def save(
+        self,
+        data_dir: Optional[Union[str, Path]] = None,
+        *,
+        embedding_fingerprint: Optional[Dict[str, Any]] = None,
+    ) -> None:
         with self._lock:
             if not data_dir:
                 data_dir = self.data_dir
@@ -603,6 +734,20 @@ class VectorStore:
             data_dir.mkdir(parents=True, exist_ok=True)
 
             self._flush_write_buffer_unlocked()
+
+            previous_embedding_fingerprint: Optional[Dict[str, Any]] = None
+            meta_path = data_dir / "vectors_metadata.pkl"
+            if embedding_fingerprint is None and meta_path.exists():
+                try:
+                    with open(meta_path, "rb") as f:
+                        previous_meta = pickle.load(f)
+                except Exception as exc:
+                    logger.warning(f"读取旧向量元数据失败，跳过 embedding 指纹继承: {exc}")
+                else:
+                    if isinstance(previous_meta, dict):
+                        previous_raw = previous_meta.get("embedding_fingerprint")
+                        if isinstance(previous_raw, dict) and previous_raw:
+                            previous_embedding_fingerprint = dict(previous_raw)
 
             if self._is_trained:
                 index_path = data_dir / "vectors.index"
@@ -617,11 +762,15 @@ class VectorStore:
                 "deleted_ids": list(self._deleted_ids),
                 "known_hashes": list(self._known_hashes),
             }
-            
-            with atomic_write(data_dir / "vectors_metadata.pkl", "wb") as f:
+            if isinstance(embedding_fingerprint, dict) and embedding_fingerprint:
+                meta["embedding_fingerprint"] = dict(embedding_fingerprint)
+            elif previous_embedding_fingerprint is not None:
+                meta["embedding_fingerprint"] = previous_embedding_fingerprint
+
+            with atomic_write(meta_path, "wb") as f:
                 pickle.dump(meta, f)
-                
-            logger.info("VectorStore saved.")
+
+            logger.debug("VectorStore saved.")
 
     def migrate_legacy_npy(self, data_dir: Optional[Union[str, Path]] = None) -> Dict[str, Any]:
         """
@@ -663,11 +812,11 @@ class VectorStore:
         with self._lock:
             if not data_dir: data_dir = self.data_dir
             data_dir = Path(data_dir)
-            
+
             npy_path = data_dir / "vectors.npy"
             idx_path = data_dir / "vectors.index"
             bin_path = data_dir / "vectors.bin"
-            
+
             if npy_path.exists() and not bin_path.exists():
                 raise RuntimeError(
                     "检测到 legacy vectors.npy，vNext 不再支持运行时自动迁移。"
@@ -678,10 +827,10 @@ class VectorStore:
             if not meta_path.exists():
                 logger.warning("No metadata found, initialized empty.")
                 return
-                
+
             with open(meta_path, "rb") as f:
                 meta = pickle.load(f)
-                
+
             if meta.get("vector_norm") != "l2":
                 logger.warning("Index IDMap2 version mismatch (L2 Norm), forcing rebuild...")
                 self._known_hashes = set(meta.get("ids", [])) | set(meta.get("known_hashes", []))
@@ -694,7 +843,7 @@ class VectorStore:
             self._vector_norm = meta.get("vector_norm", "l2")
             self._deleted_ids = set(meta.get("deleted_ids", []))
             self._known_hashes = set(meta.get("known_hashes", []))
-            
+
             if self._is_trained:
                 if idx_path.exists():
                     try:
@@ -711,7 +860,7 @@ class VectorStore:
                     logger.warning("Index file missing despite metadata indicating trained. Rebuilding from bin...")
                     self._init_index()
                     self._force_train_small_data()
-            
+
             if bin_path.exists():
                 self._bin_count = bin_path.stat().st_size // (self.dimension * 2)
 
@@ -724,33 +873,33 @@ class VectorStore:
             arr = np.load(npy_path, mmap_mode="r")
         except Exception:
             arr = np.load(npy_path)
-            
+
         meta_path = data_dir / "vectors_metadata.pkl"
         old_ids = []
         if meta_path.exists():
             with open(meta_path, "rb") as f:
                 m = pickle.load(f)
                 old_ids = m.get("ids", [])
-                
+
         if len(arr) != len(old_ids):
             logger.error(f"Migration mismatch: arr {len(arr)} != ids {len(old_ids)}")
             return
 
         logger.info(f"Migrating {len(arr)} vectors...")
-        
+
         chunk = 1000
         for i in range(0, len(arr), chunk):
             sub_arr = arr[i : i+chunk]
             sub_ids = old_ids[i : i+chunk]
             self.add(sub_arr, sub_ids)
-            
+
         if not self._is_trained:
             self._force_train_small_data()
 
         shutil.move(str(npy_path), str(npy_path) + ".bak")
         if idx_path.exists():
             shutil.move(str(idx_path), str(idx_path) + ".bak")
-            
+
         logger.info("Migration complete.")
 
     def clear(self) -> None:
@@ -773,4 +922,3 @@ class VectorStore:
     def __contains__(self, hash_value: str) -> bool:
         """Check if a hash exists in the store"""
         return hash_value in self._known_hashes and self._generate_id(hash_value) not in self._deleted_ids
-

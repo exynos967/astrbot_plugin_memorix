@@ -384,10 +384,10 @@ class EpisodeService:
                 raise ValueError("llm_empty_episodes")
         except Exception as e:
             logger.warning(
-                "Episode segmentation fallback: source=%s size=%s err=%s",
-                source,
-                len(group_hashes),
-                e,
+                "Episode segmentation fallback: "
+                f"source={source} "
+                f"size={len(group_hashes)} "
+                f"err={e}"
             )
             episodes = [self._build_fallback_episode(group)]
             fallback_used = True
@@ -528,7 +528,13 @@ class EpisodeService:
                 "paragraph_count": 0,
             }
 
-        paragraphs = self.metadata_store.get_live_paragraphs_by_source(token)
+        hard_filter_enabled = bool(
+            self._cfg("integration.feedback_correction_paragraph_hard_filter_enabled", True)
+        )
+        paragraphs = self.metadata_store.get_live_paragraphs_by_source(
+            token,
+            exclude_stale=hard_filter_enabled,
+        )
         if not paragraphs:
             replace_result = self.metadata_store.replace_episodes_for_source(token, [])
             return {

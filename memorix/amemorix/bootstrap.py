@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import pickle
 from pathlib import Path
 from typing import Any, Dict
@@ -25,10 +26,8 @@ from ..core.utils.episode_service import EpisodeService
 from ..core.utils.paragraph_vector_service import ParagraphVectorWriteService
 from ..core.utils.person_profile_service import PersonProfileService
 from ..core.utils.relation_write_service import RelationWriteService
-
 from .common.logging import get_logger
 from .context import AppContext
-from .llm_client import LLMClient
 from .settings import AppSettings, resolve_openapi_endpoint_config
 
 logger = get_logger("A_Memorix.Bootstrap")
@@ -46,6 +45,31 @@ def _safe_float(value: Any, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _dual_vector_ready(data_dir: Path, *, expected_dimension: int) -> bool:
+    """检测双池 ready manifest 是否就绪，并校验段落/图谱子池目录存在。"""
+    manifest_path = data_dir / "vectors" / "dual_ready.json"
+    if not manifest_path.exists():
+        return False
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("读取双池 ready manifest 失败: %s", exc)
+        return False
+    if not isinstance(payload, dict) or payload.get("status") != "ready":
+        return False
+    manifest_dimension = int(payload.get("dimension", 0) or 0)
+    if manifest_dimension not in {0, int(expected_dimension)}:
+        logger.warning(
+            "双池 ready manifest 维度不匹配: expected=%s, manifest=%s",
+            expected_dimension,
+            manifest_dimension,
+        )
+        return False
+    return (data_dir / "vectors" / "paragraph").exists() and (
+        data_dir / "vectors" / "graph"
+    ).exists()
 
 
 def _resolve_vector_dimension(settings: AppSettings, vectors_dir: Path) -> int:
@@ -89,14 +113,13 @@ def build_context(settings: AppSettings) -> AppContext:
     metadata_dir.mkdir(parents=True, exist_ok=True)
 
     endpoint_cfg = resolve_openapi_endpoint_config(settings.config, section="embedding")
-    retry_cfg = settings.get("embedding.retry", {}) or {}
     configured_dim = _resolve_vector_dimension(settings, vectors_dir)
     adapter = create_embedding_api_adapter(
         batch_size=_safe_int(settings.get("embedding.batch_size", 32), 32),
         max_concurrent=_safe_int(settings.get("embedding.max_concurrent", 5), 5),
         default_dimension=configured_dim,
-        model_name=str(settings.get("embedding.model_name", "auto")),
-        retry_config=retry_cfg,
+        model_name="auto",
+        retry_config=settings.get("embedding.retry", {}) or {},
         base_url=str(endpoint_cfg.get("base_url", "")),
         api_key=str(endpoint_cfg.get("api_key", "")),
         openai_model=str(endpoint_cfg.get("model", "")),
@@ -107,8 +130,11 @@ def build_context(settings: AppSettings) -> AppContext:
     metadata_path = vectors_dir / "vectors_metadata.pkl"
     vector_dim = configured_dim
     embedding_enabled = bool(settings.get("embedding.enabled", False))
-    auto_detect = embedding_enabled and bool(settings.get("embedding.auto_detect_dimension", True))
-    if auto_detect and not metadata_path.exists():
+    # 维度自动探测恒定开启（embedding 启用时）：fresh store 探测真实维度对齐向量存储，
+    # 避免用户配置维度与模型实际输出不符导致索引错乱。原 embedding.auto_detect_dimension
+    # 开关从未在 schema 暴露、默认即 True，固化为恒定行为（dimensions 兼容性探测另由
+    # adapter.encode 入口独立保证，不依赖此开关）。
+    if embedding_enabled and not metadata_path.exists():
         probed_dim = _probe_embedding_dimension(adapter, configured_dim)
         if probed_dim != configured_dim:
             logger.info(
@@ -135,17 +161,42 @@ def build_context(settings: AppSettings) -> AppContext:
         quantization_type=quantization_type,
         data_dir=vectors_dir,
     )
-    vector_store.min_train_threshold = _safe_int(settings.get("embedding.min_train_threshold", 40), 40)
 
-    matrix_format_map = {
-        "csr": SparseMatrixFormat.CSR,
-        "csc": SparseMatrixFormat.CSC,
-    }
-    matrix_format = matrix_format_map.get(
-        str(settings.get("graph.sparse_matrix_format", "csr")).strip().lower(),
-        SparseMatrixFormat.CSR,
+    # 双池子存储：始终构造（即使最终降级为 single，对象存在以备升级与回滚安全）。
+    paragraph_vectors_dir = vectors_dir / "paragraph"
+    graph_vectors_dir = vectors_dir / "graph"
+    paragraph_vectors_dir.mkdir(parents=True, exist_ok=True)
+    graph_vectors_dir.mkdir(parents=True, exist_ok=True)
+    paragraph_vector_store = VectorStore(
+        dimension=vector_dim,
+        quantization_type=quantization_type,
+        data_dir=paragraph_vectors_dir,
     )
-    graph_store = GraphStore(matrix_format=matrix_format, data_dir=graph_dir)
+    graph_vector_store = VectorStore(
+        dimension=vector_dim,
+        quantization_type=quantization_type,
+        data_dir=graph_vectors_dir,
+    )
+
+    # 读取双池模式：默认 dual；ready manifest 缺失时降级为 single。
+    vector_pools_cfg = settings.get("retrieval.vector_pools", {}) or {}
+    vector_pool_mode = (
+        str(vector_pools_cfg.get("mode", "dual") if isinstance(vector_pools_cfg, dict) else "dual")
+        .strip()
+        .lower()
+    )
+    dual_vector_pools_ready = False
+    if vector_pool_mode == "dual":
+        if _dual_vector_ready(data_dir, expected_dimension=vector_dim):
+            dual_vector_pools_ready = True
+        else:
+            logger.warning(
+                "双池配置已开启，但 ready manifest 不可用，当前按单池检索与写入运行"
+            )
+
+    # 稀疏矩阵格式固定 CSR：CSR 是图遍历（出边邻居）的标准最优格式，CSC 几乎无场景需求。
+    # 原 graph.sparse_matrix_format 从未在 schema 暴露、默认即 csr，固化为常量。
+    graph_store = GraphStore(matrix_format=SparseMatrixFormat.CSR, data_dir=graph_dir)
     metadata_store = MetadataStore(data_dir=metadata_dir)
     metadata_store.connect()
 
@@ -230,23 +281,10 @@ def build_context(settings: AppSettings) -> AppContext:
             min_threshold=_safe_float(settings.get("threshold.min_threshold", 0.3), 0.3),
             max_threshold=_safe_float(settings.get("threshold.max_threshold", 0.95), 0.95),
             percentile=_safe_float(settings.get("threshold.percentile", 75.0), 75.0),
-            std_multiplier=_safe_float(settings.get("threshold.std_multiplier", 1.5), 1.5),
+            std_multiplier=1.5,  # 上游亦未暴露；自适应阈值的 std 倍率，1.5 为经验最优值，固化为常量
             min_results=_safe_int(settings.get("threshold.min_results", 3), 3),
             enable_auto_adjust=bool(settings.get("threshold.enable_auto_adjust", True)),
         )
-    )
-
-    llm_endpoint_cfg = resolve_openapi_endpoint_config(settings.config, section="embedding")
-    chat_model = str(
-        llm_endpoint_cfg.get("chat_model", "")
-        or "gpt-4o-mini"
-    )
-    llm_client = LLMClient(
-        base_url=str(llm_endpoint_cfg.get("base_url", "")),
-        api_key=str(llm_endpoint_cfg.get("api_key", "")),
-        model=chat_model,
-        timeout_seconds=_safe_float(llm_endpoint_cfg.get("timeout_seconds", 60), 60.0),
-        max_retries=_safe_int(llm_endpoint_cfg.get("max_retries", 3), 3),
     )
 
     relation_write_service = RelationWriteService(
@@ -264,7 +302,7 @@ def build_context(settings: AppSettings) -> AppContext:
     service_config: Dict[str, Any] = dict(settings.config)
     service_config.update(
         {
-            "llm_client": llm_client,
+            "llm_client": None,
             "paragraph_vector_service": paragraph_vector_service,
             "relation_write_service": relation_write_service,
         }
@@ -289,7 +327,7 @@ def build_context(settings: AppSettings) -> AppContext:
         retriever=retriever,
     )
 
-    return AppContext(
+    ctx = AppContext(
         settings=settings,
         vector_store=vector_store,
         graph_store=graph_store,
@@ -303,7 +341,15 @@ def build_context(settings: AppSettings) -> AppContext:
         relation_write_service=relation_write_service,
         episode_service=episode_service,
         episode_retrieval_service=episode_retrieval_service,
-        llm_client=llm_client,
+        llm_client=None,
         data_dir=data_dir,
         config=settings.config,
+        paragraph_vector_store=paragraph_vector_store,
+        graph_vector_store=graph_vector_store,
+        _dual_vector_pools_ready=dual_vector_pools_ready,
     )
+    # 本土化回填：segmentation_service 构造时 ctx 尚未成型，此处补齐引用，
+    # 使 segment() 经 generate_text -> resolve_llm_client 走到 provider_bridge；
+    # provider_bridge 由上层运行时注入到同一个 ctx，时机在回填之后亦无妨。
+    ctx.episode_service.segmentation_service._ctx = ctx
+    return ctx

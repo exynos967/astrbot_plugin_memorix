@@ -1,9 +1,15 @@
 .ruff_cache/
 .pytest_cache/
-tests/
 # Python cache files
 __pycache__/
 *.py[cod]
 
 # uv local lock file
 uv.lock
+
+# 前端：node_modules 不入库（用户/CI 通过 npm install 还原），dist 也不入库
+frontend/node_modules/
+frontend/dist/
+
+# codegraph 索引（按需生成，不入库）
+.codegraph/

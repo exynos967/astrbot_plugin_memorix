@@ -163,6 +163,10 @@ class MemorixToolBase(FunctionTool[AstrAgentContext]):
     def _adapted(self, event: AstrMessageEvent, scope_key: str):
         return AstrbotEventAdapter.from_event(event, scope_key)
 
+    @staticmethod
+    def _is_cron_event(event: AstrMessageEvent) -> bool:
+        return str(getattr(event, "get_platform_name", lambda: "")() or "").strip() == "cron"
+
     def _source_for_event(self, event: AstrMessageEvent, scope_key: str) -> str:
         adapted = self._adapted(event, scope_key)
         return f"chat:{adapted.platform}:{adapted.session_id}"
@@ -204,6 +208,8 @@ class MemorixToolBase(FunctionTool[AstrAgentContext]):
         *,
         respect_filter: bool = True,
     ) -> None:
+        if self._is_cron_event(event):
+            return
         adapted = self._adapted(event, scope_key)
         if not adapted.sender_id:
             return
@@ -338,10 +344,54 @@ class MemorixSearchTool(MemorixToolBase):
                 )
             data["scope"] = scope_key
             data["chat_id"] = chat_id
+            await self._maybe_enqueue_feedback(
+                data,
+                query=query,
+                scope_key=scope_key,
+                chat_id=chat_id,
+                group_id=group_id,
+                user_id=user_id,
+            )
             return _format_search_result_for_llm(data, limit=limit)
         except Exception as exc:
             logger.warning("[memorix] search_memory tool failed: %s", exc, exc_info=True)
             return _tool_result({"success": False, "error": str(exc), "scope": scope_key})
+
+    async def _maybe_enqueue_feedback(
+        self,
+        data: dict,
+        *,
+        query: str,
+        scope_key: str,
+        chat_id: str,
+        group_id: str,
+        user_id: str,
+    ) -> None:
+        """检索命中后入队反馈纠错任务；失败静默，绝不影响检索结果。"""
+        try:
+            plugin = self.plugin
+            enqueue = getattr(plugin, "enqueue_feedback", None)
+            if not callable(enqueue):
+                return
+            if not await plugin.feedback_service_enabled(scope_key):
+                return
+            hit_hashes = [
+                str(item.get("hash") or item.get("hash_value") or "").strip()
+                for item in _search_hit_items(data)
+            ]
+            hit_hashes = [h for h in hit_hashes if h]
+            if not hit_hashes:
+                return
+            await enqueue(
+                scope_key=scope_key,
+                query=query,
+                chat_id=chat_id,
+                group_id=group_id,
+                user_id=user_id,
+                hit_hashes=hit_hashes,
+            )
+        except Exception:
+            logger.debug("[memorix] feedback enqueue skipped", exc_info=True)
 
 
 @dataclass
@@ -511,7 +561,7 @@ class MemorixPersonProfileTool(MemorixToolBase):
         adapted = self._adapted(event, scope_key)
         person_id = str(kwargs.get("person_id", "") or "").strip()
         keyword = str(kwargs.get("person_keyword", "") or "").strip()
-        if not person_id and not keyword and adapted.sender_id:
+        if not person_id and not keyword and adapted.sender_id and not self._is_cron_event(event):
             person_id = f"{adapted.platform}:{adapted.sender_id}"
             keyword = adapted.sender_name or adapted.sender_id
         limit = _to_int(kwargs.get("limit", 10), 10, min_value=1, max_value=50)
@@ -791,9 +841,20 @@ class MemorixImportAdminTool(MemorixAdminToolBase):
 @dataclass
 class MemorixTuningAdminTool(MemorixAdminToolBase):
     name: str = "memory_tuning_admin"
-    description: str = "长期记忆调优管理接口；仅 AstrBot 管理员可用，当前 AstrBot 运行时仅返回能力状态。"
+    description: str = "长期记忆检索调优管理接口；仅 AstrBot 管理员可用。可读取/应用/回滚检索参数快照，创建调优任务并查看轮次与报告。"
     admin_method: str = "tuning_admin"
-    parameters: dict = Field(default_factory=lambda: _admin_parameters("settings/get_profile/apply_profile/rollback_profile/export_profile/create_task/list_tasks/get_task/get_rounds/cancel/apply_best/get_report"))
+    parameters: dict = Field(default_factory=lambda: _admin_parameters("settings/get_profile/apply/rollback/export_toml/create/list/get/rounds/cancel/apply_best/report"))
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
+        return await self._call_admin(context, **kwargs)
+
+
+@dataclass
+class MemorixFeedbackAdminTool(MemorixAdminToolBase):
+    name: str = "memory_feedback_admin"
+    description: str = "长期记忆反馈纠错管理接口；仅 AstrBot 管理员可用。可列出/查看反馈纠错任务、回滚已应用的纠错、查看操作日志、手动触发 reconcile。"
+    admin_method: str = "feedback_admin"
+    parameters: dict = Field(default_factory=lambda: _admin_parameters("list/get/rollback/logs/reconcile"))
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
         return await self._call_admin(context, **kwargs)
@@ -821,6 +882,41 @@ class MemorixDeleteAdminTool(MemorixAdminToolBase):
         return await self._call_admin(context, **kwargs)
 
 
+@dataclass
+class MemorixFuzzyModifyAdminTool(MemorixAdminToolBase):
+    name: str = "memory_fuzzy_modify_admin"
+    description: str = "记忆模糊修正管理：基于自然语言请求预览/执行/回滚对记忆的模糊修改计划。"
+    admin_method: str = "fuzzy_modify_admin"
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "scope_key": {"type": "string", "description": "作用域 key"},
+                "action": {
+                    "type": "string",
+                    "enum": ["preview", "execute", "get", "list", "rollback", "reconcile"],
+                    "description": "操作类型",
+                },
+                "request_text": {"type": "string", "description": "preview: 用户的自然语言修改请求"},
+                "plan_id": {"type": "string", "description": "execute/get/rollback: 计划 id"},
+                "person_id": {"type": "string"},
+                "person_keyword": {"type": "string"},
+                "chat_id": {"type": "string"},
+                "limit": {"type": "integer"},
+                "confirmed": {"type": "boolean"},
+                "status": {"type": "string"},
+                "requested_by": {"type": "string"},
+                "reason": {"type": "string"},
+            },
+            "required": ["scope_key", "action"],
+            "additionalProperties": True,
+        }
+    )
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
+        return await self._call_admin(context, **kwargs)
+
+
 def build_memorix_tools(plugin: Any) -> list[FunctionTool[AstrAgentContext]]:
     return [
         MemorixSearchTool(plugin=plugin),
@@ -836,6 +932,8 @@ def build_memorix_tools(plugin: Any) -> list[FunctionTool[AstrAgentContext]]:
         MemorixRuntimeAdminTool(plugin=plugin),
         MemorixImportAdminTool(plugin=plugin),
         MemorixTuningAdminTool(plugin=plugin),
+        MemorixFeedbackAdminTool(plugin=plugin),
         MemorixV5AdminTool(plugin=plugin),
         MemorixDeleteAdminTool(plugin=plugin),
+        MemorixFuzzyModifyAdminTool(plugin=plugin),
     ]

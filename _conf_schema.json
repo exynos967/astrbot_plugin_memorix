@@ -66,12 +66,12 @@
       "openapi": {
         "type": "object",
         "description": "Embedding API 配置",
-        "hint": "填写 OpenAI 兼容格式的 Embedding API 信息。",
+        "hint": "填写 OpenAI 兼容格式的 Embedding API 信息；启用远程 Embedding 时不会从环境变量兜底读取。",
         "items": {
           "base_url": {
             "type": "string",
             "description": "API 地址",
-            "hint": "Embedding 服务的api地址，末尾不需要加 /v1，插件会自动补上。",
+            "hint": "启用远程 Embedding 时必填。Embedding 服务的 API 地址，末尾不需要加 /v1，插件会自动补上。",
             "default": ""
           },
           "api_key": {
@@ -83,7 +83,7 @@
           "model": {
             "type": "string",
             "description": "模型名称",
-            "hint": "要使用的 Embedding 模型名，具体名称请查看你的服务商文档。",
+            "hint": "启用远程 Embedding 时必填。要使用的 Embedding 模型名，具体名称请查看你的服务商文档。",
             "default": ""
           },
           "timeout_seconds": {
@@ -116,7 +116,7 @@
       "auto_inject": {
         "type": "object",
         "description": "请求前自动注入",
-        "hint": "在每次 LLM 请求前自动检索当前聊天相关的长期记忆，并像 MaiBot 的内部参考一样附加到当前用户消息的额外内容中，避免破坏稳定 system prompt 缓存。命中为空时不会注入。",
+        "hint": "在每次 LLM 请求前自动检索当前聊天相关的长期记忆，并作为内部参考附加到当前用户消息的额外内容中，避免破坏稳定 system prompt 缓存。命中为空时不会注入。",
         "items": {
           "enabled": {
             "type": "bool",
@@ -149,6 +149,120 @@
         "description": "启用并行搜索",
         "hint": "开启后，向量检索和稀疏检索（BM25）将并行执行，可降低检索延迟。",
         "default": true
+      },
+      "vector_pools": {
+        "type": "object",
+        "description": "双向量池检索",
+        "hint": "single 使用单一向量池，保持旧行为；dual 将段落向量和图谱向量分离，启用前必须先运行 scripts/migrate_vectors_to_dual_pools.py 生成 ready manifest。",
+        "items": {
+          "mode": {
+            "type": "string",
+            "description": "向量池模式",
+            "hint": "默认 dual，与上游 A_memorix 对齐；dual 需要先完成离线迁移，否则启动时会自动降级为 single。",
+            "default": "dual",
+            "options": [
+              "single",
+              "dual"
+            ]
+          },
+          "paragraph_top_k": {
+            "type": "int",
+            "description": "段落池召回上限",
+            "hint": "dual 模式下从段落向量池召回的候选数量。",
+            "default": 20
+          },
+          "graph_top_k": {
+            "type": "int",
+            "description": "图谱池召回上限",
+            "hint": "dual 模式下从关系/实体向量池召回的候选数量。",
+            "default": 40
+          },
+          "graph_expand_paragraph_k": {
+            "type": "int",
+            "description": "图谱扩展段落上限",
+            "hint": "通过图谱命中向外扩展关联段落时最多保留多少候选。",
+            "default": 80
+          },
+          "relation_expand_per_hit": {
+            "type": "int",
+            "description": "每个关系命中扩展数",
+            "hint": "每个关系向量命中最多扩展多少条关联段落。",
+            "default": 5
+          },
+          "entity_expand_per_hit": {
+            "type": "int",
+            "description": "每个实体命中扩展数",
+            "hint": "每个实体向量命中最多扩展多少条关联段落。",
+            "default": 8
+          },
+          "relation_evidence_weight": {
+            "type": "float",
+            "description": "关系证据权重",
+            "hint": "关系向量命中映射为段落证据时的基础权重。",
+            "default": 1.0
+          },
+          "entity_evidence_weight": {
+            "type": "float",
+            "description": "实体证据权重",
+            "hint": "实体向量命中映射为段落证据时的基础权重。",
+            "default": 0.55
+          },
+          "semantic_weight": {
+            "type": "float",
+            "description": "语义权重",
+            "hint": "dual 融合时段落语义召回的权重。",
+            "default": 0.65
+          },
+          "sparse_weight": {
+            "type": "float",
+            "description": "稀疏权重",
+            "hint": "dual 融合时 BM25/稀疏召回的权重。",
+            "default": 0.2
+          },
+          "graph_weight": {
+            "type": "float",
+            "description": "图谱权重",
+            "hint": "dual 融合时图谱向量召回的权重。",
+            "default": 0.15
+          },
+          "relation_intent": {
+            "type": "object",
+            "description": "关系意图权重",
+            "hint": "问题命中关系意图时，dual 模式下使用的图谱候选数与融合权重。",
+            "items": {
+              "graph_top_k": {
+                "type": "int",
+                "description": "关系意图图谱候选数",
+                "hint": "关系意图命中时从图谱向量池召回的候选数量。",
+                "default": 80
+              },
+              "semantic_weight": {
+                "type": "float",
+                "description": "关系意图语义权重",
+                "hint": "关系意图命中时段落语义召回的权重。",
+                "default": 0.45
+              },
+              "sparse_weight": {
+                "type": "float",
+                "description": "关系意图稀疏权重",
+                "hint": "关系意图命中时 BM25/稀疏召回的权重。",
+                "default": 0.15
+              },
+              "graph_weight": {
+                "type": "float",
+                "description": "关系意图图谱权重",
+                "hint": "关系意图命中时图谱向量召回的权重。",
+                "default": 0.4
+              },
+              "return_relation_items": {
+                "type": "bool",
+                "description": "返回独立关系项",
+                "hint": "关系意图命中时是否把关系结果作为独立结果返回。",
+                "default": false
+              }
+            }
+          }
+        }
       },
       "temporal": {
         "type": "object",
@@ -679,6 +793,62 @@
         "description": "话题分段使用的模型",
         "hint": "auto（推荐）：使用当前默认的 AI 模型。也可以填写具体的模型名来指定。",
         "default": "auto"
+      }
+    }
+  },
+  "integration": {
+    "type": "object",
+    "description": "集成功能",
+    "hint": "控制反馈纠错和模糊修正等需要管理员确认的高级能力。模糊修正默认启用但执行仍需确认。",
+    "items": {
+      "feedback_correction_enabled": {
+        "type": "bool",
+        "description": "启用反馈纠错",
+        "hint": "开启后允许后台根据反馈任务尝试纠正长期记忆。",
+        "default": false
+      },
+      "fuzzy_modify": {
+        "type": "object",
+        "description": "记忆模糊修正",
+        "hint": "根据自然语言请求生成记忆修改计划。默认启用，与上游 A_memorix 对齐；执行仍需要管理员确认。",
+        "items": {
+          "enabled": {
+            "type": "bool",
+            "description": "启用模糊修正",
+            "hint": "关闭时 preview/execute/list/get/rollback/reconcile 都会返回 fuzzy_modify_disabled。",
+            "default": true
+          },
+          "candidate_limit": {
+            "type": "int",
+            "description": "候选记忆上限",
+            "hint": "生成修改计划时最多收集多少条候选记忆。",
+            "default": 20
+          },
+          "confirm_threshold": {
+            "type": "float",
+            "description": "自动执行置信阈值",
+            "hint": "计划置信度低于该值时必须人工确认；默认保持保守。",
+            "default": 0.85
+          },
+          "auto_execute_enabled": {
+            "type": "bool",
+            "description": "允许自动执行",
+            "hint": "默认关闭。关闭时 execute 必须显式传 confirmed=true。",
+            "default": false
+          },
+          "max_targets": {
+            "type": "int",
+            "description": "单个计划最大目标数",
+            "hint": "限制一次模糊修正最多修改多少个目标，避免误伤过多记忆。",
+            "default": 5
+          },
+          "allow_global_scope": {
+            "type": "bool",
+            "description": "允许全局作用域",
+            "hint": "默认关闭，避免误把跨作用域的记忆纳入修改范围。",
+            "default": false
+          }
+        }
       }
     }
   },

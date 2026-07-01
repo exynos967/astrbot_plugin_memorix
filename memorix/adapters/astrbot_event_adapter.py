@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ..scope_router import parse_unified_msg_origin
+
 
 @dataclass(slots=True)
 class MemorixEvent:
@@ -47,11 +49,19 @@ class AstrbotEventAdapter:
     def from_event(event, scope_key: str) -> MemorixEvent:
         platform = str(getattr(event, "get_platform_name", lambda: "unknown")() or "unknown")
         unified_msg_origin = str(getattr(event, "unified_msg_origin", "") or "")
+        original_message_type = ""
+        original_session_id = ""
+        if platform == "cron":
+            parsed = parse_unified_msg_origin(unified_msg_origin)
+            if parsed is not None:
+                platform, original_message_type, original_session_id = parsed
         message_obj = getattr(event, "message_obj", None)
-        session_id = str(getattr(message_obj, "session_id", "") or unified_msg_origin)
+        session_id = str(getattr(message_obj, "session_id", "") or original_session_id or unified_msg_origin)
         sender_id = str(getattr(event, "get_sender_id", lambda: "")() or "")
         sender_name = str(getattr(event, "get_sender_name", lambda: "")() or "")
         group_id = str(getattr(event, "get_group_id", lambda: "")() or "")
+        if not group_id and original_message_type == "GroupMessage":
+            group_id = original_session_id
         group_name = AstrbotEventAdapter._group_name_from_event(message_obj)
         message_id = str(getattr(message_obj, "message_id", "") or "")
         message_text = str(getattr(event, "message_str", "") or "").strip()

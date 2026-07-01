@@ -99,7 +99,7 @@ class DynamicThresholdFilter:
         self._total_processed = 0
         self._threshold_history: List[float] = []
 
-        logger.info(
+        logger.debug(
             f"DynamicThresholdFilter 初始化: "
             f"method={self.config.method.value}, "
             f"min_threshold={self.config.min_threshold}"

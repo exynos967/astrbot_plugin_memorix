@@ -93,6 +93,29 @@ def _coerce_timestamp(value: Any) -> Optional[float]:
     return ts if ts > 0 else None
 
 
+def _normalize_entity_items(raw_entities: Any) -> List[str]:
+    """归一化实体列表，兼容字符串与 dict 形态，去重并保留显示名。"""
+    if not isinstance(raw_entities, list):
+        return []
+    entities: List[str] = []
+    seen = set()
+    for item in raw_entities:
+        if isinstance(item, str):
+            name = item.strip()
+        elif isinstance(item, dict):
+            name = str(item.get("name") or item.get("label") or item.get("entity") or "").strip()
+        else:
+            name = ""
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        entities.append(name)
+    return entities
+
+
 class SummaryImporter:
     def __init__(
         self,
@@ -133,6 +156,65 @@ class SummaryImporter:
             else:
                 return default
         return current
+
+    def _plugin_instance(self) -> Any:
+        """获取 plugin_instance（上游通过 plugin_config 注入的 ctx 引用）。"""
+        return self.plugin_config.get("plugin_instance") if isinstance(self.plugin_config, dict) else None
+
+    def _dual_vector_pools_enabled(self) -> bool:
+        """是否启用双池（段落池 + 图池）向量写入。
+
+        优先调用 plugin_instance 上的同名检查器；否则回退到配置字典判定。
+        """
+        plugin_instance = self._plugin_instance()
+        checker = getattr(plugin_instance, "_dual_vector_pools_enabled", None)
+        if callable(checker):
+            return bool(checker())
+        if isinstance(self.plugin_config, dict):
+            retrieval_cfg = self.plugin_config.get("retrieval", {}) or {}
+            vector_pools_cfg = retrieval_cfg.get("vector_pools", {}) if isinstance(retrieval_cfg, dict) else {}
+            configured_mode = (
+                str(vector_pools_cfg.get("mode", "dual") or "dual").strip().lower()
+                if isinstance(vector_pools_cfg, dict)
+                else "dual"
+            )
+            runtime_cfg = self.plugin_config.get("runtime", {}) or {}
+            if isinstance(runtime_cfg, dict) and "vector_pools_ready" in runtime_cfg:
+                return configured_mode == "dual" and bool(runtime_cfg.get("vector_pools_ready"))
+            return configured_mode == "dual"
+        return False
+
+    def _graph_vector_store(self) -> VectorStore:
+        """获取图池向量存储；双池未启用或未注入时安全回退到主向量存储。"""
+        if self._dual_vector_pools_enabled() and isinstance(self.plugin_config, dict):
+            store = self.plugin_config.get("graph_vector_store")
+            if store is not None:
+                return store
+        return self.vector_store
+
+    @staticmethod
+    def _graph_vector_id(item_type: str, hash_value: str) -> str:
+        return f"{str(item_type or '').strip()}:{str(hash_value or '').strip()}"
+
+    async def _ensure_entity_vector(self, *, entity_hash: str, name: str) -> None:
+        """写入实体向量到图池；graph 池不可用时安全降级跳过。"""
+        token = str(entity_hash or "").strip()
+        text = str(name or "").strip()
+        if not token or not text or not self._dual_vector_pools_enabled():
+            return
+
+        target_store = self._graph_vector_store()
+        vector_id = self._graph_vector_id("entity", token)
+        if target_store is None or vector_id in target_store:
+            return
+        try:
+            embedding = await self.embedding_manager.encode(text)
+            if getattr(embedding, "ndim", 1) == 1:
+                embedding = embedding.reshape(1, -1)
+            target_store.add(vectors=embedding, ids=[vector_id])
+        except Exception as exc:
+            # graph 池不可用时安全降级：仅记录日志，不抛错，metadata/graph 仍保留
+            logger.warning("总结导入实体向量写入失败，跳过 entity 向量: entity=%s error=%s", text, exc)
 
     def _build_chat_text(self, messages: List[Dict[str, Any]], *, bot_name: str = "") -> str:
         lines: List[str] = []
@@ -340,8 +422,13 @@ class SummaryImporter:
 
         await self.paragraph_vector_service.ensure_paragraph_vector(hash_value, summary)
 
-        if entities:
-            self.graph_store.add_nodes([str(e) for e in entities if str(e).strip()])
+        # 导入实体：归一化 + 图节点 + 实体元数据 + 图池向量（双池可用时）
+        normalized_entities = _normalize_entity_items(entities)
+        if normalized_entities:
+            self.graph_store.add_nodes(normalized_entities)
+            for name in normalized_entities:
+                entity_hash = self.metadata_store.add_entity(name=name, source_paragraph=hash_value)
+                await self._ensure_entity_vector(entity_hash=entity_hash, name=name)
 
         for rel in relations:
             s = str(rel.get("subject", "")).strip()
@@ -356,7 +443,7 @@ class SummaryImporter:
                     obj=o,
                     confidence=1.0,
                     source_paragraph=hash_value,
-                    write_vector=bool(self._cfg("retrieval.relation_vectorization.enabled", True)),
+                    write_vector=bool(self._cfg("retrieval.relation_vectorization.enabled", False)),
                 )
             else:
                 rel_hash = self.metadata_store.add_relation(
