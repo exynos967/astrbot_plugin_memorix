@@ -80,9 +80,9 @@ import TopBar from "./TopBar.vue";
   overflow: hidden;
 }
 
-.view-stack :deep(> *) {
-  /* 不设 flex:1——仅 GraphView（.view-graph）需要撑满剩余高度，它自己设了 flex:1 1 0。
-   * 其他 view（设置/总览/人物等）内容溢出不需限制高度，由 view-stack overflow:auto 处理滚动。 */
-  min-height: 0;
-}
+/* 不设 :deep(> *) flex:1 / min-height:0——flex 列子项 min-height:0 会压制
+ * 默认 min-height:auto（内容最小高度），子项 flex-shrink:1 配合 → 子项被压缩到
+ * 容器高度，view-stack overflow:auto 永远看不到溢出 → 滚动条不出、内容截断。
+ * 各 view 自己管理高度：GraphView（.view-graph flex:1 1 0 + min-height:0）
+ * 需要撑满画布，其他 view 内容自然撑高，由 view-stack 滚动。 */
 </style>
