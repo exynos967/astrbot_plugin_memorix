@@ -43,6 +43,18 @@ logger = get_logger("A_Memorix.MetadataStore")
 
 SCHEMA_VERSION = 15
 RUNTIME_AUTO_MIGRATION_MIN_SCHEMA_VERSION = 9
+DEFAULT_MIGRATION_BATCH_SIZE = 2000
+
+
+def _normalize_legacy_knowledge_type(row: Tuple[str, str, Any]) -> Tuple[str, str]:
+    paragraph_hash, content, raw_value = row
+    normalized_type = resolve_stored_knowledge_type(
+        raw_value,
+        content=content,
+        allow_legacy=True,
+        unknown_fallback=KnowledgeType.MIXED,
+    )
+    return normalized_type.value, paragraph_hash
 
 
 class MetadataStore:
@@ -1427,48 +1439,63 @@ class MetadataStore:
             invalid.append(str(raw) if raw is not None else "")
         return invalid
 
-    def normalize_paragraph_knowledge_types(self) -> Dict[str, Any]:
-        """将历史非法 knowledge_type 归一化为合法值。"""
+    def normalize_paragraph_knowledge_types(
+        self,
+        *,
+        batch_size: int = DEFAULT_MIGRATION_BATCH_SIZE,
+    ) -> Dict[str, Any]:
+        """分批归一化历史非法 knowledge_type，避免大库全量载入内存。"""
 
-        cursor = self._conn.cursor()
-        cursor.execute("SELECT hash, content, knowledge_type FROM paragraphs")
-        rows = cursor.fetchall()
+        resolved_batch_size = max(1, int(batch_size))
 
+        invalid_before = self.list_invalid_paragraph_knowledge_types()
+        if not invalid_before:
+            return {"normalized": 0, "invalid_before": [], "normalized_to": {}}
+
+        allowed_values = tuple(allowed_knowledge_type_values())
+        placeholders = ", ".join("?" for _ in allowed_values)
+        query = f"""
+            SELECT hash, content, knowledge_type
+            FROM paragraphs
+            WHERE (
+                    knowledge_type IS NULL
+                 OR TRIM(COALESCE(knowledge_type, '')) = ''
+                 OR LOWER(TRIM(knowledge_type)) NOT IN ({placeholders})
+              )
+            ORDER BY rowid
+        """
+
+        read_cursor = self._conn.cursor()
+        write_cursor = self._conn.cursor()
         normalized_count = 0
         normalized_map: Dict[str, int] = {}
-        invalid_before: List[str] = []
-        invalid_seen = set()
+        try:
+            read_cursor.execute(query, allowed_values)
+            while True:
+                rows = read_cursor.fetchmany(resolved_batch_size)
+                if not rows:
+                    break
+                payloads = [
+                    (str(row["hash"]), str(row["content"] or ""), row["knowledge_type"])
+                    for row in rows
+                ]
+                updates = [_normalize_legacy_knowledge_type(row) for row in payloads]
 
-        for row in rows:
-            paragraph_hash = str(row["hash"])
-            content = str(row["content"] or "")
-            raw_value = row["knowledge_type"]
-            try:
-                validate_stored_knowledge_type(raw_value)
-                continue
-            except ValueError:
-                raw_text = str(raw_value) if raw_value is not None else ""
-                if raw_text not in invalid_seen:
-                    invalid_seen.add(raw_text)
-                    invalid_before.append(raw_text)
+                write_cursor.executemany(
+                    "UPDATE paragraphs SET knowledge_type = ? WHERE hash = ?",
+                    updates,
+                )
+                normalized_count += len(updates)
+                for normalized_type, _ in updates:
+                    normalized_map[normalized_type] = normalized_map.get(normalized_type, 0) + 1
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
 
-            normalized_type = resolve_stored_knowledge_type(
-                raw_value,
-                content=content,
-                allow_legacy=True,
-                unknown_fallback=KnowledgeType.MIXED,
-            )
-            cursor.execute(
-                "UPDATE paragraphs SET knowledge_type = ? WHERE hash = ?",
-                (normalized_type.value, paragraph_hash),
-            )
-            normalized_count += 1
-            normalized_map[normalized_type.value] = normalized_map.get(normalized_type.value, 0) + 1
-
-        self._conn.commit()
         return {
             "normalized": normalized_count,
-            "invalid_before": sorted(invalid_before),
+            "invalid_before": invalid_before,
             "normalized_to": normalized_map,
         }
 
@@ -4745,9 +4772,8 @@ class MetadataStore:
         return [resolved]
 
     def rebuild_relation_hash_aliases(self) -> Dict[str, Any]:
-        """重建 32 位 relation hash 别名映射。"""
+        """使用集合 SQL 重建 32 位 relation hash 别名映射。"""
         cursor = self._conn.cursor()
-        # 历史库兜底：缺表时先创建，避免迁移过程直接中断。
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS relation_hash_aliases (
                 alias32 TEXT PRIMARY KEY,
@@ -4755,41 +4781,46 @@ class MetadataStore:
             )
         """)
         cursor.execute("DELETE FROM relation_hash_aliases")
-
-        cursor.execute("SELECT hash FROM relations")
-        hashes = [str(r[0]) for r in cursor.fetchall()]
         cursor.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='deleted_relations'"
         )
         has_deleted_relations = cursor.fetchone() is not None
+        hash_sources = "SELECT hash FROM relations WHERE LENGTH(hash) = 64"
         if has_deleted_relations:
-            cursor.execute("SELECT hash FROM deleted_relations")
-            hashes.extend(str(r[0]) for r in cursor.fetchall())
+            hash_sources += " UNION ALL SELECT hash FROM deleted_relations WHERE LENGTH(hash) = 64"
 
-        alias_map: Dict[str, str] = {}
-        conflicts: Dict[str, set[str]] = {}
-        for h in hashes:
-            if len(h) != 64:
-                continue
-            alias = h[:32]
-            old = alias_map.get(alias)
-            if old is None:
-                alias_map[alias] = h
-            elif old != h:
-                conflicts.setdefault(alias, set()).update({old, h})
-
-        for alias, full_hash in alias_map.items():
-            if alias in conflicts:
-                continue
-            cursor.execute(
-                "INSERT INTO relation_hash_aliases(alias32, hash) VALUES (?, ?)",
-                (alias, full_hash),
-            )
+        cte = f"""
+            WITH all_hashes(hash) AS ({hash_sources}),
+                 unique_hashes(hash) AS (SELECT DISTINCT hash FROM all_hashes)
+        """
+        cursor.execute(
+            cte
+            + """
+                INSERT INTO relation_hash_aliases(alias32, hash)
+                SELECT SUBSTR(hash, 1, 32), MIN(hash)
+                FROM unique_hashes
+                GROUP BY SUBSTR(hash, 1, 32)
+                HAVING COUNT(*) = 1
+            """
+        )
+        cursor.execute("SELECT changes()")
+        inserted = int(cursor.fetchone()[0])
+        cursor.execute(
+            cte
+            + """
+                SELECT SUBSTR(hash, 1, 32) AS alias32
+                FROM unique_hashes
+                GROUP BY SUBSTR(hash, 1, 32)
+                HAVING COUNT(*) > 1
+                ORDER BY alias32
+            """
+        )
+        conflicts = [str(row[0]) for row in cursor.fetchall()]
         self._conn.commit()
         return {
-            "inserted": len(alias_map) - len(conflicts),
+            "inserted": inserted,
             "conflict_count": len(conflicts),
-            "conflicts": sorted(conflicts.keys()),
+            "conflicts": conflicts,
         }
 
     def search_relation_hashes_by_text(self, query: str, limit: int = 5) -> List[str]:
