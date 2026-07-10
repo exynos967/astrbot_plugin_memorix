@@ -89,6 +89,12 @@ def _safe_json_loads(raw: Any) -> Dict[str, Any]:
     if not text:
         return {}
     try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict):
+        return payload
+    try:
         from json_repair import repair_json
 
         repaired = repair_json(text)
