@@ -173,37 +173,6 @@ class ProfileService:
             source_note="astrbot:profile_query",
         )
 
-    async def get_injection_status(
-        self,
-        *,
-        scope_key: str,
-        session_id: str,
-        user_id: str,
-    ) -> Dict[str, Any]:
-        runtime = await self.runtime_manager.get_runtime(scope_key)
-        ctx = runtime.context
-
-        profile_enabled = bool(ctx.get_config("person_profile.enabled", True))
-
-        sid = str(session_id or "").strip()
-        uid = str(user_id or "").strip()
-        return {
-            "success": True,
-            "scope_key": scope_key,
-            "session_id": sid,
-            "user_id": uid,
-            "person_profile_enabled": profile_enabled,
-            "effective_injection_enabled": profile_enabled,
-        }
-
-    async def set_injection_switch(self, *, scope_key: str, session_id: str, user_id: str, enabled: bool) -> Dict[str, Any]:
-        """Compatibility shim: injection is now controlled by person_profile.enabled only."""
-        del enabled
-        status = await self.get_injection_status(scope_key=scope_key, session_id=session_id, user_id=user_id)
-        status["updated"] = False
-        status["message"] = "画像注入由 person_profile.enabled 总开关控制"
-        return status
-
     async def is_injection_enabled(
         self,
         *,
@@ -211,28 +180,9 @@ class ProfileService:
         session_id: str,
         user_id: str,
     ) -> bool:
-        status = await self.get_injection_status(
-            scope_key=scope_key,
-            session_id=session_id,
-            user_id=user_id,
-        )
-        return bool(status.get("effective_injection_enabled", False))
-
-    async def mark_profile_active(
-        self,
-        *,
-        scope_key: str,
-        session_id: str,
-        user_id: str,
-        person_id: str,
-    ) -> None:
-        sid = str(session_id or "").strip()
-        uid = str(user_id or "").strip()
-        pid = str(person_id or "").strip()
-        if not (sid and uid and pid):
-            return
+        del session_id, user_id
         runtime = await self.runtime_manager.get_runtime(scope_key)
-        runtime.context.metadata_store.mark_person_profile_active(sid, uid, pid)
+        return bool(runtime.context.get_config("person_profile.enabled", True))
 
     async def set_override(self, *, scope_key: str, person_id: str, override_text: str, updated_by: str = "astrbot"):
         runtime = await self.runtime_manager.get_runtime(scope_key)

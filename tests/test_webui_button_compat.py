@@ -96,7 +96,7 @@ class _FakeCtx:
         self.graph_store = object()
         self.embedding_manager = object()
         self.astrbot_context = None
-        self.provider_bridge = None
+        self.provider_bridge = types.SimpleNamespace(enabled=True, chat_provider_id="")
 
     def get_config(self, _key, default=None):
         return default

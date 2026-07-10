@@ -1,4 +1,4 @@
-"""Person fact writeback for AstrBot events."""
+"""MaiBot-style person fact writeback for AstrBot events."""
 
 from __future__ import annotations
 
@@ -250,22 +250,20 @@ class PersonFactWritebackService:
     async def _complete(self, ctx: Any, prompt: str, item: PersonFactWritebackItem) -> str:
         bridge = getattr(ctx, "provider_bridge", None)
         provider_id = str(self._cfg("person_fact_writeback.chat_provider_id", "") or "").strip()
-        if bridge is not None and getattr(bridge, "enabled", False):
-            selected_bridge = bridge
-            if provider_id:
-                selected_bridge = AstrBotProviderBridge(
-                    astrbot_context=getattr(bridge, "_context", None),
-                    chat_provider_id=provider_id,
-                    embedding_provider_id=str(getattr(bridge, "embedding_provider_id", "") or ""),
-                )
-            return await selected_bridge.generate_text(
-                prompt,
-                temperature=float(self._cfg("person_fact_writeback.temperature", 0.1) or 0.1),
-                max_tokens=int(self._cfg("person_fact_writeback.max_tokens", 800) or 800),
-                unified_msg_origin=item.unified_msg_origin,
+        if bridge is None or not getattr(bridge, "enabled", False):
+            raise RuntimeError("AstrBot provider bridge is unavailable")
+        selected_bridge = bridge
+        if provider_id:
+            selected_bridge = AstrBotProviderBridge(
+                astrbot_context=getattr(bridge, "_context", None),
+                chat_provider_id=provider_id,
             )
-
-        return ""
+        return await selected_bridge.generate_text(
+            prompt,
+            temperature=float(self._cfg("person_fact_writeback.temperature", 0.1) or 0.1),
+            max_tokens=int(self._cfg("person_fact_writeback.max_tokens", 800) or 800),
+            unified_msg_origin=item.unified_msg_origin,
+        )
 
     @staticmethod
     def _parse_fact_list(raw: str) -> List[str]:

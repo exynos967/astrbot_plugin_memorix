@@ -4,10 +4,12 @@ from types import SimpleNamespace
 import numpy as np
 from astrbot_plugin_memorix.main import MEMORY_INJECTION_MARKER, MemorixPlugin
 from astrbot_plugin_memorix.memorix.adapters.astrbot_event_adapter import AstrbotEventAdapter
+from astrbot_plugin_memorix.memorix.amemorix.bootstrap import _probe_embedding_dimension
 from astrbot_plugin_memorix.memorix.amemorix.context import AppContext
 from astrbot_plugin_memorix.memorix.amemorix.services.query_service import QueryService
 from astrbot_plugin_memorix.memorix.core.storage.metadata_store import MetadataStore
 from astrbot_plugin_memorix.memorix.core.utils.summary_importer import SummaryImporter
+from astrbot_plugin_memorix.memorix.providers import AstrBotProviderBridge
 from astrbot_plugin_memorix.memorix.services.content_router import MemoryContentRouter
 from astrbot_plugin_memorix.memorix.services.ingest_service import IngestService
 from astrbot_plugin_memorix.memorix.services.person_fact_writeback_service import (
@@ -204,6 +206,39 @@ def test_plugin_registers_and_removes_llm_tools():
 
     plugin._remove_llm_tools()
     assert ctx.removed == [tool.name for tool in ctx.added]
+
+
+def test_provider_bridge_uses_current_astrbot_context_api():
+    class _Provider:
+        def meta(self):
+            return SimpleNamespace(id="session-provider")
+
+    class _Context:
+        def __init__(self):
+            self.origin = None
+            self.request = None
+
+        def get_using_provider(self, origin):
+            self.origin = origin
+            return _Provider()
+
+        async def llm_generate(self, **kwargs):
+            self.request = kwargs
+            return SimpleNamespace(completion_text="ok")
+
+    context = _Context()
+    bridge = AstrBotProviderBridge(astrbot_context=context)
+
+    result = asyncio.run(bridge.generate_text("hello", unified_msg_origin="umo-1"))
+
+    assert result == "ok"
+    assert context.origin == "umo-1"
+    assert context.request == {
+        "chat_provider_id": "session-provider",
+        "prompt": "hello",
+        "temperature": 0.2,
+        "max_tokens": 1200,
+    }
 
 
 def test_astrbot_event_adapter_extracts_group_name():
@@ -539,6 +574,15 @@ def test_person_fact_writeback_stores_paragraph_and_registry_points(tmp_path):
         assert paragraphs[0]["metadata"]["group_name"] == "测试群"
     finally:
         metadata_store.close()
+
+
+def test_embedding_dimension_probe_detects_remote_dimension():
+    class _Adapter:
+        async def _detect_dimension(self):
+            await asyncio.sleep(0)
+            return 768
+
+    assert _probe_embedding_dimension(_Adapter(), 1024) == 768
 
 
 class _RejectingChatCtx:

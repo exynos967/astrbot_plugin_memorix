@@ -31,8 +31,6 @@ class SummaryService:
 
     def _summary_importer_config(self) -> Dict[str, Any]:
         cfg = dict(self.ctx.config)
-        # 注入 plugin_instance 供 SummaryImporter 探测双池/图向量写入能力
-        cfg["plugin_instance"] = self.ctx
         paragraph_vector_service = getattr(self.ctx, "paragraph_vector_service", None)
         if paragraph_vector_service is not None:
             cfg["paragraph_vector_service"] = paragraph_vector_service
@@ -43,18 +41,14 @@ class SummaryService:
 
     def _build_summary_llm_client(self) -> Any:
         provider_bridge = getattr(self.ctx, "provider_bridge", None)
-        if provider_bridge is not None and getattr(provider_bridge, "enabled", False):
-            retries = int(self.ctx.get_config("embedding.retry.max_attempts", 3) or 3)
-            logger.info(
-                "summary service uses AstrBot native chat provider: provider_id=%s",
-                str(getattr(provider_bridge, "chat_provider_id", "") or "<session-default>"),
-            )
-            return AstrBotLLMClient(provider_bridge=provider_bridge, max_retries=max(1, retries))
-
-        logger.warning(
-            "summary service has no AstrBot provider bridge; LLM summary will use deterministic fallback"
+        if provider_bridge is None or not getattr(provider_bridge, "enabled", False):
+            raise RuntimeError("AstrBot provider bridge is unavailable")
+        retries = int(self.ctx.get_config("embedding.retry.max_attempts", 3) or 3)
+        logger.info(
+            "summary service uses AstrBot native chat provider: provider_id=%s",
+            str(getattr(provider_bridge, "chat_provider_id", "") or "<session-default>"),
         )
-        return None
+        return AstrBotLLMClient(provider_bridge=provider_bridge, max_retries=max(1, retries))
 
     def _cfg(self, key: str, default: Any = None) -> Any:
         return self.ctx.get_config(key, default)
