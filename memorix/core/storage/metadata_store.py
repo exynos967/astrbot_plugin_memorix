@@ -1421,6 +1421,7 @@ class MetadataStore:
     def list_invalid_paragraph_knowledge_types(self) -> List[str]:
         """列出当前库中不合法的段落 knowledge_type。"""
 
+        allowed_token = "|" + "|".join(allowed_knowledge_type_values()) + "|"
         cursor = self._conn.cursor()
         cursor.execute(
             """
@@ -1428,10 +1429,10 @@ class MetadataStore:
             FROM paragraphs
             WHERE knowledge_type IS NULL
                OR TRIM(COALESCE(knowledge_type, '')) = ''
-               OR LOWER(TRIM(knowledge_type)) NOT IN ({placeholders})
+               OR INSTR(?, '|' || LOWER(TRIM(knowledge_type)) || '|') = 0
             ORDER BY knowledge_type
-            """.format(placeholders=", ".join("?" for _ in allowed_knowledge_type_values())),
-            tuple(allowed_knowledge_type_values()),
+            """,
+            (allowed_token,),
         )
         invalid: List[str] = []
         for row in cursor.fetchall():
@@ -1452,15 +1453,14 @@ class MetadataStore:
         if not invalid_before:
             return {"normalized": 0, "invalid_before": [], "normalized_to": {}}
 
-        allowed_values = tuple(allowed_knowledge_type_values())
-        placeholders = ", ".join("?" for _ in allowed_values)
-        query = f"""
+        allowed_token = "|" + "|".join(allowed_knowledge_type_values()) + "|"
+        query = """
             SELECT hash, content, knowledge_type
             FROM paragraphs
             WHERE (
                     knowledge_type IS NULL
                  OR TRIM(COALESCE(knowledge_type, '')) = ''
-                 OR LOWER(TRIM(knowledge_type)) NOT IN ({placeholders})
+                 OR INSTR(?, '|' || LOWER(TRIM(knowledge_type)) || '|') = 0
               )
             ORDER BY rowid
         """
@@ -1470,7 +1470,7 @@ class MetadataStore:
         normalized_count = 0
         normalized_map: Dict[str, int] = {}
         try:
-            read_cursor.execute(query, allowed_values)
+            read_cursor.execute(query, (allowed_token,))
             while True:
                 rows = read_cursor.fetchmany(resolved_batch_size)
                 if not rows:
@@ -4782,37 +4782,39 @@ class MetadataStore:
         """)
         cursor.execute("DELETE FROM relation_hash_aliases")
         cursor.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='deleted_relations'"
-        )
-        has_deleted_relations = cursor.fetchone() is not None
-        hash_sources = "SELECT hash FROM relations WHERE LENGTH(hash) = 64"
-        if has_deleted_relations:
-            hash_sources += " UNION ALL SELECT hash FROM deleted_relations WHERE LENGTH(hash) = 64"
-
-        cte = f"""
-            WITH all_hashes(hash) AS ({hash_sources}),
-                 unique_hashes(hash) AS (SELECT DISTINCT hash FROM all_hashes)
-        """
-        cursor.execute(
-            cte
-            + """
-                INSERT INTO relation_hash_aliases(alias32, hash)
-                SELECT SUBSTR(hash, 1, 32), MIN(hash)
-                FROM unique_hashes
-                GROUP BY SUBSTR(hash, 1, 32)
-                HAVING COUNT(*) = 1
+            """
+            WITH all_hashes(hash) AS (
+                    SELECT hash FROM relations WHERE LENGTH(hash) = 64
+                    UNION ALL
+                    SELECT hash FROM deleted_relations WHERE LENGTH(hash) = 64
+                 ),
+                 unique_hashes(hash) AS (
+                    SELECT DISTINCT hash FROM all_hashes
+                 )
+            INSERT INTO relation_hash_aliases(alias32, hash)
+            SELECT SUBSTR(hash, 1, 32), MIN(hash)
+            FROM unique_hashes
+            GROUP BY SUBSTR(hash, 1, 32)
+            HAVING COUNT(*) = 1
             """
         )
         cursor.execute("SELECT changes()")
         inserted = int(cursor.fetchone()[0])
         cursor.execute(
-            cte
-            + """
-                SELECT SUBSTR(hash, 1, 32) AS alias32
-                FROM unique_hashes
-                GROUP BY SUBSTR(hash, 1, 32)
-                HAVING COUNT(*) > 1
-                ORDER BY alias32
+            """
+            WITH all_hashes(hash) AS (
+                    SELECT hash FROM relations WHERE LENGTH(hash) = 64
+                    UNION ALL
+                    SELECT hash FROM deleted_relations WHERE LENGTH(hash) = 64
+                 ),
+                 unique_hashes(hash) AS (
+                    SELECT DISTINCT hash FROM all_hashes
+                 )
+            SELECT SUBSTR(hash, 1, 32) AS alias32
+            FROM unique_hashes
+            GROUP BY SUBSTR(hash, 1, 32)
+            HAVING COUNT(*) > 1
+            ORDER BY alias32
             """
         )
         conflicts = [str(row[0]) for row in cursor.fetchall()]
