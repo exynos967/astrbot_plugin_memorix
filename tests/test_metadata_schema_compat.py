@@ -69,6 +69,72 @@ def test_connect_patches_legacy_episode_position_column(tmp_path):
         store.close()
 
 
+def test_knowledge_type_migration_processes_large_tables_in_batches(tmp_path):
+    store = MetadataStore(tmp_path)
+    store.connect()
+    try:
+        invalid_rows = [
+            (
+                f"invalid-{idx}",
+                f"用户在第 {idx} 条记录中描述了一段稳定事实。",
+                "legacy_unknown" if idx % 3 == 0 else ("auto" if idx % 3 == 1 else "imported"),
+            )
+            for idx in range(2505)
+        ]
+        valid_rows = [(f"valid-{idx}", "already valid", "factual") for idx in range(25)]
+        store._conn.executemany(
+            "INSERT INTO paragraphs(hash, content, knowledge_type) VALUES (?, ?, ?)",
+            invalid_rows + valid_rows,
+        )
+        store._conn.commit()
+
+        result = store.normalize_paragraph_knowledge_types(batch_size=127)
+
+        assert result["normalized"] == len(invalid_rows)
+        assert result["invalid_before"] == ["auto", "imported", "legacy_unknown"]
+        assert sum(result["normalized_to"].values()) == len(invalid_rows)
+        assert store.list_invalid_paragraph_knowledge_types() == []
+        assert store._conn.execute(
+            "SELECT COUNT(*) FROM paragraphs WHERE hash LIKE 'valid-%' AND knowledge_type = 'factual'"
+        ).fetchone()[0] == len(valid_rows)
+    finally:
+        store.close()
+
+
+def test_relation_alias_rebuild_uses_set_semantics_for_conflicts(tmp_path):
+    store = MetadataStore(tmp_path)
+    store.connect()
+    try:
+        conflict_prefix = "a" * 32
+        conflicting_hashes = [conflict_prefix + "1" * 32, conflict_prefix + "2" * 32]
+        unique_hash = "b" * 64
+        store._conn.executemany(
+            "INSERT INTO relations(hash, subject, predicate, object) VALUES (?, ?, ?, ?)",
+            [
+                (conflicting_hashes[0], "s1", "p", "o1"),
+                (conflicting_hashes[1], "s2", "p", "o2"),
+                (unique_hash, "s3", "p", "o3"),
+            ],
+        )
+        store._conn.execute(
+            "INSERT INTO deleted_relations(hash, subject, predicate, object) VALUES (?, ?, ?, ?)",
+            (unique_hash, "deleted", "p", "o"),
+        )
+        store._conn.commit()
+
+        result = store.rebuild_relation_hash_aliases()
+
+        assert result == {
+            "inserted": 1,
+            "conflict_count": 1,
+            "conflicts": [conflict_prefix],
+        }
+        aliases = store._conn.execute("SELECT alias32, hash FROM relation_hash_aliases ORDER BY alias32").fetchall()
+        assert [tuple(row) for row in aliases] == [(unique_hash[:32], unique_hash)]
+    finally:
+        store.close()
+
+
 def test_connect_patches_legacy_transcript_position_column(tmp_path):
     db_path = tmp_path / "metadata.db"
     conn = sqlite3.connect(db_path)
@@ -378,10 +444,13 @@ def test_connect_patches_037_metadata_columns_and_summary_state(tmp_path):
         assert state["summary_count"] == 0
         assert state["created_at"] == 3.0
 
-        assert store.append_transcript_messages(
-            session_id="s1",
-            messages=[{"role": "assistant", "content": "hi", "created_at": 4.0}],
-        ) == 1
+        assert (
+            store.append_transcript_messages(
+                session_id="s1",
+                messages=[{"role": "assistant", "content": "hi", "created_at": 4.0}],
+            )
+            == 1
+        )
         messages = store.get_transcript_messages("s1")
         assert [item["position"] for item in messages] == [0, 1, 2]
 
@@ -481,10 +550,7 @@ def test_v8_legacy_db_migrates_to_current_schema(tmp_path):
 
     after = sqlite3.connect(db_path)
     try:
-        tables = {
-            row[0]
-            for row in after.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-        }
+        tables = {row[0] for row in after.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         for table in _VNEXT_TABLES:
             assert table in tables, f"迁移后缺失 vNext 表: {table}"
 
@@ -645,15 +711,11 @@ def test_schema_13_db_runtime_auto_migrates_to_15(tmp_path):
     store.connect()
     try:
         assert store.get_schema_version() == 15
-        tables = {
-            row[0]
-            for row in store._conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-        }
+        tables = {row[0] for row in store._conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         assert "memory_fuzzy_modify_plans" in tables
 
         stale_columns = {
-            row[1]
-            for row in store._conn.execute("PRAGMA table_info(paragraph_stale_relation_marks)").fetchall()
+            row[1] for row in store._conn.execute("PRAGMA table_info(paragraph_stale_relation_marks)").fetchall()
         }
         assert {"source_type", "source_id", "source_operation_id"} <= stale_columns
 

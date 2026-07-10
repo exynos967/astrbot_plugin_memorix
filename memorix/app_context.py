@@ -74,6 +74,7 @@ class ScopeRuntime:
     context: Any
     task_manager: TaskManager
 
+
 class ScopeRuntimeManager:
     def __init__(
         self,
@@ -202,7 +203,6 @@ class ScopeRuntimeManager:
             astrbot_context=self.astrbot_context,
             # 聊天模型可选 AstrBot 中已定义 provider（配置优先）。
             chat_provider_id=str(provider_cfg.get("chat_provider_id", "") or ""),
-            embedding_provider_id="",
         )
 
     def _patch_local_embedding(self, runtime: ScopeRuntime) -> None:
@@ -234,7 +234,7 @@ class ScopeRuntimeManager:
             cfg = self._build_scope_config(key)
             settings = AppSettings(config=cfg)
             logger.info("create runtime: scope=%s data_dir=%s", key, settings.data_dir)
-            ctx = build_context(settings)
+            ctx = await asyncio.to_thread(build_context, settings)
             ctx.astrbot_context = self.astrbot_context
             provider_bridge = self._build_provider_bridge()
             ctx.provider_bridge = provider_bridge

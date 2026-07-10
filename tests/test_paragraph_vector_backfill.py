@@ -1,7 +1,6 @@
 import asyncio
 
 import numpy as np
-
 from astrbot_plugin_memorix.memorix.core.storage.metadata_store import MetadataStore
 from astrbot_plugin_memorix.memorix.core.utils.paragraph_vector_service import ParagraphVectorWriteService
 

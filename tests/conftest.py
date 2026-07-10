@@ -16,6 +16,7 @@ def _install_astrbot_stub() -> None:
     star_mod = types.ModuleType("astrbot.api.star")
     core_mod = types.ModuleType("astrbot.core")
     agent_mod = types.ModuleType("astrbot.core.agent")
+    message_mod = types.ModuleType("astrbot.core.agent.message")
     run_context_mod = types.ModuleType("astrbot.core.agent.run_context")
     tool_mod = types.ModuleType("astrbot.core.agent.tool")
     astr_agent_context_mod = types.ModuleType("astrbot.core.astr_agent_context")
@@ -49,6 +50,21 @@ def _install_astrbot_stub() -> None:
 
         def __class_getitem__(cls, _item):
             return cls
+
+    class TextPart:
+        def __init__(self, text: str):
+            self.text = text
+            self._no_save = False
+
+        def mark_as_temp(self):
+            self._no_save = True
+            return self
+
+        def model_dump_for_context(self):
+            data = {"type": "text", "text": self.text}
+            if self._no_save:
+                data["_no_save"] = True
+            return data
 
     class AstrAgentContext:
         def __init__(self, context=None, event=None, extra=None):
@@ -149,7 +165,9 @@ def _install_astrbot_stub() -> None:
     core_mod.platform = platform_mod
     core_mod.utils = utils_mod
     agent_mod.run_context = run_context_mod
+    agent_mod.message = message_mod
     agent_mod.tool = tool_mod
+    message_mod.TextPart = TextPart
     platform_mod.astr_message_event = astr_message_event_mod
     utils_mod.astrbot_path = path_mod
     path_mod.get_astrbot_data_path = get_astrbot_data_path
@@ -161,6 +179,7 @@ def _install_astrbot_stub() -> None:
     sys.modules["astrbot.core"] = core_mod
     sys.modules["astrbot.core.agent"] = agent_mod
     sys.modules["astrbot.core.agent.run_context"] = run_context_mod
+    sys.modules["astrbot.core.agent.message"] = message_mod
     sys.modules["astrbot.core.agent.tool"] = tool_mod
     sys.modules["astrbot.core.astr_agent_context"] = astr_agent_context_mod
     sys.modules["astrbot.core.platform"] = platform_mod

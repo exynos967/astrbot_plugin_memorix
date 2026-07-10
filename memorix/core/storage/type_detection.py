@@ -14,32 +14,32 @@ from .knowledge_types import (
 
 
 _NARRATIVE_MARKERS = [
-    r"然后",
-    r"接着",
-    r"于是",
-    r"后来",
-    r"最后",
-    r"突然",
-    r"一天",
-    r"曾经",
-    r"有一次",
-    r"从前",
-    r"说道",
-    r"问道",
-    r"想着",
-    r"觉得",
+    "然后",
+    "接着",
+    "于是",
+    "后来",
+    "最后",
+    "突然",
+    "一天",
+    "曾经",
+    "有一次",
+    "从前",
+    "说道",
+    "问道",
+    "想着",
+    "觉得",
 ]
 _FACTUAL_MARKERS = [
-    r"是",
-    r"有",
-    r"在",
-    r"为",
-    r"属于",
-    r"位于",
-    r"包含",
-    r"拥有",
-    r"成立于",
-    r"出生于",
+    "是",
+    "有",
+    "在",
+    "为",
+    "属于",
+    "位于",
+    "包含",
+    "拥有",
+    "成立于",
+    "出生于",
 ]
 
 
@@ -68,7 +68,7 @@ def looks_like_narrative_text(content: str) -> bool:
     if not text:
         return False
 
-    narrative_score = sum(1 for marker in _NARRATIVE_MARKERS if re.search(marker, text))
+    narrative_score = sum(1 for marker in _NARRATIVE_MARKERS if marker in text)
     has_dialogue = bool(re.search(r'["「『].*?["」』]', text))
     has_chapter = any(token in text[:500] for token in ("Chapter", "CHAPTER", "###"))
     return has_chapter or has_dialogue or narrative_score >= 2
@@ -81,7 +81,7 @@ def looks_like_factual_text(content: str) -> bool:
     if looks_like_structured_text(text) or looks_like_quote_text(text):
         return False
 
-    factual_score = sum(1 for marker in _FACTUAL_MARKERS if re.search(r"\s*" + marker + r"\s*", text))
+    factual_score = sum(1 for marker in _FACTUAL_MARKERS if marker in text)
     if factual_score <= 0:
         return False
 

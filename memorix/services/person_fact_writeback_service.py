@@ -1,4 +1,4 @@
-"""Person fact writeback for AstrBot events."""
+"""MaiBot-style person fact writeback for AstrBot events."""
 
 from __future__ import annotations
 
@@ -133,7 +133,9 @@ class PersonFactWritebackService:
             return False
         if not assistant_text:
             return False
-        if MemoryContentRouter._looks_ephemeral(assistant_text) or MemoryContentRouter._looks_placeholder_only(assistant_text):
+        if MemoryContentRouter._looks_ephemeral(assistant_text) or MemoryContentRouter._looks_placeholder_only(
+            assistant_text
+        ):
             return False
         if not str(item.user_id or "").strip():
             return False
@@ -199,7 +201,9 @@ class PersonFactWritebackService:
 
         stored = []
         for fact in facts[: self._max_facts_per_turn()]:
-            stored_hash = await self._store_fact(ctx=ctx, item=item, person_id=person_id, person_name=display_name, fact=fact)
+            stored_hash = await self._store_fact(
+                ctx=ctx, item=item, person_id=person_id, person_name=display_name, fact=fact
+            )
             if stored_hash:
                 stored.append(stored_hash)
         if stored:
@@ -213,7 +217,9 @@ class PersonFactWritebackService:
         platform = str(item.platform or "").strip()
         return f"{platform}:{uid}" if platform else uid
 
-    async def _extract_facts(self, *, ctx: Any, person_name: str, user_text: str, assistant_text: str, item: PersonFactWritebackItem) -> List[str]:
+    async def _extract_facts(
+        self, *, ctx: Any, person_name: str, user_text: str, assistant_text: str, item: PersonFactWritebackItem
+    ) -> List[str]:
         prompt = self._build_prompt(
             person_name=person_name,
             user_text=self._truncate(user_text, self._max_evidence_chars()),
@@ -250,22 +256,20 @@ class PersonFactWritebackService:
     async def _complete(self, ctx: Any, prompt: str, item: PersonFactWritebackItem) -> str:
         bridge = getattr(ctx, "provider_bridge", None)
         provider_id = str(self._cfg("person_fact_writeback.chat_provider_id", "") or "").strip()
-        if bridge is not None and getattr(bridge, "enabled", False):
-            selected_bridge = bridge
-            if provider_id:
-                selected_bridge = AstrBotProviderBridge(
-                    astrbot_context=getattr(bridge, "_context", None),
-                    chat_provider_id=provider_id,
-                    embedding_provider_id=str(getattr(bridge, "embedding_provider_id", "") or ""),
-                )
-            return await selected_bridge.generate_text(
-                prompt,
-                temperature=float(self._cfg("person_fact_writeback.temperature", 0.1) or 0.1),
-                max_tokens=int(self._cfg("person_fact_writeback.max_tokens", 800) or 800),
-                unified_msg_origin=item.unified_msg_origin,
+        if bridge is None or not getattr(bridge, "enabled", False):
+            raise RuntimeError("AstrBot provider bridge is unavailable")
+        selected_bridge = bridge
+        if provider_id:
+            selected_bridge = AstrBotProviderBridge(
+                astrbot_context=getattr(bridge, "_context", None),
+                chat_provider_id=provider_id,
             )
-
-        return ""
+        return await selected_bridge.generate_text(
+            prompt,
+            temperature=float(self._cfg("person_fact_writeback.temperature", 0.1) or 0.1),
+            max_tokens=int(self._cfg("person_fact_writeback.max_tokens", 800) or 800),
+            unified_msg_origin=item.unified_msg_origin,
+        )
 
     @staticmethod
     def _parse_fact_list(raw: str) -> List[str]:

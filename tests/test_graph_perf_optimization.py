@@ -4,6 +4,7 @@
 - 瓶颈3：edge_predicates 缓存键用规范化小写，O(1) 查找匹配大小写不一的边
   （等价于旧的 O(E) 线性大小写扫描结果）
 """
+
 import sys
 import types
 from pathlib import Path
@@ -77,6 +78,7 @@ def test_get_graph_offloads_sync_to_thread():
     本断言读取源码，确保 to_thread 调用链不被退化回同步内联。
     """
     import inspect
+
     from memorix.webui import routes_compat as rc
 
     src = inspect.getsource(rc.MemorixServer)

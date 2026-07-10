@@ -24,8 +24,8 @@ def _install_astrbot_stub() -> None:
 
 _install_astrbot_stub()
 
-from astrbot_plugin_memorix.memorix.core.utils.person_profile_service import PersonProfileService  # noqa: E402
 from astrbot_plugin_memorix.memorix.core.storage.metadata_store import MetadataStore  # noqa: E402
+from astrbot_plugin_memorix.memorix.core.utils.person_profile_service import PersonProfileService  # noqa: E402
 from astrbot_plugin_memorix.memorix.services.person_fact_writeback_service import (  # noqa: E402
     PersonFactWritebackItem,
     PersonFactWritebackService,
