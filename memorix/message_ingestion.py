@@ -296,9 +296,7 @@ class MessageIngestionController:
         try:
             safe_paths = await copy_images_to_safe_dir(event)
             user_text = await self._format_event_text_for_memory(event, skip_image_caption=True)
-            self.plugin._spawn_background_task(
-                self._record_llm_response_background(event, text, user_text, safe_paths)
-            )
+            self.plugin._spawn_background_task(self._record_llm_response_background(event, text, user_text, safe_paths))
         except Exception as exc:
             logger.warning(
                 "[memorix] prepare LLM response failed: %s (%s)",

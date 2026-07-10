@@ -16,7 +16,11 @@ from astrbot_plugin_memorix.memorix.services.person_fact_writeback_service impor
     PersonFactWritebackItem,
     PersonFactWritebackService,
 )
-from astrbot_plugin_memorix.memorix.tools import MemorixIngestTextTool, _format_search_result_for_llm, build_memorix_tools
+from astrbot_plugin_memorix.memorix.tools import (
+    MemorixIngestTextTool,
+    _format_search_result_for_llm,
+    build_memorix_tools,
+)
 from astrbot_plugin_memorix.memorix.utils.profile_injection import build_profile_injection_text
 
 

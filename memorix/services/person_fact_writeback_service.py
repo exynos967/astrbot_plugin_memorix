@@ -133,7 +133,9 @@ class PersonFactWritebackService:
             return False
         if not assistant_text:
             return False
-        if MemoryContentRouter._looks_ephemeral(assistant_text) or MemoryContentRouter._looks_placeholder_only(assistant_text):
+        if MemoryContentRouter._looks_ephemeral(assistant_text) or MemoryContentRouter._looks_placeholder_only(
+            assistant_text
+        ):
             return False
         if not str(item.user_id or "").strip():
             return False
@@ -199,7 +201,9 @@ class PersonFactWritebackService:
 
         stored = []
         for fact in facts[: self._max_facts_per_turn()]:
-            stored_hash = await self._store_fact(ctx=ctx, item=item, person_id=person_id, person_name=display_name, fact=fact)
+            stored_hash = await self._store_fact(
+                ctx=ctx, item=item, person_id=person_id, person_name=display_name, fact=fact
+            )
             if stored_hash:
                 stored.append(stored_hash)
         if stored:
@@ -213,7 +217,9 @@ class PersonFactWritebackService:
         platform = str(item.platform or "").strip()
         return f"{platform}:{uid}" if platform else uid
 
-    async def _extract_facts(self, *, ctx: Any, person_name: str, user_text: str, assistant_text: str, item: PersonFactWritebackItem) -> List[str]:
+    async def _extract_facts(
+        self, *, ctx: Any, person_name: str, user_text: str, assistant_text: str, item: PersonFactWritebackItem
+    ) -> List[str]:
         prompt = self._build_prompt(
             person_name=person_name,
             user_text=self._truncate(user_text, self._max_evidence_chars()),

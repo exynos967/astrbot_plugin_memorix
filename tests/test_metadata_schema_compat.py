@@ -550,10 +550,7 @@ def test_v8_legacy_db_migrates_to_current_schema(tmp_path):
 
     after = sqlite3.connect(db_path)
     try:
-        tables = {
-            row[0]
-            for row in after.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-        }
+        tables = {row[0] for row in after.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         for table in _VNEXT_TABLES:
             assert table in tables, f"迁移后缺失 vNext 表: {table}"
 
@@ -714,15 +711,11 @@ def test_schema_13_db_runtime_auto_migrates_to_15(tmp_path):
     store.connect()
     try:
         assert store.get_schema_version() == 15
-        tables = {
-            row[0]
-            for row in store._conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-        }
+        tables = {row[0] for row in store._conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         assert "memory_fuzzy_modify_plans" in tables
 
         stale_columns = {
-            row[1]
-            for row in store._conn.execute("PRAGMA table_info(paragraph_stale_relation_marks)").fetchall()
+            row[1] for row in store._conn.execute("PRAGMA table_info(paragraph_stale_relation_marks)").fetchall()
         }
         assert {"source_type", "source_id", "source_operation_id"} <= stale_columns
 

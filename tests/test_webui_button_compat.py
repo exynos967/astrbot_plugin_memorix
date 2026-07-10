@@ -36,9 +36,11 @@ def _install_astrbot_stub() -> None:
 
 _install_astrbot_stub()
 
-from astrbot_plugin_memorix.memorix.amemorix.routers import v1_router
-from astrbot_plugin_memorix.memorix.webui.plugin_page_bridge import _WebV1TaskManager
-from astrbot_plugin_memorix.memorix.webui.plugin_page_bridge import PluginPageWebUIBridge
+from astrbot_plugin_memorix.memorix.amemorix.routers import v1_router  # noqa: E402
+from astrbot_plugin_memorix.memorix.webui.plugin_page_bridge import (  # noqa: E402
+    PluginPageWebUIBridge,
+    _WebV1TaskManager,
+)
 
 
 class _FakeMetadataStore:
@@ -132,9 +134,7 @@ def test_webui_import_button_prefers_native_import_manager():
     manager = _WebV1TaskManager(ctx, import_task_manager=native_import_manager)
 
     result = asyncio.run(
-        manager.enqueue_import_task(
-            {"mode": "text", "payload": "hello", "options": {"source": "manual-source"}}
-        )
+        manager.enqueue_import_task({"mode": "text", "payload": "hello", "options": {"source": "manual-source"}})
     )
 
     assert result["task_id"] == "native-paste"

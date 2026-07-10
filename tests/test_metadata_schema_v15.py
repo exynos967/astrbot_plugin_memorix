@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import sqlite3
-
 from astrbot_plugin_memorix.memorix.core.storage.metadata_store import (
-    MetadataStore,
     SCHEMA_VERSION,
+    MetadataStore,
 )
 
 
@@ -20,16 +18,10 @@ def test_fuzzy_modify_plans_table_and_indexes_exist(tmp_path) -> None:
     try:
         conn = store._conn
         assert conn is not None
-        tables = {
-            row[0]
-            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-        }
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         assert "memory_fuzzy_modify_plans" in tables
 
-        indexes = {
-            row[0]
-            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()
-        }
+        indexes = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()}
         assert "idx_memory_fuzzy_modify_plans_created" in indexes
         assert "idx_memory_fuzzy_modify_plans_status_updated" in indexes
         assert "idx_memory_fuzzy_modify_plans_target" in indexes
@@ -43,8 +35,7 @@ def test_paragraph_stale_relation_marks_has_source_columns(tmp_path) -> None:
     store.connect()
     try:
         columns = {
-            row[1]
-            for row in store._conn.execute("PRAGMA table_info(paragraph_stale_relation_marks)").fetchall()
+            row[1] for row in store._conn.execute("PRAGMA table_info(paragraph_stale_relation_marks)").fetchall()
         }
         assert {"source_type", "source_id", "source_operation_id"} <= columns
     finally:
