@@ -212,6 +212,48 @@ def test_plugin_registers_and_removes_llm_tools():
     assert ctx.removed == [tool.name for tool in ctx.added]
 
 
+def test_remove_llm_tools_tolerates_missing_manager():
+    context = SimpleNamespace()
+    plugin = MemorixPlugin(context, {"scope": {"mode": "group_global"}})
+    plugin._llm_tools = [SimpleNamespace(name="search_memory")]
+
+    plugin._remove_llm_tools()
+
+    assert plugin._llm_tools == []
+
+
+def test_terminate_handles_asyncio_timeout(monkeypatch):
+    plugin = MemorixPlugin(DummyContext(), {"scope": {"mode": "group_global"}})
+    plugin._remove_llm_tools = lambda: None
+    closed: list[str] = []
+
+    async def _close(name: str) -> None:
+        closed.append(name)
+
+    plugin.person_fact_writeback_service = SimpleNamespace(close=lambda: _close("person"))
+    plugin.webui_page_bridge = SimpleNamespace(close=lambda: _close("webui"))
+    plugin.feedback_service = SimpleNamespace(stop_background_loops=lambda: _close("feedback"))
+    plugin.admin_service = SimpleNamespace(close=lambda: _close("admin"))
+    plugin.runtime_manager = SimpleNamespace(close_all=lambda: _close("runtime"))
+
+    async def _raise_timeout(awaitable, *, timeout):
+        del timeout
+        awaitable.cancel()
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr(asyncio, "wait_for", _raise_timeout)
+
+    async def _run() -> None:
+        task = asyncio.create_task(asyncio.sleep(60))
+        plugin._background_tasks.add(task)
+        await plugin.terminate()
+        await asyncio.sleep(0)
+        assert task.cancelled()
+
+    asyncio.run(_run())
+    assert closed == ["person", "webui", "feedback", "admin", "runtime"]
+
+
 def test_provider_bridge_uses_current_astrbot_context_api():
     class _Provider:
         def meta(self):

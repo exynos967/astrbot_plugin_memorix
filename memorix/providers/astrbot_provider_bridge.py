@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional, Tuple
 
 
 def _extract_provider_id(provider: Any) -> str:
+    """Read the ID from AstrBot's Provider.meta() contract."""
     if provider is None:
         return ""
     return str(provider.meta().id or "").strip()

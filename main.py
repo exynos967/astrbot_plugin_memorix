@@ -99,7 +99,7 @@ class MemorixPlugin(Star):
         if pending:
             try:
                 await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=5.0)
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 for task in pending:
                     task.cancel()
         await self._close_component("person fact writeback", self.person_fact_writeback_service.close)
@@ -117,14 +117,29 @@ class MemorixPlugin(Star):
             logger.warning("[memorix] close %s failed", name, exc_info=True)
 
     def _remove_llm_tools(self) -> None:
-        tool_manager = self.context.get_llm_tool_manager()
-        remove_func = tool_manager.remove_func
-        for tool in self._llm_tools:
+        tools, self._llm_tools = self._llm_tools, []
+        if not tools:
+            return
+
+        get_tool_manager = getattr(self.context, "get_llm_tool_manager", None)
+        if not callable(get_tool_manager):
+            logger.warning("[memorix] LLM tool manager is unavailable during cleanup")
+            return
+        try:
+            tool_manager = get_tool_manager()
+        except Exception:
+            logger.warning("[memorix] get LLM tool manager failed during cleanup", exc_info=True)
+            return
+
+        remove_func = getattr(tool_manager, "remove_func", None)
+        if not callable(remove_func):
+            logger.warning("[memorix] LLM tool manager does not provide remove_func")
+            return
+        for tool in tools:
             try:
                 remove_func(tool.name)
             except Exception:
                 logger.warning("[memorix] remove LLM tool failed: %s", tool.name, exc_info=True)
-        self._llm_tools = []
 
     def _resolve_scope(self, event: AstrMessageEvent) -> str:
         return self.scope_router.resolve(event)
