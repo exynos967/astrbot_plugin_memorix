@@ -484,6 +484,38 @@ _VNEXT_TABLES = (
 )
 
 
+def test_v8_schema_error_points_to_existing_migration_script(tmp_path):
+    """v8 旧库的报错应给出可直接执行的实际迁移脚本。"""
+
+    db_path = tmp_path / "metadata.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at REAL NOT NULL);
+        INSERT INTO schema_migrations(version, applied_at) VALUES (8, 1.0);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = MetadataStore(tmp_path)
+    try:
+        with pytest.raises(RuntimeError) as exc_info:
+            store.connect()
+    finally:
+        store.close()
+
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "scripts" / "migrate_schema_v8_to_v13.py"
+    message = str(exc_info.value)
+
+    assert "current=8" in message
+    assert f"expected={SCHEMA_VERSION}" in message
+    assert script.is_file()
+    assert f'"{sys.executable}" "{script}" --db "{db_path}"' in message
+    assert "release_vnext_migrate.py" not in message
+
+
 @pytest.mark.skipif(SCHEMA_VERSION < 13, reason="vendored core 未升级到 2.0.0 (SCHEMA_VERSION>=13)")
 def test_v8_legacy_db_migrates_to_current_schema(tmp_path):
     """模拟历史 v8 库，离线迁移后应出现全部 vNext 表且老数据保留。"""
