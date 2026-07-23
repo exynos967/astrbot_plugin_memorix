@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import AppShell from "@/components/shell/AppShell.vue";
 import CandidateMenu from "@/components/common/CandidateMenu.vue";
+import ConfirmDialog from "@/components/common/ConfirmDialog.vue";
 import { useTheme } from "@/composables/useTheme";
 import { useAppStore } from "@/stores/app";
 
@@ -15,6 +16,9 @@ const app = useAppStore();
 
   <!-- 全局候选菜单（单例，teleport 到 body；修 H8 内部滚动链） -->
   <CandidateMenu />
+
+  <!-- sandbox iframe 禁用原生 confirm，破坏性操作统一使用页面内确认弹窗 -->
+  <ConfirmDialog />
 
   <!-- 全局错误 toast：修复 legacy 多处 catch 静默吞错 -->
   <div class="error-toast-stack" aria-live="polite">

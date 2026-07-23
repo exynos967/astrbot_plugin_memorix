@@ -6,6 +6,7 @@ from astrbot_plugin_memorix.memorix.webui.plugin_page_bridge import PluginPageWe
 
 ROOT = Path(__file__).resolve().parents[1]
 VUE_PAGE = ROOT / "pages" / "memorix" / "index.html"
+FRONTEND_SRC = ROOT / "frontend" / "src"
 
 
 def test_plugin_page_embeds_dashboard_bridge() -> None:
@@ -46,6 +47,28 @@ def test_plugin_page_assets_exist() -> None:
     for ref in refs:
         asset = VUE_PAGE.parent / ref
         assert asset.exists(), f"产物引用的资源缺失：{ref}"
+
+
+def test_plugin_page_avoids_sandbox_blocked_native_modals() -> None:
+    """AstrBot sandbox 未开放 allow-modals，源码和发布产物不得调用原生弹窗。"""
+
+    pattern = re.compile(r"window\.(?:alert|confirm|prompt)\s*\(")
+    source_offenders = []
+    for source in FRONTEND_SRC.rglob("*"):
+        if source.suffix not in {".ts", ".vue"}:
+            continue
+        if pattern.search(source.read_text(encoding="utf-8")):
+            source_offenders.append(source.relative_to(ROOT).as_posix())
+
+    assert not source_offenders, f"源码仍调用 sandbox 禁止的原生弹窗：{source_offenders}"
+
+    assets_dir = VUE_PAGE.parent / "assets"
+    bundle_offenders = []
+    for bundle in assets_dir.glob("*.js"):
+        if pattern.search(bundle.read_text(encoding="utf-8")):
+            bundle_offenders.append(bundle.name)
+
+    assert not bundle_offenders, f"发布产物仍调用 sandbox 禁止的原生弹窗：{bundle_offenders}"
 
 
 def test_plugin_page_single_bundle_no_subchunks() -> None:

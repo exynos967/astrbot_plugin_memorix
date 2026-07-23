@@ -200,7 +200,13 @@ async function onRename(): Promise<void> {
 async function onRemoveNode(): Promise<void> {
   const id = selectedNode.value;
   if (!id) return;
-  if (!window.confirm(`删除节点 ${id}？`)) return;
+  const confirmed = await app.requestConfirmation({
+    title: "删除节点",
+    message: `确定删除节点 ${id}？相关图谱关系也可能受到影响。`,
+    confirmText: "删除",
+    danger: true,
+  });
+  if (!confirmed) return;
   const ok = await store.removeNode(id);
   if (ok) {
     await store.loadGraph();
@@ -224,7 +230,13 @@ function onFocusNode(): void {
 async function onRemoveEdge(): Promise<void> {
   const edge = currentEdge.value;
   if (!edge) return;
-  if (!window.confirm(`删除关系 ${edge.from} → ${edge.to}？`)) return;
+  const confirmed = await app.requestConfirmation({
+    title: "删除关系",
+    message: `确定删除关系 ${edge.from} → ${edge.to}？`,
+    confirmText: "删除",
+    danger: true,
+  });
+  if (!confirmed) return;
   const ok = await store.removeEdge(edge.from, edge.to);
   if (ok) {
     await store.loadGraph();

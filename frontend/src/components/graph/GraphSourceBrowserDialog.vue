@@ -56,7 +56,13 @@ function focusSource(source: string): void {
 /** 删除来源：确认后调 batchDeleteSource，成功重新拉取列表。 */
 async function deleteSource(source: string): Promise<void> {
   if (!source) return;
-  if (!window.confirm(`删除 source ${source}？`)) return;
+  const confirmed = await app.requestConfirmation({
+    title: "删除来源",
+    message: `确定删除 source ${source} 及其关联数据？`,
+    confirmText: "删除",
+    danger: true,
+  });
+  if (!confirmed) return;
   try {
     const res = await batchDeleteSource(source);
     logs.log(`source 已删除: ${source}（count=${res.count ?? 0}）`);

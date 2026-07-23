@@ -69,7 +69,14 @@ export const useSourcesStore = defineStore("sources", () => {
   }
 
   async function removeSource(source: string): Promise<boolean> {
-    if (!source || !window.confirm(`删除 source ${source}？`)) return false;
+    if (!source) return false;
+    const confirmed = await app.requestConfirmation({
+      title: "删除来源",
+      message: `确定删除 source ${source} 及其关联数据？`,
+      confirmText: "删除",
+      danger: true,
+    });
+    if (!confirmed) return false;
     deleting.value = true;
     try {
       const data = await batchDeleteApi(source);
@@ -85,7 +92,14 @@ export const useSourcesStore = defineStore("sources", () => {
   }
 
   async function removeParagraph(hash: string): Promise<boolean> {
-    if (!hash || !window.confirm("删除该段落？")) return false;
+    if (!hash) return false;
+    const confirmed = await app.requestConfirmation({
+      title: "删除段落",
+      message: "确定删除该段落？相关图谱关系可能被同步剪枝。",
+      confirmText: "删除",
+      danger: true,
+    });
+    if (!confirmed) return false;
     deleting.value = true;
     try {
       const data = await deleteParagraphApi(hash, graph.effectiveScope());
