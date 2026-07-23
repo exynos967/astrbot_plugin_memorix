@@ -111,7 +111,14 @@ export const useEpisodeStore = defineStore("episode", () => {
 
   /** 删除 episode 关联的某段落（episode 详情内）。 */
   async function removeParagraph(hash: string): Promise<boolean> {
-    if (!hash || !window.confirm("删除该段落？")) return false;
+    if (!hash) return false;
+    const confirmed = await app.requestConfirmation({
+      title: "删除段落",
+      message: "确定删除该段落？相关图谱关系可能被同步剪枝。",
+      confirmText: "删除",
+      danger: true,
+    });
+    if (!confirmed) return false;
     deleting.value = true;
     try {
       const data = await deleteParagraphApi(hash, graph.effectiveScope());

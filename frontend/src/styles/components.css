@@ -592,6 +592,32 @@ html[data-theme="dark"] .textarea::placeholder {
   color: rgba(148, 163, 184, 0.72);
 }
 
+html[data-theme="dark"] .btn.primary,
+html[data-theme="dark"] .btn.active {
+  color: #ffffff;
+  border-color: var(--accent);
+  background: var(--accent);
+}
+
+html[data-theme="dark"] .btn.primary:hover,
+html[data-theme="dark"] .btn.active:hover {
+  color: #ffffff;
+  border-color: var(--accent-strong);
+  background: var(--accent-strong);
+}
+
+html[data-theme="dark"] .btn.danger {
+  color: #ffffff;
+  border-color: var(--red);
+  background: var(--red);
+}
+
+html[data-theme="dark"] .btn.danger:hover {
+  color: #ffffff;
+  border-color: #ef4444;
+  background: #ef4444;
+}
+
 .tag {
   display: inline-flex;
   align-items: center;

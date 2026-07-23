@@ -8,15 +8,28 @@ export interface AppError {
   at: number;
 }
 
+export interface ConfirmationRequest {
+  title: string;
+  message: string;
+  confirmText: string;
+  cancelText: string;
+  danger: boolean;
+}
+
+export type ConfirmationOptions = Pick<ConfirmationRequest, "title" | "message"> &
+  Partial<Pick<ConfirmationRequest, "confirmText" | "cancelText" | "danger">>;
+
 /**
- * 应用级 store：错误总线 + 跨 view 临时状态。
- * P0 最小骨架：错误总线（push/clear/dismiss）。修复 legacy 多处 catch 静默吞错——
- * 各 service 失败时 push 到此总线，由全局 toast 组件统一展示。
+ * 应用级 store：错误总线 + 页面内确认弹窗状态。
+ * 各 service 失败时 push 到错误总线，由全局 toast 组件统一展示；破坏性操作通过
+ * requestConfirmation 返回 Promise，避免 sandbox iframe 禁止浏览器原生 confirm。
  * currentTaskId / configPersist* 等字段随对应 view 阶段补齐（YAGNI，不预建）。
  */
 export const useAppStore = defineStore("app", () => {
   const errors = ref<AppError[]>([]);
+  const confirmation = ref<ConfirmationRequest | null>(null);
   let seq = 0;
+  let confirmationResolver: ((confirmed: boolean) => void) | null = null;
   // 上限：超过则丢弃最旧，防止轮询失败等高频错误无限堆积。
   const MAX_ERRORS = 20;
 
@@ -47,5 +60,36 @@ export const useAppStore = defineStore("app", () => {
     errors.value = [];
   }
 
-  return { errors, pushError, dismiss, clear };
+  function requestConfirmation(options: ConfirmationOptions): Promise<boolean> {
+    if (confirmationResolver) resolveConfirmation(false);
+
+    confirmation.value = {
+      title: options.title,
+      message: options.message,
+      confirmText: options.confirmText || "确认",
+      cancelText: options.cancelText || "取消",
+      danger: options.danger ?? false,
+    };
+
+    return new Promise<boolean>((resolve) => {
+      confirmationResolver = resolve;
+    });
+  }
+
+  function resolveConfirmation(confirmed: boolean): void {
+    const resolve = confirmationResolver;
+    confirmationResolver = null;
+    confirmation.value = null;
+    resolve?.(confirmed);
+  }
+
+  return {
+    errors,
+    confirmation,
+    pushError,
+    dismiss,
+    clear,
+    requestConfirmation,
+    resolveConfirmation,
+  };
 });

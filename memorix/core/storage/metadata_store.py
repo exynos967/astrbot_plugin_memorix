@@ -8,6 +8,7 @@ import json
 import pickle
 import re
 import sqlite3
+import sys
 import time
 import uuid
 from datetime import datetime
@@ -44,6 +45,7 @@ logger = get_logger("A_Memorix.MetadataStore")
 SCHEMA_VERSION = 15
 RUNTIME_AUTO_MIGRATION_MIN_SCHEMA_VERSION = 9
 DEFAULT_MIGRATION_BATCH_SIZE = 2000
+SCHEMA_MIGRATION_SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "migrate_schema_v8_to_v13.py"
 
 
 def _normalize_legacy_knowledge_type(row: Tuple[str, str, Any]) -> Tuple[str, str]:
@@ -157,6 +159,7 @@ class MetadataStore:
 
     def _assert_schema_compatible(self, db_existed: bool) -> None:
         """运行时执行 post-1.0 自动迁移；legacy/vNext 仍要求离线迁移。"""
+        migration_command = f'"{sys.executable}" "{SCHEMA_MIGRATION_SCRIPT}" --db "{self._db_path}"'
         cursor = self._conn.cursor()
         cursor.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
@@ -166,7 +169,7 @@ class MetadataStore:
             if db_existed:
                 raise RuntimeError(
                     "检测到旧版 metadata schema（缺少 schema_migrations）。"
-                    " 请先执行 scripts/release_vnext_migrate.py migrate。"
+                    f" 请停止插件后执行离线迁移：{migration_command}"
                 )
             return
 
@@ -181,7 +184,7 @@ class MetadataStore:
         if version != SCHEMA_VERSION:
             raise RuntimeError(
                 f"metadata schema 版本不匹配: current={version}, expected={SCHEMA_VERSION}。"
-                " 请执行 scripts/release_vnext_migrate.py migrate。"
+                f" 请停止插件后执行离线迁移：{migration_command}"
             )
 
     def _run_runtime_auto_migration(self, *, current_version: int) -> None:
