@@ -2,13 +2,28 @@
 // 侧栏导航：渲染 NAV_ITEMS，高亮当前路由。
 // 从 legacy nav（index.html 行 2024-2041）迁移，改用 vue-router 而非 data-view 手动切换。
 import { RouterLink } from "vue-router";
+import { storeToRefs } from "pinia";
 import { NAV_ITEMS } from "@/router";
+import { useUiStore } from "@/stores/ui";
+
+const ui = useUiStore();
+const { sidebarCollapsed } = storeToRefs(ui);
 </script>
 
 <template>
-  <aside class="sidebar">
+  <aside class="sidebar" :class="{ collapsed: sidebarCollapsed }">
     <div class="brand">
       <span class="brand-fallback">Memorix</span>
+      <button
+        class="sidebar-toggle"
+        type="button"
+        :title="sidebarCollapsed ? '展开侧栏' : '折叠侧栏'"
+        :aria-label="sidebarCollapsed ? '展开侧栏' : '折叠侧栏'"
+        :aria-expanded="!sidebarCollapsed"
+        @click="ui.toggleSidebar()"
+      >
+        {{ sidebarCollapsed ? "›" : "‹" }}
+      </button>
     </div>
     <nav class="nav">
       <RouterLink
@@ -17,9 +32,11 @@ import { NAV_ITEMS } from "@/router";
         :to="item.path"
         class="nav-btn"
         active-class="active"
+        :title="sidebarCollapsed ? item.label : undefined"
+        :aria-label="item.label"
       >
         <span class="nav-icon">{{ item.icon }}</span>
-        <span>{{ item.label }}</span>
+        <span class="nav-label">{{ item.label }}</span>
       </RouterLink>
     </nav>
   </aside>
@@ -36,17 +53,59 @@ import { NAV_ITEMS } from "@/router";
   background: var(--nav);
   backdrop-filter: var(--blur);
   border-right: 1px solid var(--hairline);
+  transition: width 0.2s ease, padding 0.2s ease;
+}
+
+.sidebar.collapsed {
+  width: 72px;
+  padding-inline: 10px;
 }
 
 .brand {
-  display: grid;
-  place-items: center;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
   height: 44px;
+  padding: 0 8px;
   border-radius: var(--radius-md);
   background: var(--nav-soft);
   font-weight: 700;
   color: var(--accent-ink);
   letter-spacing: 1px;
+}
+
+.sidebar.collapsed .brand {
+  justify-content: center;
+  padding: 0;
+}
+
+.sidebar.collapsed .brand-fallback,
+.sidebar.collapsed .nav-label {
+  display: none;
+}
+
+.sidebar-toggle {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid var(--hairline);
+  border-radius: 9px;
+  color: var(--accent-strong);
+  background: var(--surface-strong);
+  cursor: pointer;
+  flex: 0 0 auto;
+  font-size: 18px;
+  line-height: 1;
+}
+
+.sidebar-toggle:hover,
+.sidebar-toggle:focus-visible {
+  border-color: var(--hairline-strong);
+  background: var(--accent-soft);
+  outline: none;
 }
 
 .nav {
@@ -66,6 +125,11 @@ import { NAV_ITEMS } from "@/router";
   text-decoration: none;
   font-size: 14px;
   transition: background 0.15s, color 0.15s;
+}
+
+.sidebar.collapsed .nav-btn {
+  justify-content: center;
+  padding-inline: 8px;
 }
 
 .nav-btn:hover {

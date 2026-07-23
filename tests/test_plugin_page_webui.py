@@ -7,6 +7,7 @@ from astrbot_plugin_memorix.memorix.webui.plugin_page_bridge import PluginPageWe
 ROOT = Path(__file__).resolve().parents[1]
 VUE_PAGE = ROOT / "pages" / "memorix" / "index.html"
 FRONTEND_SRC = ROOT / "frontend" / "src"
+SIDEBAR_SOURCE = FRONTEND_SRC / "components" / "shell" / "Sidebar.vue"
 
 
 def test_plugin_page_embeds_dashboard_bridge() -> None:
@@ -69,6 +70,22 @@ def test_plugin_page_avoids_sandbox_blocked_native_modals() -> None:
             bundle_offenders.append(bundle.name)
 
     assert not bundle_offenders, f"发布产物仍调用 sandbox 禁止的原生弹窗：{bundle_offenders}"
+
+
+def test_plugin_page_sidebar_is_collapsible() -> None:
+    """侧栏应提供可访问的折叠控件，且发布产物包含对应交互。"""
+
+    source = SIDEBAR_SOURCE.read_text(encoding="utf-8")
+    assert "sidebarCollapsed" in source
+    assert 'aria-expanded="!sidebarCollapsed"' in source
+    assert "ui.toggleSidebar()" in source
+
+    assets_dir = VUE_PAGE.parent / "assets"
+    bundles = list(assets_dir.glob("*.js"))
+    assert bundles, "memorix/assets 下无 JS bundle"
+    bundle_text = "\n".join(bundle.read_text(encoding="utf-8") for bundle in bundles)
+    assert "展开侧栏" in bundle_text
+    assert "折叠侧栏" in bundle_text
 
 
 def test_plugin_page_single_bundle_no_subchunks() -> None:

@@ -10,9 +10,10 @@ const UI_PREFS_KEY = "memorix.webui.ui_prefs";
 interface UiPrefs {
   theme: UiTheme;
   effects: UiEffects;
+  sidebarCollapsed: boolean;
 }
 
-const DEFAULT_PREFS: UiPrefs = { theme: "auto", effects: "glass" };
+const DEFAULT_PREFS: UiPrefs = { theme: "auto", effects: "glass", sidebarCollapsed: false };
 
 /**
  * UI 偏好 store：主题/特效 + localStorage 持久化。
@@ -24,12 +25,20 @@ export const useUiStore = defineStore("ui", () => {
   // 容错：旧数据可能缺少字段
   if (!prefs.value.theme) prefs.value.theme = DEFAULT_PREFS.theme;
   if (!prefs.value.effects) prefs.value.effects = DEFAULT_PREFS.effects;
+  if (typeof prefs.value.sidebarCollapsed !== "boolean") {
+    prefs.value.sidebarCollapsed = DEFAULT_PREFS.sidebarCollapsed;
+  }
 
   const theme = ref<UiTheme>(prefs.value.theme);
   const effects = ref<UiEffects>(prefs.value.effects);
+  const sidebarCollapsed = ref(prefs.value.sidebarCollapsed);
 
   function persist(): void {
-    writeJSON(UI_PREFS_KEY, { theme: theme.value, effects: effects.value });
+    writeJSON(UI_PREFS_KEY, {
+      theme: theme.value,
+      effects: effects.value,
+      sidebarCollapsed: sidebarCollapsed.value,
+    });
   }
 
   function setTheme(next: UiTheme): void {
@@ -42,5 +51,18 @@ export const useUiStore = defineStore("ui", () => {
     persist();
   }
 
-  return { theme, effects, setTheme, setEffects, persist };
+  function toggleSidebar(): void {
+    sidebarCollapsed.value = !sidebarCollapsed.value;
+    persist();
+  }
+
+  return {
+    theme,
+    effects,
+    sidebarCollapsed,
+    setTheme,
+    setEffects,
+    toggleSidebar,
+    persist,
+  };
 });
