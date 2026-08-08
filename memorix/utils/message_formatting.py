@@ -473,12 +473,16 @@ async def enrich_text_with_captions(
     """Replace [图片] placeholders with vision API captions in background task."""
     if not safe_paths:
         return text
+    opts = message_format_options_from_config(config)
+    if not opts.include_image_caption:
+        for p in safe_paths:
+            _remove_quiet(p)
+        return text
     provider = resolve_vision_provider(context, config, event)
     if provider is None:
         for p in safe_paths:
             _remove_quiet(p)
         return text
-    opts = message_format_options_from_config(config)
     max_count = max(0, int(opts.image_caption_max_count))
     captioned = 0
     current = text
