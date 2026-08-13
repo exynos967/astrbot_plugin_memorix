@@ -235,6 +235,7 @@ class PluginPageWebUIBridge:
         self.admin_service = admin_service
         self._apps: Dict[str, _EmbeddedWebUIApp] = {}
         self._lock = asyncio.Lock()
+        self._closing = False
 
     def register(self, context: Any, *, plugin_name: str) -> None:
         register_web_api = getattr(context, "register_web_api", None)
@@ -250,6 +251,7 @@ class PluginPageWebUIBridge:
         )
 
     async def close(self) -> None:
+        self._closing = True
         apps = list(self._apps.values())
         self._apps.clear()
         for app in apps:
@@ -394,11 +396,15 @@ class PluginPageWebUIBridge:
         return urlunsplit(("", "", path, parts.query, ""))
 
     async def _get_app(self, scope_key: str) -> _EmbeddedWebUIApp:
+        if self._closing:
+            raise RuntimeError("Memorix WebUI bridge is closing")
         cached = self._apps.get(scope_key)
         if cached is not None:
             return cached
 
         async with self._lock:
+            if self._closing:
+                raise RuntimeError("Memorix WebUI bridge is closing")
             cached = self._apps.get(scope_key)
             if cached is not None:
                 return cached

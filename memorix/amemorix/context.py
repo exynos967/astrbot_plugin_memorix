@@ -211,6 +211,15 @@ class AppContext:
             logger.warning("Save on close failed: %s", exc)
 
         try:
+            closer = getattr(self.embedding_manager, "close", None)
+            if callable(closer):
+                result = closer()
+                if asyncio.iscoroutine(result):
+                    await result
+        except Exception as exc:
+            logger.warning("Embedding close failed: %s", exc)
+
+        try:
             self.metadata_store.close()
         except Exception as exc:
             logger.warning("Metadata close failed: %s", exc)

@@ -328,6 +328,11 @@ class MessageIngestionController:
                     self.plugin._event_ctx_text(event, adapted.scope_key),
                 )
                 return
+            if self.plugin._bool_cfg(
+                self.plugin.config, "ingest.skip_command_messages", True
+            ) and self._is_command_message(user_text):
+                logger.debug("[memorix] skip command LLM response %s", self.plugin._event_ctx_text(event))
+                return
             ingested = await self._ingest_event_message(event, "assistant", text)
             if not ingested:
                 return

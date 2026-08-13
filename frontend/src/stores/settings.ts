@@ -9,6 +9,7 @@ import {
 import { CONFIG_FIELDS, fieldValue } from "@/utils/configFields";
 import { useAppStore } from "@/stores/app";
 import { useDashboardStore } from "@/stores/dashboard";
+import { useGraphStore } from "@/stores/graph";
 import { useLogsStore } from "@/stores/logs";
 import { errText } from "@/utils/error";
 
@@ -37,6 +38,7 @@ export const useSettingsStore = defineStore("settings", () => {
 
   const app = useAppStore();
   const dashboard = useDashboardStore();
+  const graph = useGraphStore();
   const logs = useLogsStore();
 
   /** 从后端配置初始化表单（legacy renderConfigForm 的数据准备）。 */
@@ -72,7 +74,7 @@ export const useSettingsStore = defineStore("settings", () => {
   async function saveRuntime(): Promise<boolean> {
     saving.value = true;
     try {
-      const result = await patchRuntimeConfig({ updates: collectUpdates(), persist: false });
+      const result = await patchRuntimeConfig({ updates: collectUpdates(), persist: false }, graph.effectiveScope());
       if (result.config) rawConfig.value = result.config;
       autoSaveEnabled.value = !!result.auto_save_enabled;
       logs.log("运行配置已更新", "info");
@@ -89,7 +91,7 @@ export const useSettingsStore = defineStore("settings", () => {
   async function persistConfig(): Promise<boolean> {
     saving.value = true;
     try {
-      const result = await patchRuntimeConfig({ updates: collectUpdates(), persist: true });
+      const result = await patchRuntimeConfig({ updates: collectUpdates(), persist: true }, graph.effectiveScope());
       if (result.config) rawConfig.value = result.config;
       // 后端不持久化 → 显式告知用户，而非静默假装成功。
       app.pushError(result.persist_message || "当前 WebUI 不支持写回配置文件，请在 AstrBot 插件配置页持久化", "persistConfig");
@@ -105,7 +107,7 @@ export const useSettingsStore = defineStore("settings", () => {
   /** 开关自动保存。 */
   async function toggleAutoSave(enabled: boolean): Promise<boolean> {
     try {
-      const result = await setAutoSaveApi(enabled);
+      const result = await setAutoSaveApi(enabled, graph.effectiveScope());
       autoSaveEnabled.value = !!result.auto_save_enabled;
       logs.log(enabled ? "自动保存已开启" : "自动保存已关闭", "info");
       return true;
@@ -118,7 +120,7 @@ export const useSettingsStore = defineStore("settings", () => {
   /** 手动保存所有 store 到磁盘。 */
   async function manualSaveAll(): Promise<boolean> {
     try {
-      const result = await manualSave();
+      const result = await manualSave(graph.effectiveScope());
       logs.log(`手动保存完成：${result.saved?.join(", ") || "无"}`, "info");
       return true;
     } catch (err) {

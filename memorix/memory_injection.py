@@ -240,10 +240,13 @@ class MemoryInjectionController:
         )
 
     def _memory_injection_query_text(self, event: AstrMessageEvent, request) -> str:
+        event_text = str(getattr(event, "message_str", "") or "").strip()
+        if event_text and self.plugin._is_command_message(event_text):
+            return event_text
         prompt = str(getattr(request, "prompt", "") or "").strip()
         if prompt and prompt != "<attachment>":
             return prompt
-        return str(getattr(event, "message_str", "") or "").strip()
+        return event_text
 
     @staticmethod
     def _content_part_text(part) -> str:
@@ -377,6 +380,8 @@ class MemoryInjectionController:
         return f"【长期记忆-自动检索】\n{self._truncate_reference_text(formatted, MEMORY_INJECTION_MAX_CHARS)}"
 
     async def _build_llm_memory_injection_block(self, event: AstrMessageEvent, request) -> str:
+        if self.plugin._is_cron_event(event):
+            return ""
         adapted = AstrbotEventAdapter.from_event(event, self.plugin._resolve_scope(event))
         if not await self.plugin._is_adapted_chat_enabled(adapted, adapted.sender_id):
             logger.debug(
@@ -410,9 +415,19 @@ class MemoryInjectionController:
         )
 
     async def inject(self, event: AstrMessageEvent, request: "ProviderRequest") -> None:
+        if self.plugin._is_cron_event(event):
+            return
         if self._request_already_has_injection(request):
             return
-        injection_block = await self._build_llm_memory_injection_block(event, request)
+        try:
+            injection_block = await self._build_llm_memory_injection_block(event, request)
+        except Exception:
+            logger.warning(
+                "[memorix] memory injection failed %s",
+                self.plugin._event_ctx_text(event),
+                exc_info=True,
+            )
+            return
         if not injection_block:
             return
         self._append_injection_to_user_content(request, injection_block)

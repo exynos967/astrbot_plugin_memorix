@@ -13,6 +13,7 @@ from typing import Any, Dict, Iterable, Optional
 from ..amemorix.services import DeleteService, PersonProfileApiService
 from ..amemorix.services import MemoryService as BaseMemoryService
 from ..amemorix.services.import_task_manager import ImportTaskManager
+from ..amemorix.settings import mask_sensitive
 from ..app_context import ScopeRuntimeManager
 from ..core.utils.retrieval_tuning_manager import RetrievalTuningManager
 from ..core.utils.runtime_self_check import ensure_runtime_self_check
@@ -258,9 +259,10 @@ class AdminService:
             await ctx.save_all()
             return {"success": True, "saved": True, "data_dir": str(ctx.data_dir)}
         if act == "get_config":
+            raw_config = ctx.config if isinstance(ctx.config, dict) else {}
             return {
                 "success": True,
-                "config": ctx.config,
+                "config": mask_sensitive(raw_config),
                 "data_dir": str(ctx.data_dir),
                 "auto_save": bool(ctx.get_config("advanced.enable_auto_save", True)),
                 "runtime_ready": True,

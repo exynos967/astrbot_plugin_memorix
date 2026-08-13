@@ -9,7 +9,7 @@
 图谱 + 向量混合检索 · 记忆生命周期管理 · 人物画像 · 总结导入 · 内嵌 WebUI
 
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16-blue)](https://github.com/Soulter/AstrBot)
-[![Version](https://img.shields.io/badge/version-v1.1.0-green)]()
+[![Version](https://img.shields.io/badge/version-v1.1.1-green)]()
 [![Platforms](https://img.shields.io/badge/platforms-QQ%20%7C%20Telegram%20%7C%20Discord-orange)]()
 
 </div>

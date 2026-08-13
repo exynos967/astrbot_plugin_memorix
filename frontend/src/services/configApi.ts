@@ -131,29 +131,30 @@ export function fetchDashboardStatus(scope: string): Promise<DashboardStatus> {
 }
 
 /** 运行时自检（embedding 维度等）。force 走 query 参数，与 legacy 一致。 */
-export function fetchRuntimeSelfCheck(force: boolean): Promise<RuntimeReport> {
+export function fetchRuntimeSelfCheck(force: boolean, scope: string): Promise<RuntimeReport> {
   return api.post<RuntimeReport>(
     `/v1/runtime/self_check?force=${force ? "true" : "false"}`,
     {},
+    { scope },
   );
 }
 
 /** 脱敏只读配置（用于 dashboard autosave 指示；表单渲染在 P3）。 */
-export function fetchConfig(): Promise<ConfigPayload> {
-  return api.get<ConfigPayload>("/api/config");
+export function fetchConfig(scope: string): Promise<ConfigPayload> {
+  return api.get<ConfigPayload>("/api/config", { scope });
 }
 
 /** 保存运行时配置（persist=true 时尝试写文件，但 WebUI 恒返回 persisted=false）。 */
-export function patchRuntimeConfig(patch: RuntimeConfigPatch): Promise<RuntimeConfigResult> {
-  return api.patch<RuntimeConfigResult>("/api/config/runtime", patch);
+export function patchRuntimeConfig(patch: RuntimeConfigPatch, scope: string): Promise<RuntimeConfigResult> {
+  return api.patch<RuntimeConfigResult>("/api/config/runtime", patch, { scope });
 }
 
 /** 开关自动保存。返回新的 autosave 状态。 */
-export function setAutoSave(enabled: boolean): Promise<AutoSaveConfig & ConfigPayload> {
-  return api.post<AutoSaveConfig & ConfigPayload>("/api/config/auto_save", { enabled });
+export function setAutoSave(enabled: boolean, scope: string): Promise<AutoSaveConfig & ConfigPayload> {
+  return api.post<AutoSaveConfig & ConfigPayload>("/api/config/auto_save", { enabled }, { scope });
 }
 
 /** 手动保存所有数据到磁盘（graph_store / vector_store）。 */
-export function manualSave(): Promise<ManualSaveResult> {
-  return api.post<ManualSaveResult>("/api/save", {});
+export function manualSave(scope: string): Promise<ManualSaveResult> {
+  return api.post<ManualSaveResult>("/api/save", {}, { scope });
 }

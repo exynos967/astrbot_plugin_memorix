@@ -68,7 +68,14 @@ class AstrBotLLMClient:
         self.provider_bridge = provider_bridge
         self.max_retries = max(1, int(max_retries))
 
-    async def complete(self, prompt: str, *, temperature: float = 0.2, max_tokens: int = 1200) -> str:
+    async def complete(
+        self,
+        prompt: str,
+        *,
+        temperature: float = 0.2,
+        max_tokens: int = 1200,
+        unified_msg_origin: str = "",
+    ) -> str:
         last_exc: Optional[Exception] = None
         for attempt in range(1, self.max_retries + 1):
             try:
@@ -76,6 +83,7 @@ class AstrBotLLMClient:
                     prompt,
                     temperature=temperature,
                     max_tokens=max_tokens,
+                    unified_msg_origin=unified_msg_origin,
                 )
             except Exception as exc:
                 last_exc = exc
@@ -91,8 +99,14 @@ class AstrBotLLMClient:
         *,
         temperature: float = 0.2,
         max_tokens: int = 1200,
+        unified_msg_origin: str = "",
     ) -> Tuple[bool, Dict[str, Any], str]:
-        text = await self.complete(prompt, temperature=temperature, max_tokens=max_tokens)
+        text = await self.complete(
+            prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            unified_msg_origin=unified_msg_origin,
+        )
         if not text:
             return False, {}, ""
 

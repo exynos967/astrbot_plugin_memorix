@@ -44,6 +44,9 @@ class LocalEmbeddingAdapter:
 
     async def encode(self, texts, **kwargs):
         del kwargs
+        return await asyncio.to_thread(self._encode_sync, texts)
+
+    def _encode_sync(self, texts):
         if isinstance(texts, str):
             return self._embed_text(texts)
 
@@ -88,6 +91,7 @@ class ScopeRuntimeManager:
         self.astrbot_context = astrbot_context
         self._runtimes: Dict[str, ScopeRuntime] = {}
         self._lock = asyncio.Lock()
+        self._closing = False
 
     def _scope_base_dir(self) -> Path:
         data_root_raw = get_astrbot_data_path()
@@ -110,6 +114,16 @@ class ScopeRuntimeManager:
                 fallback,
             )
             target = base_resolved / fallback
+        existing_key = self._read_scope_manifest(target)
+        if existing_key and existing_key != str(scope_key or "").strip():
+            fallback = f"scope_{hashlib.sha256(str(scope_key or '').encode('utf-8')).hexdigest()[:16]}"
+            logger.warning(
+                "scope dir collision, fallback applied: scope=%s existing=%s fallback=%s",
+                scope_key,
+                existing_key,
+                fallback,
+            )
+            target = (base_resolved / fallback).resolve()
         target.mkdir(parents=True, exist_ok=True)
         self._write_scope_manifest(target, scope_key)
         logger.debug("resolved scope dir: scope=%s dir=%s", target.name, target)
@@ -127,6 +141,17 @@ class ScopeRuntimeManager:
         if text in {"", ".", ".."}:
             return "default"
         return text[:128] or "default"
+
+    @staticmethod
+    def _read_scope_manifest(scope_dir: Path) -> str:
+        manifest = scope_dir / ".scope.json"
+        if not manifest.exists():
+            return ""
+        try:
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+        except Exception:
+            return ""
+        return str(payload.get("scope_key", "") or "").strip()
 
     @staticmethod
     def _write_scope_manifest(scope_dir: Path, scope_key: str) -> None:
@@ -219,6 +244,8 @@ class ScopeRuntimeManager:
         logger.info("local embedding fallback enabled: scope=%s dim=%s", runtime.scope_key, dimension)
 
     async def get_runtime(self, scope_key: str) -> ScopeRuntime:
+        if self._closing:
+            raise RuntimeError("Memorix runtime manager is closing")
         key = str(scope_key or "default")
         existing = self._runtimes.get(key)
         if existing is not None:
@@ -226,6 +253,8 @@ class ScopeRuntimeManager:
             return existing
 
         async with self._lock:
+            if self._closing:
+                raise RuntimeError("Memorix runtime manager is closing")
             existing = self._runtimes.get(key)
             if existing is not None:
                 logger.debug("runtime cache hit after lock: scope=%s", key)
@@ -303,6 +332,7 @@ class ScopeRuntimeManager:
 
     async def close_all(self) -> None:
         async with self._lock:
+            self._closing = True
             runtimes = list(self._runtimes.values())
             self._runtimes.clear()
 

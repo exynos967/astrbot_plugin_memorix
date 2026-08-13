@@ -36,15 +36,18 @@ class ScopeRouter:
                 sender = session_id or sender
                 group = session_id if message_type == "GroupMessage" else ""
 
+        if mode not in {"umo", "user_global", "group_global", "platform_global"}:
+            mode = "group_global"
+
         if mode == "umo":
             return self._sanitize(umo or f"{platform}:{sender}")
         if mode == "user_global":
             return self._sanitize(f"{platform}:user:{sender}")
-        if mode == "group_global":
-            if group:
-                return self._sanitize(f"{platform}:group:{group}")
-            return self._sanitize(f"{platform}:group:{sender}")
-        return self._sanitize(platform)
+        if mode == "platform_global":
+            return self._sanitize(platform)
+        if group:
+            return self._sanitize(f"{platform}:group:{group}")
+        return self._sanitize(f"{platform}:user:{sender}")
 
     @staticmethod
     def _safe_str(value) -> str:

@@ -395,6 +395,10 @@ def resolve_openapi_endpoint_config(config: Dict[str, Any], *, section: str = "e
     return merged
 
 
+_SENSITIVE_KEY_MARKERS = ("api_key", "secret", "token", "password", "passwd")
+_SENSITIVE_PATH_KEYS = {"data_dir", "path_aliases"}
+
+
 def mask_sensitive(config: Dict[str, Any]) -> Dict[str, Any]:
     out = copy.deepcopy(config)
 
@@ -404,13 +408,31 @@ def mask_sensitive(config: Dict[str, Any]) -> Dict[str, Any]:
             return "*" * len(text)
         return f"{text[:2]}***{text[-2:]}"
 
-    emb = out.get("embedding", {})
-    if isinstance(emb, dict):
-        for key in ("openai", "openapi"):
-            endpoint_cfg = emb.get(key, {})
-            if isinstance(endpoint_cfg, dict) and "api_key" in endpoint_cfg:
-                endpoint_cfg["api_key"] = _mask(endpoint_cfg["api_key"])
-    return out
+    def _should_mask(key: str) -> bool:
+        lowered = str(key or "").strip().lower()
+        if lowered in _SENSITIVE_PATH_KEYS:
+            return True
+        return any(marker in lowered for marker in _SENSITIVE_KEY_MARKERS)
+
+    def _walk(node: Any) -> Any:
+        if isinstance(node, dict):
+            masked: Dict[str, Any] = {}
+            for key, value in node.items():
+                if _should_mask(str(key)):
+                    if isinstance(value, dict):
+                        masked[key] = {child: _mask(child_value) for child, child_value in value.items()}
+                    elif isinstance(value, list):
+                        masked[key] = [_mask(item) for item in value]
+                    else:
+                        masked[key] = _mask(value)
+                else:
+                    masked[key] = _walk(value)
+            return masked
+        if isinstance(node, list):
+            return [_walk(item) for item in node]
+        return node
+
+    return _walk(out)
 
 
 @dataclass(slots=True)

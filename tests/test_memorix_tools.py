@@ -9,7 +9,7 @@ from astrbot_plugin_memorix.memorix.amemorix.context import AppContext
 from astrbot_plugin_memorix.memorix.amemorix.services.query_service import QueryService
 from astrbot_plugin_memorix.memorix.core.storage.metadata_store import MetadataStore
 from astrbot_plugin_memorix.memorix.core.utils.summary_importer import SummaryImporter
-from astrbot_plugin_memorix.memorix.providers import AstrBotProviderBridge
+from astrbot_plugin_memorix.memorix.providers import AstrBotLLMClient, AstrBotProviderBridge
 from astrbot_plugin_memorix.memorix.services.content_router import MemoryContentRouter
 from astrbot_plugin_memorix.memorix.services.ingest_service import IngestService
 from astrbot_plugin_memorix.memorix.services.person_fact_writeback_service import (
@@ -18,6 +18,8 @@ from astrbot_plugin_memorix.memorix.services.person_fact_writeback_service impor
 )
 from astrbot_plugin_memorix.memorix.tools import (
     MemorixIngestTextTool,
+    MemorixMaintainTool,
+    MemorixSearchTool,
     _format_search_result_for_llm,
     build_memorix_tools,
 )
@@ -983,3 +985,154 @@ def test_command_prefixes_cache_invalidates_on_config_change():
     second = plugin._command_prefixes()
     assert second == ["/", "！"]
     assert second is not first
+
+
+def _tool_context(event):
+    return SimpleNamespace(context=SimpleNamespace(event=event))
+
+
+def test_search_memory_ignores_client_scope_key():
+    plugin = MemorixPlugin(DummyContext(), {"scope": {"mode": "group_global"}})
+
+    class _Query:
+        def __init__(self):
+            self.calls = []
+
+        async def search(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"hits": []}
+
+    async def _no_feedback(_scope_key):
+        return False
+
+    plugin.query_service = _Query()
+    plugin.feedback_service_enabled = _no_feedback
+    tool = MemorixSearchTool(plugin=plugin)
+
+    asyncio.run(
+        tool.call(
+            _tool_context(_FakeEvent()),
+            query="RPG",
+            scope_key="aiocqhttp:group:OTHER",
+            respect_filter=False,
+        )
+    )
+
+    assert plugin.query_service.calls[0]["scope_key"] == "aiocqhttp:group:group-1"
+    assert plugin.query_service.calls[0]["enforce_chat_filter"] is True
+    assert plugin.query_service.calls[0]["strict_source"] is True
+
+
+def test_maintain_memory_rejects_recycle_bin():
+    plugin = MemorixPlugin(DummyContext(), {"scope": {"mode": "group_global"}})
+    tool = MemorixMaintainTool(plugin=plugin)
+    result = asyncio.run(tool.call(_tool_context(_FakeEvent()), action="recycle_bin"))
+    assert "unsupported action" in result
+
+
+def test_llm_request_skips_cron_injection():
+    plugin = MemorixPlugin(
+        DummyContext(),
+        {
+            "scope": {"mode": "group_global"},
+            "retrieval": {"auto_inject": {"enabled": True}},
+            "person_profile": {"enabled": True},
+        },
+    )
+    plugin.profile_service = _FakeProfileService()
+    plugin.query_service = _FakeQueryService()
+    request = _FakeProviderRequest(prompt="You are now responding to a scheduled task.", extra_user_content_parts=[])
+
+    class _CronEvent:
+        unified_msg_origin = "aiocqhttp:GroupMessage:799462158"
+        message_obj = _FakeMessageObj()
+        message_str = "定时任务"
+
+        def get_platform_name(self):
+            return "cron"
+
+        def get_sender_id(self):
+            return "799462158"
+
+        def get_sender_name(self):
+            return "Scheduler"
+
+        def get_group_id(self):
+            return ""
+
+    asyncio.run(plugin.on_llm_request(_CronEvent(), request))
+
+    assert request.extra_user_content_parts == []
+    assert plugin.query_service.calls == []
+    assert plugin.profile_service.query_calls == []
+
+
+def test_command_user_message_skips_assistant_ingest():
+    plugin = MemorixPlugin(DummyContext(), {"ingest": {"skip_command_messages": True}})
+    ingested = []
+
+    async def _enabled(_adapted, _user_id=""):
+        return True
+
+    async def _ingest(_event, role, text):
+        ingested.append((role, text))
+        return True
+
+    plugin._is_adapted_chat_enabled = _enabled
+    plugin.message_ingestion._ingest_event_message = _ingest
+
+    asyncio.run(
+        plugin.message_ingestion._record_llm_response_background(
+            _FakeEvent(),
+            "这是助手对命令的回复",
+            "/help",
+        )
+    )
+
+    assert ingested == []
+
+
+def test_astrbot_llm_client_complete_forwards_umo():
+    class _Provider:
+        def meta(self):
+            return SimpleNamespace(id="session-provider")
+
+    class _Context:
+        def __init__(self):
+            self.origin = None
+
+        def get_using_provider(self, origin):
+            self.origin = origin
+            return _Provider()
+
+        async def llm_generate(self, **kwargs):
+            return SimpleNamespace(completion_text="ok")
+
+    context = _Context()
+    client = AstrBotLLMClient(provider_bridge=AstrBotProviderBridge(astrbot_context=context))
+    result = asyncio.run(client.complete("hello", unified_msg_origin="umo-1"))
+
+    assert result == "ok"
+    assert context.origin == "umo-1"
+
+
+def test_event_adapter_tolerates_non_numeric_timestamp():
+    event = _FakeEvent()
+    event.message_obj = SimpleNamespace(
+        session_id="session-1",
+        message_id="msg-1",
+        timestamp="not-a-number",
+        message=[],
+        group=SimpleNamespace(group_id="group-1", group_name="测试群"),
+    )
+    adapted = AstrbotEventAdapter.from_event(event, "aiocqhttp:group:group-1")
+    assert adapted.timestamp == 0
+
+
+def test_dashboard_webui_scope_uses_disk_scope_list():
+    plugin = MemorixPlugin(DummyContext(), {"scope": {"mode": "group_global"}})
+    plugin.runtime_manager = SimpleNamespace(
+        get_known_scopes=lambda: [],
+        list_scope_keys=lambda: ["aiocqhttp:group:123"],
+    )
+    assert plugin._resolve_dashboard_webui_scope() == "aiocqhttp:group:123"

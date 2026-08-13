@@ -457,7 +457,7 @@ class TaskManager:
                     if ops:
                         self.ctx.graph_store.prune_relation_hashes(ops)
                     self.ctx.metadata_store.backup_and_delete_relations(expired)
-                self.ctx.graph_store.save()
+                await asyncio.to_thread(self.ctx.graph_store.save)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -489,7 +489,7 @@ class TaskManager:
                 ):
                     logger.info("paragraph vector backfill result: %s", result)
                     try:
-                        self.ctx.vector_store.save()
+                        await asyncio.to_thread(self.ctx.vector_store.save)
                     except Exception as exc:
                         logger.warning("Paragraph vector backfill save failed: %s", exc)
             except asyncio.CancelledError:

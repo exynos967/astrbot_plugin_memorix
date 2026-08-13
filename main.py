@@ -29,7 +29,7 @@ from .memorix.webui.plugin_page_bridge import PluginPageWebUIBridge
 if TYPE_CHECKING:
     from astrbot.api.provider import LLMResponse, ProviderRequest
 
-PLUGIN_VERSION = "1.1.0"
+PLUGIN_VERSION = "1.1.1"
 
 
 @register(
@@ -102,6 +102,7 @@ class MemorixPlugin(Star):
             except asyncio.TimeoutError:
                 for task in pending:
                     task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
         await self._close_component("person fact writeback", self.person_fact_writeback_service.close)
         await self._close_component("webui", self.webui_page_bridge.close)
         await self._close_component("feedback service", self.feedback_service.stop_background_loops)
@@ -155,7 +156,7 @@ class MemorixPlugin(Star):
         return task
 
     def _resolve_dashboard_webui_scope(self) -> str:
-        known_scopes = self.runtime_manager.get_known_scopes()
+        known_scopes = self.runtime_manager.list_scope_keys()
         return str(known_scopes[-1]) if known_scopes else "default"
 
     @staticmethod
@@ -207,7 +208,7 @@ class MemorixPlugin(Star):
             runtime = await self.runtime_manager.get_runtime(adapted.scope_key)
             checker = getattr(runtime.context, "is_chat_enabled", None)
             if not callable(checker):
-                return True
+                return False
             return bool(
                 checker(
                     stream_id=adapted.session_id,
@@ -217,7 +218,7 @@ class MemorixPlugin(Star):
             )
         except Exception:
             logger.warning("[memorix] chat filter check failed: scope=%s", adapted.scope_key, exc_info=True)
-            return True
+            return False
 
     async def feedback_service_enabled(self, scope_key: str) -> bool:
         try:

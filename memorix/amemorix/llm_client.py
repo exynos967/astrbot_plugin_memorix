@@ -46,7 +46,15 @@ class LLMClient:
             self._client = AsyncOpenAI(**kwargs)
         return self._client
 
-    async def complete(self, prompt: str, *, temperature: float = 0.2, max_tokens: int = 1200) -> str:
+    async def complete(
+        self,
+        prompt: str,
+        *,
+        temperature: float = 0.2,
+        max_tokens: int = 1200,
+        unified_msg_origin: str = "",
+    ) -> str:
+        del unified_msg_origin
         last_exc: Optional[Exception] = None
         for attempt in range(1, self.max_retries + 1):
             try:

@@ -1,5 +1,22 @@
 # Changelog
 
+## v1.1.1
+
+### Fixes
+
+- 成员/管理员 LLM 工具不再接受客户端传入的 `scope_key` / `respect_filter`，避免跨会话读写记忆。
+- `group_global` 私聊改走 `platform:user:{sender}`，不再和同号群聊共用一个库。
+- `maintain_memory` 去掉未鉴权的 `recycle_bin`；回收站只走 `memory_v5_admin`。
+- cron 定时任务不再做自动记忆注入；命令消息的助手回复不再入库。
+- `runtime_admin get_config` 与 WebUI 一样脱敏密钥/路径；聊天过滤失败改为 fail-closed。
+- WebUI 默认 scope 改读磁盘 `list_scope_keys()`；配置/自检/保存请求带上当前 `_scope`。
+- `AstrBotLLMClient.complete()` 透传 `unified_msg_origin`；畸形 timestamp 不再让整次注入静默失败。
+
+### Notes
+
+- 已有私聊记忆如果落在 `platform:group:{用户ID}` 下，不会自动搬到 `platform:user:{用户ID}`。需要的话请手工迁移该 scope 目录。
+- 未知 `scope.mode` 不再退化成整平台共用一个库，而是回退 `group_global`。
+
 ## v1.1.0
 
 ### Features
