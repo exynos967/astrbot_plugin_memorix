@@ -7,6 +7,7 @@ features return an explicit payload instead of silently creating fake behavior.
 
 from __future__ import annotations
 
+import time
 from typing import Any, Dict, Iterable, Optional
 
 from ..amemorix.services import DeleteService, PersonProfileApiService
@@ -213,7 +214,7 @@ class AdminService:
                 except Exception as exc:
                     failures.append({"source": src, "error": str(exc)})
             return {"success": not failures, "items": results, "failures": failures, "count": len(results)}
-        if act == "process_pending":
+        if act in {"process_pending", "process_sources"}:
             return {"success": True, **await self._process_episode_pending(ctx, kwargs)}
         return self._unsupported("episode", act)
 
@@ -464,8 +465,28 @@ class AdminService:
             target = str(selector.get("hash") or selector.get("target") or selector.get("query") or "").strip()
             restore_type = str(selector.get("restore_type") or selector.get("type") or mode or "relation")
             return await BaseMemoryService(ctx).restore(hash_value=target, restore_type=restore_type)
-        if act in {"list_operations", "get_operation", "purge"}:
-            return self._err(f"当前 AstrBot 内嵌运行时暂不支持 delete action: {act}")
+        if act == "list_operations":
+            items = ctx.metadata_store.list_delete_operations(
+                limit=self._int(kwargs.get("limit"), 50, 1, 200),
+                mode=str(kwargs.get("mode") or selector.get("mode") or ""),
+            )
+            return {"success": True, "items": items, "count": len(items)}
+        if act == "get_operation":
+            operation_id = str(
+                kwargs.get("operation_id") or selector.get("operation_id") or selector.get("target") or ""
+            ).strip()
+            operation = ctx.metadata_store.get_delete_operation(operation_id)
+            if operation is None:
+                return self._err("delete operation 不存在")
+            return {"success": True, "operation": operation}
+        if act == "purge":
+            hours = self._float_or_none(kwargs.get("older_than_hours")) or 24.0
+            cutoff = time.time() - max(0.0, float(hours)) * 3600.0
+            purged = ctx.metadata_store.purge_deleted_relations(
+                cutoff_time=cutoff,
+                limit=self._int(kwargs.get("limit"), 1000, 1, 10000),
+            )
+            return {"success": True, "purged": purged, "count": len(purged), "cutoff_time": cutoff}
         return self._unsupported("delete", act)
 
     async def _import_manager(self, scope_key: str, ctx: Any) -> ImportTaskManager:

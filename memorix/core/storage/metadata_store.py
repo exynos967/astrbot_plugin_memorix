@@ -30,6 +30,7 @@ from .schema_compat import (
     ensure_transcript_schema_compat,
     table_columns,
 )
+from .schema_v21 import SCHEMA_VERSION, apply_upstream_schema_v21
 
 try:
     import jieba  # type: ignore
@@ -42,7 +43,6 @@ except Exception:
 logger = get_logger("A_Memorix.MetadataStore")
 
 
-SCHEMA_VERSION = 15
 RUNTIME_AUTO_MIGRATION_MIN_SCHEMA_VERSION = 9
 DEFAULT_MIGRATION_BATCH_SIZE = 2000
 SCHEMA_MIGRATION_SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "migrate_schema_v8_to_v13.py"
@@ -152,8 +152,8 @@ class MetadataStore:
             logger.warning(f"初始化 FTS schema 失败，将跳过 BM25 检索: {e}")
 
         # 插件本地表与列补丁（开闭原则：不污染上游 _migrate_schema）。
-        # 上游 A_memorix 2.0.0 未提供 transcript / person_registry / async_tasks
-        # 等表，但插件封装层依赖；历史库还需补齐 episode_paragraphs.position 等列。
+        # 上游 A_memorix schema 21 未提供 transcript / person_registry / async_tasks
+        # 等表，且会 DROP episode_pending_paragraphs；插件封装层继续保留这些本地表。
         # 每次 connect 幂等执行。
         self._ensure_plugin_local_schema()
 
@@ -817,6 +817,7 @@ class MetadataStore:
         """)
         self._ensure_fuzzy_modify_plan_tables(cursor)
         self._create_performance_indexes()
+        apply_upstream_schema_v21(self._conn, logger)
         # 新版 schema 包含完整字段，直接写入版本信息
         cursor.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)", (SCHEMA_VERSION, datetime.now().timestamp()))
         self._conn.commit()
@@ -1312,6 +1313,7 @@ class MetadataStore:
         self._initialize_tables()
 
         self._create_performance_indexes()
+        apply_upstream_schema_v21(self._conn, logger)
         self._conn.commit()
 
     def _create_temporal_indexes_if_ready(self) -> None:
@@ -8545,16 +8547,16 @@ class MetadataStore:
     def _ensure_plugin_local_schema(self) -> None:
         """插件本地表与列补丁。
 
-        上游 A_memorix 2.0.0 的 ``_migrate_schema`` 只负责上游表；插件封装层
-        依赖的 ``transcript_*`` / ``person_registry`` / ``async_tasks`` 等本地表
-        以及历史库的 ``episode_paragraphs.position`` 列补丁在此统一创建。每次
-        ``connect`` 幂等执行，且对表/列缺失只会 warning 不抛异常。
+        上游 A_memorix schema 21 的 ``_migrate_schema`` 只负责上游表；插件封装层
+        依赖的 ``transcript_*`` / ``person_registry`` / ``async_tasks`` 以及兼容
+        队列 ``episode_pending_paragraphs`` 在此统一创建。每次 ``connect`` 幂等执行。
         """
         if not self._conn:
             return
         self._ensure_async_task_schema()
         self._ensure_transcript_schema()
         self._ensure_person_registry_schema()
+        self._ensure_episode_pending_schema()
         cursor = self._conn.cursor()
         self._ensure_table_column(
             cursor,
@@ -8714,6 +8716,44 @@ class MetadataStore:
             return
         cursor = self._conn.cursor()
         self._create_person_registry_schema(cursor)
+        self._conn.commit()
+
+    def _ensure_episode_pending_schema(self) -> None:
+        """保留插件兼容队列。上游 schema 19 会删除此表，插件侧重新建回。"""
+        if not self._conn:
+            return
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS episode_pending_paragraphs (
+                paragraph_hash TEXT PRIMARY KEY,
+                source TEXT,
+                created_at REAL,
+                status TEXT DEFAULT 'pending',
+                retry_count INTEGER DEFAULT 0,
+                last_error TEXT,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_episode_pending_status_updated
+            ON episode_pending_paragraphs(status, updated_at)
+            """
+        )
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_episode_pending_source_created
+            ON episode_pending_paragraphs(source, created_at)
+            """
+        )
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_episode_pending_status_retry_updated
+            ON episode_pending_paragraphs(status, retry_count, updated_at)
+            """
+        )
         self._conn.commit()
 
     # ------------------------------------------------------------------

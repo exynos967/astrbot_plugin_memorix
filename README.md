@@ -9,7 +9,7 @@
 图谱 + 向量混合检索 · 记忆生命周期管理 · 人物画像 · 总结导入 · 内嵌 WebUI
 
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16-blue)](https://github.com/Soulter/AstrBot)
-[![Version](https://img.shields.io/badge/version-v0.9.5-green)]()
+[![Version](https://img.shields.io/badge/version-v1.1.0-green)]()
 [![Platforms](https://img.shields.io/badge/platforms-QQ%20%7C%20Telegram%20%7C%20Discord-orange)]()
 
 </div>
@@ -171,9 +171,9 @@ data/plugin_data/astrbot_plugin_memorix/scopes/<scope_key>/
 
 > **破坏性更新提醒**
 >
-> 从 `main` 旧版升级到 feat2.0 / SCHEMA 15 时，旧版 `metadata.db` 为 `SCHEMA_VERSION=8`，新版本运行时不会直接打开 v8 库。请先停止插件，备份 `data/plugin_data/astrbot_plugin_memorix/`，并按下方步骤执行一次离线迁移脚本，自动扫描所有 scope 后再启动新版本。
+> 从 `main` 旧版升级到 feat2.0 / SCHEMA 21 时，旧版 `metadata.db` 为 `SCHEMA_VERSION=8`，新版本运行时不会直接打开 v8 库。请先停止插件，备份 `data/plugin_data/astrbot_plugin_memorix/`，并按下方步骤执行一次离线迁移脚本，自动扫描所有 scope 后再启动新版本。
 
-当前元数据 Schema 版本为 **SCHEMA 15**。相对前一版本，本次升级包含两项结构变更：
+当前元数据 Schema 版本为 **SCHEMA 21**。相对 SCHEMA 15，本次对齐上游 A_memorix 的结构变更包括：
 
 - **新增 `fuzzy_modify_plans` 表**：存放模糊修正功能的修改计划与执行状态（preview / confirmed / executed / rolled_back），与模糊修正功能配套。
 - **`stale_relation` 表新增三列**：`source_type`、`source_id`、`source_operation_id`，用于精确标记关系条目的来源类型与具体来源操作 ID，便于追溯与回收。
@@ -186,13 +186,13 @@ data/plugin_data/astrbot_plugin_memorix/scopes/<scope_key>/
   uv run --no-project python scripts/migrate_schema_v8_to_v13.py
   ```
 
-  脚本默认查找 `data/plugin_data/astrbot_plugin_memorix/scopes/*/metadata/metadata.db`；如果数据目录不在默认位置，可加 `--plugin-data-dir /path/to/data/plugin_data/astrbot_plugin_memorix`。高级用户仍可用 `--db /path/to/metadata.db` 只迁移单个数据库。脚本文件名保留历史兼容，实际目标版本取当前代码的 `SCHEMA_VERSION`（本版为 15）。脚本会先备份原库，迁移后旧段落/关系数据保留。
-- **从已版本化的新库升级**：`schema_version >= 9 && < 15` 时，插件启动会自动迁移到 15。
-- **全新安装**：直接创建 SCHEMA 15 库。
+  脚本默认查找 `data/plugin_data/astrbot_plugin_memorix/scopes/*/metadata/metadata.db`；如果数据目录不在默认位置，可加 `--plugin-data-dir /path/to/data/plugin_data/astrbot_plugin_memorix`。高级用户仍可用 `--db /path/to/metadata.db` 只迁移单个数据库。脚本文件名保留历史兼容，实际目标版本取当前代码的 `SCHEMA_VERSION`（本版为 21）。脚本会先备份原库，迁移后旧段落/关系数据保留。
+- **从已版本化的新库升级**：`schema_version >= 9 && < 21` 时，插件启动会自动迁移到 21。
+- **全新安装**：直接创建 SCHEMA 21 库。
 
 ### 双向量池架构（dual-pool）
 
-SCHEMA 15 起支持双向量池模式，将 **段落向量** 与 **图谱向量** 分离到独立索引，便于独立扩容、独立检索调参。
+SCHEMA 15 起支持双向量池模式，将 **段落向量** 与 **图谱向量** 分离到独立索引，便于独立扩容、独立检索调参。v1.1.0 起插件主线会把双池 store 真正接到检索器。
 
 - **默认 `mode=dual`，与上游 A_memorix 对齐**：如果未生成 `dual_ready.json`，运行时会自动降级为 single，不会因配置错配而无法检索。
 - **正式启用双池步骤**：

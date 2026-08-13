@@ -142,6 +142,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "semantic_weight": 0.65,
             "sparse_weight": 0.20,
             "graph_weight": 0.15,
+            "score_calibration_method": "none",
+            "score_calibration_rrf_k": 60,
             "relation_intent": {
                 "graph_top_k": 80,
                 "semantic_weight": 0.45,

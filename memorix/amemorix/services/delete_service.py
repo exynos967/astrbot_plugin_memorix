@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict
+from typing import Any, Dict, Iterable, Sequence
 
 from ...core.utils.hash import compute_hash, normalize_text
 
 from ..context import AppContext
+
+
+def _unique_tokens(values: Iterable[str]) -> list[str]:
+    return list(dict.fromkeys(str(item).strip() for item in values if str(item).strip()))
 
 
 class DeleteService:
@@ -17,6 +21,47 @@ class DeleteService:
     @staticmethod
     def _looks_like_hash(text: str) -> bool:
         return bool(re.fullmatch(r"[0-9a-fA-F]{64}", str(text or "").strip()))
+
+    @staticmethod
+    def _graph_vector_id(item_type: str, hash_value: str) -> str:
+        return f"{str(item_type or '').strip()}:{str(hash_value or '').strip()}"
+
+    def _dual_pools_enabled(self) -> bool:
+        checker = getattr(self.ctx, "_dual_vector_pools_enabled", None)
+        if callable(checker):
+            return bool(checker())
+        return bool(getattr(self.ctx, "_dual_vector_pools_ready", False))
+
+    def _delete_vectors(
+        self,
+        *,
+        paragraph_hashes: Sequence[str] = (),
+        entity_hashes: Sequence[str] = (),
+        relation_hashes: Sequence[str] = (),
+    ) -> int:
+        deleted = 0
+        legacy_ids = _unique_tokens([*paragraph_hashes, *entity_hashes, *relation_hashes])
+        if legacy_ids:
+            deleted += int(self.ctx.vector_store.delete(legacy_ids) or 0)
+            self.ctx.vector_store.save()
+        if not self._dual_pools_enabled():
+            return deleted
+        paragraph_ids = _unique_tokens(paragraph_hashes)
+        paragraph_store = getattr(self.ctx, "paragraph_vector_store", None)
+        if paragraph_store is not None and paragraph_ids:
+            deleted += int(paragraph_store.delete(paragraph_ids) or 0)
+            paragraph_store.save()
+        graph_ids = [
+            self._graph_vector_id("entity", hash_value) for hash_value in _unique_tokens(entity_hashes)
+        ]
+        graph_ids.extend(
+            self._graph_vector_id("relation", hash_value) for hash_value in _unique_tokens(relation_hashes)
+        )
+        graph_store = getattr(self.ctx, "graph_vector_store", None)
+        if graph_store is not None and graph_ids:
+            deleted += int(graph_store.delete(graph_ids) or 0)
+            graph_store.save()
+        return deleted
 
     async def paragraph(self, paragraph_spec: str) -> Dict[str, Any]:
         query = str(paragraph_spec or "").strip()
@@ -51,16 +96,18 @@ class DeleteService:
         elif edges_to_remove:
             self.ctx.graph_store.delete_edges(edges_to_remove)
 
-        vector_ids = []
+        paragraph_ids = []
+        relation_ids = []
         vid = plan.get("vector_id_to_remove")
         if vid:
-            vector_ids.append(str(vid))
+            paragraph_ids.append(str(vid))
         for op in relation_prune_ops:
             if len(op) >= 3 and op[2]:
-                vector_ids.append(str(op[2]))
-        deleted_vectors = self.ctx.vector_store.delete(list(dict.fromkeys(vector_ids))) if vector_ids else 0
-
-        self.ctx.vector_store.save()
+                relation_ids.append(str(op[2]))
+        deleted_vectors = self._delete_vectors(
+            paragraph_hashes=paragraph_ids,
+            relation_hashes=relation_ids,
+        )
         self.ctx.graph_store.save()
         return {
             "success": True,
@@ -89,10 +136,11 @@ class DeleteService:
 
         self.ctx.graph_store.delete_nodes([canonical])
         self.ctx.metadata_store.delete_entity(canonical)
-        vector_ids = [compute_hash(canonical)] + list(rel_hashes)
-        deleted_vectors = self.ctx.vector_store.delete(vector_ids)
-
-        self.ctx.vector_store.save()
+        entity_hash = compute_hash(canonical)
+        deleted_vectors = self._delete_vectors(
+            entity_hashes=[entity_hash],
+            relation_hashes=list(rel_hashes),
+        )
         self.ctx.graph_store.save()
         return {
             "success": True,
@@ -140,8 +188,7 @@ class DeleteService:
         else:
             self.ctx.graph_store.delete_edges([(subject, obj)])
 
-        deleted_vectors = self.ctx.vector_store.delete([rel_hash])
-        self.ctx.vector_store.save()
+        deleted_vectors = self._delete_vectors(relation_hashes=[rel_hash])
         self.ctx.graph_store.save()
         return {
             "success": True,
@@ -160,6 +207,15 @@ class DeleteService:
             "vectors": self.ctx.vector_store.num_vectors,
         }
         self.ctx.vector_store.clear()
+        if self._dual_pools_enabled():
+            paragraph_store = getattr(self.ctx, "paragraph_vector_store", None)
+            graph_vector_store = getattr(self.ctx, "graph_vector_store", None)
+            if paragraph_store is not None:
+                paragraph_store.clear()
+                paragraph_store.save()
+            if graph_vector_store is not None:
+                graph_vector_store.clear()
+                graph_vector_store.save()
         self.ctx.graph_store.clear()
         self.ctx.metadata_store.clear_all()
         self.ctx.vector_store.save()

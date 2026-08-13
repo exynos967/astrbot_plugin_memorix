@@ -225,6 +225,30 @@
             "hint": "dual 融合时图谱向量召回的权重。",
             "default": 0.15
           },
+          "score_calibration_method": {
+            "type": "string",
+            "description": "双池分数校准方法",
+            "hint": "none 保持原始加权；minmax / rank_percentile / weighted_rrf 等会在查询内校准各通道分数后再融合。",
+            "default": "none",
+            "options": [
+              "none",
+              "minmax",
+              "rank_percentile",
+              "robust_sigmoid",
+              "softmax",
+              "weighted_rrf",
+              "semantic_minmax",
+              "semantic_rrf",
+              "semantic_sparse_rrf",
+              "semantic_graph_rrf"
+            ]
+          },
+          "score_calibration_rrf_k": {
+            "type": "int",
+            "description": "RRF 校准常数",
+            "hint": "仅在 RRF 类校准方法下生效，值越大排名差异越平滑。",
+            "default": 60
+          },
           "relation_intent": {
             "type": "object",
             "description": "关系意图权重",

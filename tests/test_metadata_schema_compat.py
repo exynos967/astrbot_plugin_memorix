@@ -683,9 +683,9 @@ def test_schema_migration_script_discovers_scope_dbs(tmp_path):
 
 
 def test_schema_13_db_runtime_auto_migrates_to_15(tmp_path):
-    """模拟上一版 schema=13 库，connect() 应自动迁移到当前 schema=15。"""
+    """模拟上一版 schema=13 库，connect() 应自动迁移到当前 schema=21。"""
 
-    assert SCHEMA_VERSION == 15
+    assert SCHEMA_VERSION == 21
     db_path = tmp_path / "metadata.db"
     conn = sqlite3.connect(db_path)
     conn.executescript(
@@ -742,7 +742,7 @@ def test_schema_13_db_runtime_auto_migrates_to_15(tmp_path):
     store = MetadataStore(tmp_path)
     store.connect()
     try:
-        assert store.get_schema_version() == 15
+        assert store.get_schema_version() == 21
         tables = {row[0] for row in store._conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         assert "memory_fuzzy_modify_plans" in tables
 

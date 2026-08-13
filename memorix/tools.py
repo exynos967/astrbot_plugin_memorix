@@ -799,7 +799,7 @@ class MemorixEpisodeAdminTool(MemorixAdminToolBase):
     name: str = "memory_episode_admin"
     description: str = "Episode 管理接口；仅 AstrBot 管理员可用。"
     admin_method: str = "episode_admin"
-    parameters: dict = Field(default_factory=lambda: _admin_parameters("query/list/get/status/rebuild/process_pending"))
+    parameters: dict = Field(default_factory=lambda: _admin_parameters("query/list/get/status/rebuild/process_pending/process_sources"))
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
         return await self._call_admin(context, **kwargs)
@@ -876,7 +876,7 @@ class MemorixDeleteAdminTool(MemorixAdminToolBase):
     name: str = "memory_delete_admin"
     description: str = "长期记忆删除管理接口；仅 AstrBot 管理员可用。"
     admin_method: str = "delete_admin"
-    parameters: dict = Field(default_factory=lambda: _admin_parameters("preview/execute/restore"))
+    parameters: dict = Field(default_factory=lambda: _admin_parameters("preview/execute/restore/list_operations/get_operation/purge"))
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
         return await self._call_admin(context, **kwargs)

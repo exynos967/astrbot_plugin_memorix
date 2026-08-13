@@ -6,7 +6,7 @@
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 import asyncio
 import re
@@ -23,6 +23,7 @@ from ..utils.time_parser import format_timestamp
 from .graph_relation_recall import GraphRelationRecallConfig, GraphRelationRecallService
 from .pagerank import PersonalizedPageRank, PageRankConfig
 from .posterior_graph import PosteriorGraphConfig, apply_posterior_graph_gate
+from .score_calibration import fuse_score_maps, normalize_calibration_method
 from .sparse_bm25 import SparseBM25Config, SparseBM25Index
 
 logger = get_logger("A_Memorix.DualPathRetriever")
@@ -67,6 +68,21 @@ class RetrievalResult:
             "source": self.source,
             "metadata": self.metadata,
         }
+
+
+@dataclass(frozen=True)
+class RetrievalScope:
+    """一次检索已解析出的可见资源集合。"""
+
+    key: str
+    paragraph_ids: FrozenSet[str] = field(default_factory=frozenset)
+    relation_ids: FrozenSet[str] = field(default_factory=frozenset)
+    entity_ids: FrozenSet[str] = field(default_factory=frozenset)
+    episode_ids: FrozenSet[str] = field(default_factory=frozenset)
+
+    @property
+    def empty(self) -> bool:
+        return not self.paragraph_ids and not self.relation_ids and not self.episode_ids
 
 
 @dataclass
@@ -195,6 +211,8 @@ class VectorPoolsConfig:
     semantic_weight: float = 0.65
     sparse_weight: float = 0.20
     graph_weight: float = 0.15
+    score_calibration_method: str = "none"
+    score_calibration_rrf_k: int = 60
     relation_intent_graph_top_k: int = 80
     relation_intent_semantic_weight: float = 0.45
     relation_intent_sparse_weight: float = 0.15
@@ -216,6 +234,8 @@ class VectorPoolsConfig:
         self.semantic_weight = max(0.0, float(self.semantic_weight))
         self.sparse_weight = max(0.0, float(self.sparse_weight))
         self.graph_weight = max(0.0, float(self.graph_weight))
+        self.score_calibration_method = normalize_calibration_method(self.score_calibration_method)
+        self.score_calibration_rrf_k = max(1, int(self.score_calibration_rrf_k))
 
         relation_intent = self.relation_intent if isinstance(self.relation_intent, dict) else {}
         self.relation_intent_graph_top_k = max(
@@ -1801,24 +1821,49 @@ class DualPathRetriever:
                 )
 
         results = list(candidates.values())
+        score_maps: Dict[str, Dict[str, float]] = {
+            "semantic": {},
+            "sparse": {},
+            "graph": {},
+        }
+        for item in results:
+            score_meta = self._candidate_score_meta(item)
+            if "semantic" in score_meta:
+                score_maps["semantic"][item.hash_value] = float(score_meta["semantic"])
+            if "sparse" in score_meta:
+                score_maps["sparse"][item.hash_value] = float(score_meta["sparse"])
+            graph_score = float(
+                score_meta.get("graph_evidence", self._aggregate_graph_evidence_score(item)) or 0.0
+            )
+            if graph_score > 0.0:
+                score_maps["graph"][item.hash_value] = graph_score
+        final_scores, calibrated_score_maps = fuse_score_maps(
+            score_maps,
+            {
+                "semantic": semantic_weight,
+                "sparse": sparse_weight,
+                "graph": graph_weight,
+            },
+            method=self.config.vector_pools.score_calibration_method,
+            rrf_k=self.config.vector_pools.score_calibration_rrf_k,
+        )
         for item in results:
             score_meta = self._candidate_score_meta(item)
             semantic_score = float(score_meta.get("semantic", 0.0) or 0.0)
             sparse_score = float(score_meta.get("sparse", 0.0) or 0.0)
             graph_score = float(
-                score_meta.get("graph_evidence", self._aggregate_graph_evidence_score(item))
-                or 0.0
+                score_meta.get("graph_evidence", self._aggregate_graph_evidence_score(item)) or 0.0
             )
-            final_score = (
-                semantic_weight * semantic_score
-                + sparse_weight * sparse_score
-                + graph_weight * graph_score
-            )
+            final_score = float(final_scores.get(item.hash_value, 0.0))
             score_meta.update(
                 {
                     "semantic": semantic_score,
                     "sparse": sparse_score,
                     "graph_evidence": graph_score,
+                    "calibrated_semantic": float(calibrated_score_maps["semantic"].get(item.hash_value, 0.0)),
+                    "calibrated_sparse": float(calibrated_score_maps["sparse"].get(item.hash_value, 0.0)),
+                    "calibrated_graph": float(calibrated_score_maps["graph"].get(item.hash_value, 0.0)),
+                    "score_calibration_method": self.config.vector_pools.score_calibration_method,
                     "semantic_weight": semantic_weight,
                     "sparse_weight": sparse_weight,
                     "graph_weight": graph_weight,

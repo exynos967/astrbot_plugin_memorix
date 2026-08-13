@@ -29,13 +29,13 @@ from .memorix.webui.plugin_page_bridge import PluginPageWebUIBridge
 if TYPE_CHECKING:
     from astrbot.api.provider import LLMResponse, ProviderRequest
 
-PLUGIN_VERSION = "0.9.5"
+PLUGIN_VERSION = "1.1.0"
 
 
 @register(
     "astrbot_plugin_memorix",
     "薄暝",
-    "A_Memorix memory plugin with embedded WebUI",
+    "让 AstrBot 拥有可检索、可维护、可追溯的长期记忆",
     PLUGIN_VERSION,
 )
 class MemorixPlugin(Star):
