@@ -8,7 +8,6 @@ import json
 import pickle
 import re
 import sqlite3
-import sys
 import time
 import uuid
 from datetime import datetime
@@ -18,19 +17,28 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from ...amemorix.common.logging import get_logger
 from ..utils.hash import compute_hash, normalize_text
 from ..utils.time_parser import normalize_time_meta
+from .core_schema import create_core_tables, ensure_legacy_core_columns
+from .episode_jobs import EpisodeJobsMixin
 from .knowledge_types import (
     KnowledgeType,
     allowed_knowledge_type_values,
     resolve_stored_knowledge_type,
     validate_stored_knowledge_type,
 )
+from .memory_operations import MemoryOperationsMixin
+from .metadata_fact import MetadataFactMixin
+from .metadata_profile_alias import MetadataProfileAliasMixin
+from .migration import inspect_database, inspect_database_file, migrate_metadata
+from .person_evidence import PersonEvidenceMixin
+from .schema import SCHEMA_VERSION, apply_schema
 from .schema_compat import (
     ensure_person_registry_schema_compat,
     ensure_table_column,
     ensure_transcript_schema_compat,
     table_columns,
 )
-from .schema_v21 import SCHEMA_VERSION, apply_upstream_schema_v21
+from .sqlite_connection import SQLiteConnectionManager
+from .transaction import MetadataTransactionMixin
 
 try:
     import jieba  # type: ignore
@@ -43,9 +51,7 @@ except Exception:
 logger = get_logger("A_Memorix.MetadataStore")
 
 
-RUNTIME_AUTO_MIGRATION_MIN_SCHEMA_VERSION = 9
 DEFAULT_MIGRATION_BATCH_SIZE = 2000
-SCHEMA_MIGRATION_SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "migrate_schema_v8_to_v13.py"
 
 
 def _normalize_legacy_knowledge_type(row: Tuple[str, str, Any]) -> Tuple[str, str]:
@@ -59,7 +65,7 @@ def _normalize_legacy_knowledge_type(row: Tuple[str, str, Any]) -> Tuple[str, st
     return normalized_type.value, paragraph_hash
 
 
-class MetadataStore:
+class MetadataStore(MemoryOperationsMixin, EpisodeJobsMixin, MetadataFactMixin, MetadataProfileAliasMixin, PersonEvidenceMixin, MetadataTransactionMixin):
     """
     元数据存储类
 
@@ -89,11 +95,18 @@ class MetadataStore:
         """
         self.data_dir = Path(data_dir) if data_dir else None
         self.db_name = db_name
-        self._conn: Optional[sqlite3.Connection] = None
+        self._connection_manager: Optional[SQLiteConnectionManager] = None
         self._is_initialized = False
         self._db_path: Optional[Path] = None
+        self.migration_report: Optional[Dict[str, Any]] = None
 
         logger.debug(f"元数据存储初始化: db={db_name}")
+
+    @property
+    def _conn(self) -> Optional[sqlite3.Connection]:
+        if self._connection_manager is None:
+            return None
+        return self._connection_manager.connection()
 
     def connect(
         self,
@@ -118,89 +131,52 @@ class MetadataStore:
 
         db_path = data_dir / self.db_name
         db_existed = db_path.exists()
+        if self._connection_manager is not None:
+            if self._db_path != db_path:
+                raise RuntimeError("MetadataStore 已连接其他数据库，请先关闭")
+            return
+        self.migration_report = None
+        if db_existed and enforce_schema:
+            inspect_database_file(db_path)
         self._db_path = db_path
+        self._connection_manager = SQLiteConnectionManager(db_path)
 
-        # 连接数据库
-        self._conn = sqlite3.connect(
-            str(db_path),
-            check_same_thread=False,
-            timeout=30.0,
-        )
-        self._conn.row_factory = sqlite3.Row  # 使用字典式访问
-
-        # 优化性能
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._conn.execute("PRAGMA cache_size=-64000")  # 64MB缓存
-        self._conn.execute("PRAGMA temp_store=MEMORY")
-        self._conn.execute("PRAGMA foreign_keys = ON") # 开启外键约束支持级联删除
-
-        logger.info(f"数据库已连接: {db_path}")
-
-        # 初始化或校验 schema
-        if not self._is_initialized:
-            if not db_existed:
-                self._initialize_tables()
-            if enforce_schema:
-                self._assert_schema_compatible(db_existed=db_existed)
-            self._is_initialized = True
-
-        # 初始化 FTS schema（幂等）
         try:
-            self.ensure_fts_schema()
-        except Exception as e:
-            logger.warning(f"初始化 FTS schema 失败，将跳过 BM25 检索: {e}")
+            logger.info(f"数据库已连接: {db_path}")
 
-        # 插件本地表与列补丁（开闭原则：不污染上游 _migrate_schema）。
-        # 上游 A_memorix schema 21 未提供 transcript / person_registry / async_tasks
-        # 等表，且会 DROP episode_pending_paragraphs；插件封装层继续保留这些本地表。
-        # 每次 connect 幂等执行。
-        self._ensure_plugin_local_schema()
+            # 初始化或校验 schema
+            if not self._is_initialized:
+                if enforce_schema:
+                    self._assert_schema_compatible(db_existed=db_existed)
+                elif not db_existed:
+                    with self.transaction(immediate=True):
+                        self._initialize_tables()
+                self._is_initialized = True
+
+            # 初始化 FTS schema（幂等）
+            try:
+                self.ensure_fts_schema()
+            except Exception as e:
+                logger.warning(f"初始化 FTS schema 失败，将跳过 BM25 检索: {e}")
+
+            # 插件本地表与列补丁（开闭原则：不污染上游 _migrate_schema）。
+            # 上游 A_memorix schema 21 未提供 transcript / person_registry / async_tasks
+            # 等表，且会 DROP episode_pending_paragraphs；插件封装层继续保留这些本地表。
+            # 每次 connect 幂等执行。
+            self._ensure_plugin_local_schema()
+        except BaseException:
+            self.close()
+            raise
 
     def _assert_schema_compatible(self, db_existed: bool) -> None:
-        """运行时执行 post-1.0 自动迁移；legacy/vNext 仍要求离线迁移。"""
-        migration_command = f'"{sys.executable}" "{SCHEMA_MIGRATION_SCRIPT}" --db "{self._db_path}"'
-        cursor = self._conn.cursor()
-        cursor.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
-        )
-        has_version_table = cursor.fetchone() is not None
-        if not has_version_table:
-            if db_existed:
-                raise RuntimeError(
-                    "检测到旧版 metadata schema（缺少 schema_migrations）。"
-                    f" 请停止插件后执行离线迁移：{migration_command}"
-                )
-            return
-
-        cursor.execute("SELECT MAX(version) FROM schema_migrations")
-        row = cursor.fetchone()
-        version = int(row[0]) if row and row[0] is not None else 0
-        if version < SCHEMA_VERSION and version >= RUNTIME_AUTO_MIGRATION_MIN_SCHEMA_VERSION:
-            self._run_runtime_auto_migration(current_version=version)
-            cursor.execute("SELECT MAX(version) FROM schema_migrations")
-            row = cursor.fetchone()
-            version = int(row[0]) if row and row[0] is not None else 0
-        if version != SCHEMA_VERSION:
-            raise RuntimeError(
-                f"metadata schema 版本不匹配: current={version}, expected={SCHEMA_VERSION}。"
-                f" 请停止插件后执行离线迁移：{migration_command}"
-            )
+        """按结构识别旧库，在任何后台写入启动前完成自动迁移。"""
+        state = inspect_database(self._conn)
+        if state.kind != "current":
+            self._run_runtime_auto_migration(current_version=state.version)
 
     def _run_runtime_auto_migration(self, *, current_version: int) -> None:
-        """对 1.0 之后的已版本化库执行轻量自动迁移。"""
-        logger.info(
-            f"检测到 metadata schema 需要运行时自动迁移: current={current_version}, target={SCHEMA_VERSION}",
-        )
-        self._migrate_schema()
-        alias_result = self.rebuild_relation_hash_aliases()
-        knowledge_type_result = self.normalize_paragraph_knowledge_types()
-        self.set_schema_version(SCHEMA_VERSION)
-        logger.info(
-            f"metadata schema 运行时自动迁移完成: {current_version} -> {SCHEMA_VERSION}, "
-            f"alias_inserted={int(alias_result.get('inserted', 0) or 0)}, "
-            f"knowledge_normalized={int(knowledge_type_result.get('normalized', 0) or 0)}",
-        )
+        logger.info("检测到 metadata 需要迁移: %s -> %s", current_version, SCHEMA_VERSION)
+        self.migration_report = migrate_metadata(self)
 
     def _ensure_memory_feedback_task_columns(self, cursor: sqlite3.Cursor) -> None:
         """补齐 memory_feedback_tasks 历史库缺失的 rollback_* 列。"""
@@ -222,12 +198,15 @@ class MetadataStore:
                     cursor.execute(sql)
                 except sqlite3.OperationalError as e:
                     logger.warning(f"Schema迁移失败 (memory_feedback_tasks.{col}): {e}")
+                    raise
 
     def _ensure_paragraph_stale_relation_mark_columns(self, cursor: sqlite3.Cursor) -> None:
         """补齐段落陈旧关系标记的来源追踪列。"""
         cursor.execute("PRAGMA table_info(paragraph_stale_relation_marks)")
         stale_mark_columns = {row[1] for row in cursor.fetchall()}
         stale_mark_migrations = {
+            "query_tool_id": "ALTER TABLE paragraph_stale_relation_marks ADD COLUMN query_tool_id TEXT",
+            "task_id": "ALTER TABLE paragraph_stale_relation_marks ADD COLUMN task_id INTEGER",
             "source_type": "ALTER TABLE paragraph_stale_relation_marks ADD COLUMN source_type TEXT",
             "source_id": "ALTER TABLE paragraph_stale_relation_marks ADD COLUMN source_id TEXT",
             "source_operation_id": "ALTER TABLE paragraph_stale_relation_marks ADD COLUMN source_operation_id TEXT",
@@ -238,6 +217,7 @@ class MetadataStore:
                     cursor.execute(sql)
                 except sqlite3.OperationalError as e:
                     logger.warning(f"Schema迁移失败 (paragraph_stale_relation_marks.{col}): {e}")
+                    raise
 
     def _ensure_fuzzy_modify_plan_tables(self, cursor: sqlite3.Cursor) -> None:
         """补齐模糊修改计划表，用于预览、确认、执行和追溯。"""
@@ -275,109 +255,17 @@ class MetadataStore:
 
     def close(self) -> None:
         """关闭数据库连接"""
-        if self._conn:
-            self._conn.close()
-            self._conn = None
+        if self._connection_manager is not None:
+            self._connection_manager.close_all()
+            self._connection_manager = None
+            self._is_initialized = False
             logger.info("数据库连接已关闭")
 
     def _initialize_tables(self) -> None:
         """初始化数据库表结构"""
         cursor = self._conn.cursor()
 
-        # 段落表
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS paragraphs (
-                hash TEXT PRIMARY KEY,
-                content TEXT NOT NULL,
-                vector_index INTEGER,
-                created_at REAL,
-                updated_at REAL,
-                metadata TEXT,
-                source TEXT,
-                word_count INTEGER,
-                event_time REAL,
-                event_time_start REAL,
-                event_time_end REAL,
-                time_granularity TEXT,
-                time_confidence REAL DEFAULT 1.0,
-                knowledge_type TEXT DEFAULT 'mixed',
-                is_permanent BOOLEAN DEFAULT 0,
-                last_accessed REAL,
-                access_count INTEGER DEFAULT 0,
-                is_deleted INTEGER DEFAULT 0,
-                deleted_at REAL
-            )
-        """)
-
-        # 实体表
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS entities (
-                hash TEXT PRIMARY KEY,
-                name TEXT NOT NULL UNIQUE,
-                vector_index INTEGER,
-                appearance_count INTEGER DEFAULT 1,
-                created_at REAL,
-                metadata TEXT,
-                is_deleted INTEGER DEFAULT 0,
-                deleted_at REAL
-            )
-        """)
-
-        # 关系表
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS relations (
-                hash TEXT PRIMARY KEY,
-                subject TEXT NOT NULL,
-                predicate TEXT NOT NULL,
-                object TEXT NOT NULL,
-                vector_index INTEGER,
-                confidence REAL DEFAULT 1.0,
-                vector_state TEXT DEFAULT 'none',
-                vector_updated_at REAL,
-                vector_error TEXT,
-                vector_retry_count INTEGER DEFAULT 0,
-                created_at REAL,
-                source_paragraph TEXT,
-                metadata TEXT,
-                is_permanent BOOLEAN DEFAULT 0,
-                last_accessed REAL,
-                access_count INTEGER DEFAULT 0,
-                is_inactive BOOLEAN DEFAULT 0,
-                inactive_since REAL,
-                is_pinned BOOLEAN DEFAULT 0,
-                protected_until REAL,
-                last_reinforced REAL,
-                UNIQUE(subject, predicate, object)
-            )
-        """)
-
-        # 回收站关系表
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS deleted_relations (
-                hash TEXT PRIMARY KEY,
-                subject TEXT NOT NULL,
-                predicate TEXT NOT NULL,
-                object TEXT NOT NULL,
-                vector_index INTEGER,
-                confidence REAL DEFAULT 1.0,
-                vector_state TEXT DEFAULT 'none',
-                vector_updated_at REAL,
-                vector_error TEXT,
-                vector_retry_count INTEGER DEFAULT 0,
-                created_at REAL,
-                source_paragraph TEXT,
-                metadata TEXT,
-                is_permanent BOOLEAN DEFAULT 0,
-                last_accessed REAL,
-                access_count INTEGER DEFAULT 0,
-                is_inactive BOOLEAN DEFAULT 0,
-                inactive_since REAL,
-                is_pinned BOOLEAN DEFAULT 0,
-                protected_until REAL,
-                last_reinforced REAL,
-                deleted_at REAL
-            )
-        """)
+        create_core_tables(self._conn)
 
         # 32位哈希别名映射（用于 vNext 唯一解析）
         cursor.execute("""
@@ -817,7 +705,7 @@ class MetadataStore:
         """)
         self._ensure_fuzzy_modify_plan_tables(cursor)
         self._create_performance_indexes()
-        apply_upstream_schema_v21(self._conn, logger)
+        apply_schema(self._conn, logger)
         # 新版 schema 包含完整字段，直接写入版本信息
         cursor.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)", (SCHEMA_VERSION, datetime.now().timestamp()))
         self._conn.commit()
@@ -825,6 +713,7 @@ class MetadataStore:
 
     def _migrate_schema(self) -> None:
         """执行数据库schema迁移"""
+        ensure_legacy_core_columns(self._conn)
         cursor = self._conn.cursor()
 
         # vNext 关键表兜底：历史库可能缺失，需在迁移阶段主动补齐。
@@ -1123,164 +1012,6 @@ class MetadataStore:
         """)
         self._ensure_fuzzy_modify_plan_tables(cursor)
 
-        # 检查paragraphs表是否有knowledge_type列
-        cursor.execute("PRAGMA table_info(paragraphs)")
-        columns = [row[1] for row in cursor.fetchall()]
-
-        if "knowledge_type" not in columns:
-            logger.info("检测到旧版schema，正在迁移添加knowledge_type字段...")
-            try:
-                cursor.execute("""
-                    ALTER TABLE paragraphs
-                    ADD COLUMN knowledge_type TEXT DEFAULT 'mixed'
-                """)
-                self._conn.commit()
-                logger.info("Schema迁移完成：已添加knowledge_type字段")
-            except sqlite3.OperationalError as e:
-                logger.warning(f"Schema迁移失败（可能已存在）: {e}")
-
-        # 问题2: 时序字段迁移
-        cursor.execute("PRAGMA table_info(paragraphs)")
-        columns = [row[1] for row in cursor.fetchall()]
-        temporal_columns = {
-            "event_time": "ALTER TABLE paragraphs ADD COLUMN event_time REAL",
-            "event_time_start": "ALTER TABLE paragraphs ADD COLUMN event_time_start REAL",
-            "event_time_end": "ALTER TABLE paragraphs ADD COLUMN event_time_end REAL",
-            "time_granularity": "ALTER TABLE paragraphs ADD COLUMN time_granularity TEXT",
-            "time_confidence": "ALTER TABLE paragraphs ADD COLUMN time_confidence REAL DEFAULT 1.0",
-        }
-        for col, sql in temporal_columns.items():
-            if col not in columns:
-                try:
-                    cursor.execute(sql)
-                except sqlite3.OperationalError as e:
-                    logger.warning(f"Schema迁移失败（{col}）: {e}")
-
-        # 时序索引（仅在列存在时创建，兼容旧库迁移）
-        self._create_temporal_indexes_if_ready()
-        self._conn.commit()
-
-        # 检查paragraphs表是否有is_permanent列
-        cursor.execute("PRAGMA table_info(paragraphs)")
-        columns = [row[1] for row in cursor.fetchall()]
-
-        if "is_permanent" not in columns:
-            logger.info("正在迁移: 添加记忆动态字段...")
-            try:
-                # 段落表
-                cursor.execute("ALTER TABLE paragraphs ADD COLUMN is_permanent BOOLEAN DEFAULT 0")
-                cursor.execute("ALTER TABLE paragraphs ADD COLUMN last_accessed REAL")
-                cursor.execute("ALTER TABLE paragraphs ADD COLUMN access_count INTEGER DEFAULT 0")
-
-                # 关系表
-                cursor.execute("ALTER TABLE relations ADD COLUMN is_permanent BOOLEAN DEFAULT 0")
-                cursor.execute("ALTER TABLE relations ADD COLUMN last_accessed REAL")
-                cursor.execute("ALTER TABLE relations ADD COLUMN access_count INTEGER DEFAULT 0")
-
-                self._conn.commit()
-                logger.info("Schema迁移完成：已添加记忆动态字段")
-            except sqlite3.OperationalError as e:
-                logger.warning(f"Schema迁移失败: {e}")
-
-        # 检查relations表是否有is_inactive列 (V5 Memory System)
-        cursor.execute("PRAGMA table_info(relations)")
-        columns = [row[1] for row in cursor.fetchall()]
-
-        if "is_inactive" not in columns:
-            logger.info("正在迁移: 添加V5记忆动态字段 (inactive, protected)...")
-            try:
-                # 关系表 V5 新增字段
-                cursor.execute("ALTER TABLE relations ADD COLUMN is_inactive BOOLEAN DEFAULT 0")
-                cursor.execute("ALTER TABLE relations ADD COLUMN inactive_since REAL")
-                cursor.execute("ALTER TABLE relations ADD COLUMN is_pinned BOOLEAN DEFAULT 0")
-                cursor.execute("ALTER TABLE relations ADD COLUMN protected_until REAL")
-                cursor.execute("ALTER TABLE relations ADD COLUMN last_reinforced REAL")
-
-                # 为回收站创建 deleted_relations 表
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS deleted_relations (
-                        hash TEXT PRIMARY KEY,
-                        subject TEXT NOT NULL,
-                        predicate TEXT NOT NULL,
-                        object TEXT NOT NULL,
-                        vector_index INTEGER,
-                        confidence REAL DEFAULT 1.0,
-                        vector_state TEXT DEFAULT 'none',
-                        vector_updated_at REAL,
-                        vector_error TEXT,
-                        vector_retry_count INTEGER DEFAULT 0,
-                        created_at REAL,
-                        source_paragraph TEXT,
-                        metadata TEXT,
-                        is_permanent BOOLEAN DEFAULT 0,
-                        last_accessed REAL,
-                        access_count INTEGER DEFAULT 0,
-                        is_inactive BOOLEAN DEFAULT 0,
-                        inactive_since REAL,
-                        is_pinned BOOLEAN DEFAULT 0,
-                        protected_until REAL,
-                        last_reinforced REAL,
-                        deleted_at REAL  -- 用于记录删除时间的额外列
-                    )
-                """)
-
-                self._conn.commit()
-                logger.info("Schema迁移完成：已添加V5记忆动态字段及回收站表")
-            except sqlite3.OperationalError as e:
-                logger.warning(f"Schema迁移失败 (V5): {e}")
-
-        # 关系向量状态字段迁移
-        cursor.execute("PRAGMA table_info(relations)")
-        relation_columns = {row[1] for row in cursor.fetchall()}
-        relation_vector_columns = {
-            "vector_state": "ALTER TABLE relations ADD COLUMN vector_state TEXT DEFAULT 'none'",
-            "vector_updated_at": "ALTER TABLE relations ADD COLUMN vector_updated_at REAL",
-            "vector_error": "ALTER TABLE relations ADD COLUMN vector_error TEXT",
-            "vector_retry_count": "ALTER TABLE relations ADD COLUMN vector_retry_count INTEGER DEFAULT 0",
-        }
-        for col, sql in relation_vector_columns.items():
-            if col not in relation_columns:
-                try:
-                    cursor.execute(sql)
-                except sqlite3.OperationalError as e:
-                    logger.warning(f"Schema迁移失败 (relations.{col}): {e}")
-
-        # 回收站同步字段迁移（用于 restore 保留向量状态）
-        cursor.execute("PRAGMA table_info(deleted_relations)")
-        deleted_relation_columns = {row[1] for row in cursor.fetchall()}
-        deleted_relation_vector_columns = {
-            "vector_state": "ALTER TABLE deleted_relations ADD COLUMN vector_state TEXT DEFAULT 'none'",
-            "vector_updated_at": "ALTER TABLE deleted_relations ADD COLUMN vector_updated_at REAL",
-            "vector_error": "ALTER TABLE deleted_relations ADD COLUMN vector_error TEXT",
-            "vector_retry_count": "ALTER TABLE deleted_relations ADD COLUMN vector_retry_count INTEGER DEFAULT 0",
-        }
-        for col, sql in deleted_relation_vector_columns.items():
-            if col not in deleted_relation_columns:
-                try:
-                    cursor.execute(sql)
-                except sqlite3.OperationalError as e:
-                    logger.warning(f"Schema迁移失败 (deleted_relations.{col}): {e}")
-
-        # 检查 entities 表是否有 is_deleted 列 (Soft Delete System)
-        cursor.execute("PRAGMA table_info(entities)")
-        columns = [row[1] for row in cursor.fetchall()]
-
-        if "is_deleted" not in columns:
-            logger.info("正在迁移: 添加软删除字段 (Soft Delete)...")
-            try:
-                # 实体表
-                cursor.execute("ALTER TABLE entities ADD COLUMN is_deleted INTEGER DEFAULT 0")
-                cursor.execute("ALTER TABLE entities ADD COLUMN deleted_at REAL")
-
-                # 段落表
-                cursor.execute("ALTER TABLE paragraphs ADD COLUMN is_deleted INTEGER DEFAULT 0")
-                cursor.execute("ALTER TABLE paragraphs ADD COLUMN deleted_at REAL")
-
-                self._conn.commit()
-                logger.info("Schema迁移完成：已添加软删除字段")
-            except sqlite3.OperationalError as e:
-                logger.warning(f"Schema迁移失败 (Soft Delete): {e}")
-
         # 数据修复: 检查是否存在 source/vector_index 列错位的情况
         # 症状: vector_index (本应是int) 变成了文件名字符串, source (本应是文件名) 变成了类型字符串
         try:
@@ -1305,6 +1036,7 @@ class MetadataStore:
                 logger.info(f"自动修复完成: 已校正 {cursor.rowcount} 条数据")
         except Exception as e:
             logger.error(f"数据自动修复失败: {e}")
+            raise
 
         # 历史库（如 v8）可能缺失 paragraph_relations / paragraph_entities / entities 等
         # 核心表，而 _create_performance_indexes 依赖这些表。上方列补丁已就绪，
@@ -1313,7 +1045,7 @@ class MetadataStore:
         self._initialize_tables()
 
         self._create_performance_indexes()
-        apply_upstream_schema_v21(self._conn, logger)
+        apply_schema(self._conn, logger)
         self._conn.commit()
 
     def _create_temporal_indexes_if_ready(self) -> None:
@@ -2440,32 +2172,7 @@ class MetadataStore:
         return self._dedupe_episode_sources([row["source"] for row in cursor.fetchall()])
 
     def _enqueue_episode_source_rebuilds(self, sources: List[Any], reason: str = "") -> int:
-        normalized_sources = self._dedupe_episode_sources(sources)
-        if not normalized_sources:
-            return 0
-
-        now = datetime.now().timestamp()
-        reason_text = str(reason or "").strip()[:200] or None
-        cursor = self._conn.cursor()
-        cursor.executemany(
-            """
-            INSERT INTO episode_rebuild_sources (
-                source, status, retry_count, last_error, reason, requested_at, updated_at
-            ) VALUES (?, 'pending', 0, NULL, ?, ?, ?)
-            ON CONFLICT(source) DO UPDATE SET
-                status = 'pending',
-                last_error = NULL,
-                reason = excluded.reason,
-                requested_at = excluded.requested_at,
-                updated_at = excluded.updated_at
-            """,
-            [
-                (source, reason_text, now, now)
-                for source in normalized_sources
-            ],
-        )
-        self._conn.commit()
-        return len(normalized_sources)
+        return self.enqueue_episode_rebuilds(sources, reason)
 
     def add_paragraph(
         self,
@@ -3897,7 +3604,7 @@ class MetadataStore:
 
     @staticmethod
     def _decode_metadata(value: Any) -> Dict[str, Any]:
-        if value in {None, ""}:
+        if value is None or value == "":
             return {}
         if isinstance(value, dict):
             return dict(value)
@@ -4028,6 +3735,7 @@ class MetadataStore:
         reason: str = "",
         updated_by: str = "",
         result: Optional[Dict[str, Any]] = None,
+        conn: Optional[sqlite3.Connection] = None,
     ) -> Dict[str, Any]:
         operation_id = f"v5_{uuid.uuid4().hex}"
         created_at = datetime.now().timestamp()
@@ -4041,7 +3749,8 @@ class MetadataStore:
             "resolved_hashes": [str(item or "").strip() for item in (resolved_hashes or []) if str(item or "").strip()],
             "result": result or {},
         }
-        cursor = self._conn.cursor()
+        connection = self._resolve_conn(conn)
+        cursor = connection.cursor()
         cursor.execute(
             """
             INSERT INTO memory_v5_operations (
@@ -4059,7 +3768,8 @@ class MetadataStore:
                 self._json_dumps(payload["result"]),
             ),
         )
-        self._conn.commit()
+        if conn is None:
+            connection.commit()
         return payload
 
     def create_fuzzy_modify_plan(
@@ -4776,9 +4486,10 @@ class MetadataStore:
         resolved = str(row[0])
         return [resolved]
 
-    def rebuild_relation_hash_aliases(self) -> Dict[str, Any]:
+    def rebuild_relation_hash_aliases(self, *, conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
         """使用集合 SQL 重建 32 位 relation hash 别名映射。"""
-        cursor = self._conn.cursor()
+        connection = self._resolve_conn(conn)
+        cursor = connection.cursor()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS relation_hash_aliases (
                 alias32 TEXT PRIMARY KEY,
@@ -4823,7 +4534,8 @@ class MetadataStore:
             """
         )
         conflicts = [str(row[0]) for row in cursor.fetchall()]
-        self._conn.commit()
+        if conn is None:
+            connection.commit()
         return {
             "inserted": inserted,
             "conflict_count": len(conflicts),
@@ -4880,6 +4592,7 @@ class MetadataStore:
         )
         changed = cursor.rowcount > 0 and row is not None
         if changed:
+            self.restore_paragraph_facts(str(paragraph_hash), conn=self._conn)
             self._upsert_paragraph_ngram_if_ready(
                 str(paragraph_hash),
                 str(row["content"] or ""),
@@ -5004,6 +4717,7 @@ class MetadataStore:
                 )
 
             # 3. [主删除] 删除段落 (触发 CASCADE 删 paragraph_relations)
+            self.detach_paragraph_facts([paragraph_hash], recoverable=False, conn=self._conn)
             self._delete_paragraph_ngrams_if_ready(
                 [paragraph_hash],
                 count_delta=-1 if paragraph_was_active else 0,
@@ -5068,6 +4782,9 @@ class MetadataStore:
         """清空所有表数据"""
         cursor = self._conn.cursor()
         tables = [
+            "fact_evidence", "fact_transitions", "fact_claims",
+            "paragraph_fact_evidence_backups", "graph_pending_renames",
+            "person_profile_snapshots", "person_profile_overrides", "person_profile_alias_overrides",
             "paragraphs", "entities", "relations",
             "paragraph_relations", "paragraph_entities",
             "episodes", "episode_paragraphs",
@@ -5119,7 +4836,7 @@ class MetadataStore:
         placeholders = ",".join(["?"] * len(hashes))
         cursor = self._conn.cursor()
         cursor.execute(f"""
-            SELECT hash, is_inactive, confidence, is_pinned, protected_until, last_reinforced, inactive_since
+            SELECT hash, is_inactive, confidence, is_pinned, is_permanent, protected_until, last_reinforced, inactive_since
             FROM relations
             WHERE hash IN ({placeholders})
         """, hashes)
@@ -5130,6 +4847,7 @@ class MetadataStore:
                 "is_inactive": bool(row["is_inactive"]),
                 "weight": row["confidence"],
                 "is_pinned": bool(row["is_pinned"]),
+                "is_permanent": bool(row["is_permanent"]),
                 "protected_until": row["protected_until"],
                 "last_reinforced": row["last_reinforced"],
                 "inactive_since": row["inactive_since"]
@@ -5223,8 +4941,10 @@ class MetadataStore:
             SELECT hash FROM relations
             WHERE is_inactive = 1
             AND inactive_since < ?
+            AND COALESCE(is_pinned, 0) = 0 AND COALESCE(is_permanent, 0) = 0
+            AND COALESCE(protected_until, 0) <= ?
             LIMIT ?
-        """, (cutoff_time, limit))
+        """, (cutoff_time, time.time(), limit))
         return [row[0] for row in cursor.fetchall()]
 
     def backup_and_delete_relations(self, hashes: List[str]) -> int:
@@ -5438,7 +5158,7 @@ class MetadataStore:
             placeholders = ",".join(["?"] * len(chunk))
             sql = f"""
                 UPDATE relations
-                SET is_inactive = 1, inactive_since = ?
+                SET is_inactive = 1, inactive_since = COALESCE(inactive_since, ?)
                 WHERE hash IN ({placeholders})
             """
             cursor.execute(sql, [mark_time] + chunk)
@@ -5669,6 +5389,9 @@ class MetadataStore:
         if type_ == "paragraph":
             touched_sources = self._get_sources_for_paragraph_hashes(hashes, include_deleted=True)
 
+        if type_ == "paragraph":
+            self.detach_paragraph_facts(hashes, recoverable=True, conn=self._conn)
+
         count = 0
         batch_size = 900
         for i in range(0, len(hashes), batch_size):
@@ -5680,7 +5403,7 @@ class MetadataStore:
             cursor.execute(f"""
                 UPDATE {table}
                 SET is_deleted = 1, deleted_at = ?
-                WHERE is_deleted = 0 AND hash IN ({placeholders})
+                WHERE COALESCE(is_deleted, 0) = 0 AND hash IN ({placeholders})
             """, [now] + batch)
             changed = cursor.rowcount
             count += changed
@@ -5748,6 +5471,7 @@ class MetadataStore:
     def physically_delete_paragraphs(self, hashes: List[str]) -> int:
         """物理删除段落 (批量)"""
         if not hashes: return 0
+        self.detach_paragraph_facts(hashes, recoverable=False, conn=self._conn)
         touched_sources = self._get_sources_for_paragraph_hashes(hashes, include_deleted=True)
         active_delete_count = 0
         batch_size = 900
@@ -5833,6 +5557,7 @@ class MetadataStore:
                 count += changed
                 if changed > 0:
                     for row in revive_rows:
+                        self.restore_paragraph_facts(str(row["hash"]), conn=self._conn)
                         self._upsert_paragraph_ngram_if_ready(
                             str(row["hash"]),
                             str(row["content"] or ""),
@@ -6526,8 +6251,7 @@ class MetadataStore:
         now = datetime.now().timestamp()
         cursor = self._conn.cursor()
 
-        try:
-            cursor.execute("BEGIN IMMEDIATE")
+        with self.transaction(immediate=True):
             cursor.execute(
                 """
                 SELECT episode_id, created_at
@@ -6649,11 +6373,7 @@ class MetadataStore:
                 )
                 inserted_count += 1
 
-            self._conn.commit()
             return {"source": token, "episode_count": inserted_count}
-        except Exception:
-            self._conn.rollback()
-            raise
 
     def enqueue_episode_pending(
         self,
@@ -7694,13 +7414,15 @@ class MetadataStore:
         person_id: str,
         reason: str = "",
         source_query_tool_id: str = "",
+        conn: Optional[sqlite3.Connection] = None,
     ) -> Optional[Dict[str, Any]]:
         token = str(person_id or "").strip()
         if not token:
             return None
 
         now = datetime.now().timestamp()
-        cursor = self._conn.cursor()
+        connection = self._resolve_conn(conn)
+        cursor = connection.cursor()
         cursor.execute(
             """
             INSERT INTO person_profile_refresh_queue (
@@ -7722,7 +7444,12 @@ class MetadataStore:
                 now,
             ),
         )
-        self._conn.commit()
+        cursor.execute(
+            "UPDATE person_profile_snapshots SET expires_at = 0 WHERE person_id = ?",
+            (token,),
+        )
+        if conn is None:
+            connection.commit()
         return self.get_person_profile_refresh_request(token)
 
     def fetch_person_profile_refresh_batch(
@@ -8140,6 +7867,14 @@ class MetadataStore:
 
         conditions.append(f"{source_expr} != ''")
         conditions.append("COALESCE(e.paragraph_count, 0) > 0")
+        conditions.append("""
+            COALESCE(e.paragraph_count, 0) = (
+                SELECT COUNT(*) FROM episode_paragraphs ep_live
+                JOIN paragraphs p_live ON p_live.hash = ep_live.paragraph_hash
+                WHERE ep_live.episode_id = e.episode_id
+                  AND COALESCE(p_live.is_deleted, 0) = 0
+            )
+        """)
         conditions.append(
             """
             NOT EXISTS (

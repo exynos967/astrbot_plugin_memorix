@@ -7,8 +7,8 @@ from astrbot_plugin_memorix.memorix.core.storage.metadata_store import (
 
 
 def test_schema_version_is_current() -> None:
-    """当前模块级版本号应与上游 A_memorix schema 21 对齐。"""
-    assert SCHEMA_VERSION == 21
+    """当前模块级版本号使用 AstrBot 原生 schema 23。"""
+    assert SCHEMA_VERSION == 23
 
 
 def test_fuzzy_modify_plans_table_and_indexes_exist(tmp_path) -> None:

@@ -3,15 +3,9 @@
 
 用途
 ----
-插件 vendored core 升级后，``metadata_store.SCHEMA_VERSION`` 会随内核 schema 演进。
-新版运行时自动迁移要求 ``schema_version >= RUNTIME_AUTO_MIGRATION_MIN_SCHEMA_VERSION (9)``，
-因此历史 v8 库首次启动会被 ``_assert_schema_compatible`` 直接拒绝。本脚本提供离线兜底：
-直接复用新版 ``MetadataStore._migrate_schema()``（幂等全量 DDL）把老库推到当前版本。
-
-何时用
-------
-* 用户不信任运行时自动迁移，想手动升级后再启动；
-* 运行时迁移因环境问题失败，需要离线修复。
+正常启动会自动升级可识别的旧 metadata.db（包括 v8 和字段指纹匹配的无版本库）。
+本脚本提供批量预检查、停机后手动升级和备份恢复，复用运行时迁移入口。
+迁移前通过 SQLite Backup API 保存包含 WAL 数据的快照，失败时整体回滚。
 
 用法
 ----
@@ -29,12 +23,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import sqlite3
 import sys
-import time
+from contextlib import closing
 from pathlib import Path
-from typing import Any, Dict
 
 PLUGIN_NAME = "astrbot_plugin_memorix"
 
@@ -61,37 +53,20 @@ def _resolve_metadata_store():
     return MetadataStore, SCHEMA_VERSION
 
 
-def _read_current_version(db_path: Path) -> int:
-    """直连读取当前 schema_version，缺失 schema_migrations 视为 0。"""
-
-    if not db_path.exists():
-        return 0
-    conn = sqlite3.connect(str(db_path))
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
-        )
-        if cursor.fetchone() is None:
-            return 0
-        cursor.execute("SELECT MAX(version) FROM schema_migrations")
-        row = cursor.fetchone()
-        return int(row[0]) if row and row[0] is not None else 0
-    finally:
-        conn.close()
-
-
-def _backup_db(db_path: Path) -> Path:
-    backup_path = db_path.with_suffix(db_path.suffix + f".v8.bak.{int(time.time())}")
-    shutil.copy2(str(db_path), str(backup_path))
-    return backup_path
-
-
 def _restore_db(db_path: Path, backup_path: Path) -> None:
-    if not backup_path.exists():
-        print(f"[错误] 备份文件不存在: {backup_path}", file=sys.stderr)
-        sys.exit(2)
-    shutil.copy2(str(backup_path), str(db_path))
+    if not backup_path.is_file():
+        raise ValueError(f"备份文件不存在: {backup_path}")
+    if backup_path.resolve() == db_path.resolve():
+        raise ValueError("备份文件不能与恢复目标相同")
+    with closing(sqlite3.connect(backup_path.resolve().as_uri() + "?mode=ro", uri=True)) as source:
+        if source.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+            raise RuntimeError("备份完整性检查失败，未执行恢复")
+        def progress(status, remaining, total):
+            if status in {5, 6}:
+                raise RuntimeError("恢复目标数据库正忙，请停止插件后重试")
+
+        with closing(sqlite3.connect(db_path)) as target:
+            source.backup(target, progress=progress)
     print(f"[完成] 已从备份恢复: {backup_path} -> {db_path}")
 
 
@@ -156,47 +131,27 @@ def _discover_scope_dbs(plugin_data_dir: Path | None) -> list[tuple[str, Path]]:
 
 def _migrate(db_path: Path, dry_run: bool) -> int:
     MetadataStore, schema_version = _resolve_metadata_store()
-    current = _read_current_version(db_path)
-    print(f"[信息] 当前 schema_version={current}, 目标={schema_version}, db={db_path}")
+    from memorix.core.storage.migration import inspect_database_file
 
-    if current == 0 and not db_path.exists():
-        print(f"[信息] 数据库不存在，将创建全新 v{schema_version} 库。")
-    elif current >= schema_version:
+    state = inspect_database_file(db_path) if db_path.exists() else None
+    current = state.version if state else 0
+    print(f"[信息] 当前 schema_version={current}, 目标={schema_version}, db={db_path}")
+    if state is not None and state.kind == "current":
         print(f"[信息] 已是最新版本 (v{current})，无需迁移。")
         return 0
-
     if dry_run:
-        print("[dry-run] 将执行：备份 -> _migrate_schema() -> rebuild_relation_hash_aliases() "
-              f"-> normalize_paragraph_knowledge_types() -> set_schema_version({schema_version})")
+        print("[dry-run] 将执行：SQLite 一致性备份（旧库） -> 事务内升级/补列/回填 -> 完整性检查 -> 提交版本；不改动数据库")
         return 0
-
-    backup_path: Path | None = None
-    if db_path.exists():
-        backup_path = _backup_db(db_path)
-        print(f"[备份] {backup_path}")
-
     store = MetadataStore(data_dir=str(db_path.parent), db_name=db_path.name)
-    # enforce_schema=False 避免老库在 _assert_schema_compatible 直接抛错，
-    # 改由本脚本显式调用 _migrate_schema 推进版本。
-    store.connect(enforce_schema=False)
     try:
-        store._migrate_schema()
-        alias_result: Dict[str, Any] = store.rebuild_relation_hash_aliases()
-        kt_result: Dict[str, Any] = store.normalize_paragraph_knowledge_types()
-        store.set_schema_version(schema_version)
-        if store._conn is not None:
-            store._conn.commit()
+        store.connect()
+        report = store.migration_report or {}
+        after = store.get_schema_version()
     finally:
         store.close()
-
-    after = _read_current_version(db_path)
-    print(
-        f"[完成] 迁移结束: v{current} -> v{after}, "
-        f"alias_inserted={int(alias_result.get('inserted', 0) or 0)}, "
-        f"knowledge_normalized={int(kt_result.get('normalized', 0) or 0)}"
-    )
-    if backup_path is not None:
-        print(f"[提示] 旧库已备份于: {backup_path}（如需回滚使用 --restore）")
+    print(f"[完成] 迁移结束: v{current} -> v{after}")
+    if report.get("backup_path"):
+        print(f"[备份] {report['backup_path']}（如需回滚，请停机后使用 --restore）")
     return 0 if after == schema_version else 3
 
 
@@ -242,17 +197,25 @@ def main() -> int:
         help="插件数据目录，默认自动查找 data/plugin_data/astrbot_plugin_memorix",
     )
     parser.add_argument("--dry-run", action="store_true", help="仅打印将执行的步骤，不改动数据库")
-    parser.add_argument("--restore", type=Path, help="从指定备份恢复单个 --db 数据库")
+    parser.add_argument("--restore", type=Path, help="停止插件后，从指定备份恢复单个 --db 数据库")
     args = parser.parse_args()
 
     if args.restore is not None:
         if args.db is None:
             parser.error("--restore 必须配合 --db 使用")
-        _restore_db(args.db, args.restore)
-        return 0
+        try:
+            _restore_db(args.db, args.restore)
+            return 0
+        except Exception as exc:
+            print(f"[错误] 恢复失败: {exc}", file=sys.stderr)
+            return 3
 
     if args.db is not None:
-        return _migrate(args.db, args.dry_run)
+        try:
+            return _migrate(args.db, args.dry_run)
+        except Exception as exc:
+            print(f"[错误] 迁移失败: {exc}", file=sys.stderr)
+            return 3
 
     return _migrate_all(args.plugin_data_dir, args.dry_run)
 

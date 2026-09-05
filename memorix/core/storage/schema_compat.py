@@ -19,7 +19,8 @@ def ensure_table_column(
     logger: Any = None,
 ) -> None:
     """Add a missing column for legacy DBs where CREATE TABLE IF NOT EXISTS is not enough."""
-    if column_name in table_columns(cursor, table_name):
+    columns = table_columns(cursor, table_name)
+    if not columns or column_name in columns:
         return
     try:
         cursor.execute(add_column_sql)
@@ -28,6 +29,7 @@ def ensure_table_column(
     except sqlite3.OperationalError as e:
         if logger:
             logger.warning("Schema兼容迁移失败（%s.%s）: %s", table_name, column_name, e)
+        raise
 
 
 def ensure_table_columns(
