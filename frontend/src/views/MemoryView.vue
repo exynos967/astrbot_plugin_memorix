@@ -6,6 +6,7 @@ import { onMounted } from "vue";
 import MemoryStatusPanel from "@/components/memory/MemoryStatusPanel.vue";
 import MemoryActionsPanel from "@/components/memory/MemoryActionsPanel.vue";
 import RecyclePanel from "@/components/memory/RecyclePanel.vue";
+import DeleteOperationsPanel from "@/components/memory/DeleteOperationsPanel.vue";
 import { useMemoryStore } from "@/stores/memory";
 import type { MemoryAction } from "@/services/memoryApi";
 
@@ -41,6 +42,7 @@ onMounted(() => {
       <button class="btn" :disabled="memory.loadingRecycle" @click="memory.loadRecycle()">刷新回收站</button>
     </div>
     <RecyclePanel :items="memory.recycle" :busy="memory.actionBusy" @restore="onRestore" />
+    <DeleteOperationsPanel />
   </section>
 </template>
 

@@ -1,11 +1,4 @@
-// Person API（typed 封装）。
-// 后端契约（均 NOT scope-aware，直接操作插件级全局 store，故不传 scope）：
-//   GET     /v1/person/registry/list ?keyword=&page=1&page_size=30 → v1_router.py:627
-//   POST    /v1/person/query       {person_keyword, top_k, force_refresh} → v1_router.py:580
-//   POST    /v1/person/override    {person_id, override_text, updated_by} → v1_router.py:595
-//   DELETE  /v1/person/override     {person_id} → v1_router.py:608
-//
-// 与 legacy 一致：registry/query/override 全走 /v1。person_profile.* 与之等价，沿用 /v1。
+// 人物接口随当前记忆作用域路由。
 
 import { api } from "./api";
 
@@ -97,29 +90,32 @@ export function fetchPersonRegistry(
   keyword: string,
   page = 1,
   pageSize = 30,
+  scope?: string,
 ): Promise<PersonRegistryList> {
   const kw = encodeURIComponent(keyword || "");
   return api.get<PersonRegistryList>(
     `/v1/person/registry/list?keyword=${kw}&page=${page}&page_size=${pageSize}`,
+    { scope },
   );
 }
 
-export function queryPerson(req: PersonQueryRequest): Promise<PersonProfile> {
-  return api.post<PersonProfile>("/v1/person/query", req);
+export function queryPerson(req: PersonQueryRequest, scope?: string): Promise<PersonProfile> {
+  return api.post<PersonProfile>("/v1/person/query", req, { scope });
 }
 
 export function savePersonOverride(
   personId: string,
   overrideText: string,
   updatedBy = "webui",
+  scope?: string,
 ): Promise<PersonOverrideResult> {
   return api.post<PersonOverrideResult>("/v1/person/override", {
     person_id: personId,
     override_text: overrideText,
     updated_by: updatedBy,
-  });
+  }, { scope });
 }
 
-export function clearPersonOverride(personId: string): Promise<PersonOverrideResult> {
-  return api.delete<PersonOverrideResult>("/v1/person/override", { person_id: personId });
+export function clearPersonOverride(personId: string, scope?: string): Promise<PersonOverrideResult> {
+  return api.delete<PersonOverrideResult>("/v1/person/override", { person_id: personId }, { scope });
 }

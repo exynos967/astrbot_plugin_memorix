@@ -5,6 +5,7 @@
 import PersonQueryPanel from "@/components/people/PersonQueryPanel.vue";
 import PersonProfilePanel from "@/components/people/PersonProfilePanel.vue";
 import PersonOverridePanel from "@/components/people/PersonOverridePanel.vue";
+import PersonMemoryPanel from "@/components/people/PersonMemoryPanel.vue";
 import { usePeopleStore } from "@/stores/people";
 
 const store = usePeopleStore();
@@ -22,6 +23,7 @@ const store = usePeopleStore();
     </div>
 
     <PersonOverridePanel />
+    <PersonMemoryPanel />
   </section>
 </template>
 
