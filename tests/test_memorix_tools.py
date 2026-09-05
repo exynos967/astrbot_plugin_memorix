@@ -266,9 +266,9 @@ def test_provider_bridge_uses_current_astrbot_context_api():
             self.origin = None
             self.request = None
 
-        def get_using_provider(self, origin):
+        async def get_current_chat_provider_id(self, origin):
             self.origin = origin
-            return _Provider()
+            return "session-provider"
 
         async def llm_generate(self, **kwargs):
             self.request = kwargs
@@ -1101,9 +1101,9 @@ def test_astrbot_llm_client_complete_forwards_umo():
         def __init__(self):
             self.origin = None
 
-        def get_using_provider(self, origin):
+        async def get_current_chat_provider_id(self, origin):
             self.origin = origin
-            return _Provider()
+            return "session-provider"
 
         async def llm_generate(self, **kwargs):
             return SimpleNamespace(completion_text="ok")

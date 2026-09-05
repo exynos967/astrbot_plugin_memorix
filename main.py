@@ -84,11 +84,8 @@ class MemorixPlugin(Star):
             self.context.add_llm_tools(*self._llm_tools)
             await self.person_fact_writeback_service.start()
             await self.feedback_service.start_background_loops()
-        except Exception:
-            self._remove_llm_tools()
-            await self._close_component("feedback service", self.feedback_service.stop_background_loops)
-            await self._close_component("person fact writeback", self.person_fact_writeback_service.close)
-            await self._close_component("webui", self.webui_page_bridge.close)
+        except BaseException:
+            await self.terminate()
             raise
         logger.info("[memorix] initialize done")
 
@@ -132,13 +129,9 @@ class MemorixPlugin(Star):
             logger.warning("[memorix] get LLM tool manager failed during cleanup", exc_info=True)
             return
 
-        remove_func = getattr(tool_manager, "remove_func", None)
-        if not callable(remove_func):
-            logger.warning("[memorix] LLM tool manager does not provide remove_func")
-            return
         for tool in tools:
             try:
-                remove_func(tool.name)
+                tool_manager.remove_func(tool.name)
             except Exception:
                 logger.warning("[memorix] remove LLM tool failed: %s", tool.name, exc_info=True)
 

@@ -7,13 +7,6 @@ import json
 from typing import Any, Dict, Optional, Tuple
 
 
-def _extract_provider_id(provider: Any) -> str:
-    """Read the ID from AstrBot's Provider.meta() contract."""
-    if provider is None:
-        return ""
-    return str(provider.meta().id or "").strip()
-
-
 class AstrBotProviderBridge:
     """AstrBot Context bridge for provider selection and invocation."""
 
@@ -33,8 +26,7 @@ class AstrBotProviderBridge:
     async def resolve_chat_provider_id(self, unified_msg_origin: str = "") -> str:
         if self.chat_provider_id:
             return self.chat_provider_id
-        provider = self._context.get_using_provider(unified_msg_origin or None)
-        return _extract_provider_id(provider)
+        return await self._context.get_current_chat_provider_id(unified_msg_origin)
 
     async def generate_text(
         self,
