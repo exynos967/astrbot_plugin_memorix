@@ -23,6 +23,7 @@ from ..utils.time_parser import format_timestamp
 from .graph_relation_recall import GraphRelationRecallConfig, GraphRelationRecallService
 from .pagerank import PersonalizedPageRank, PageRankConfig
 from .posterior_graph import PosteriorGraphConfig, apply_posterior_graph_gate
+from .graph_evidence import calibrate_weights, grounding_factor
 from .score_calibration import fuse_score_maps, normalize_calibration_method
 from .sparse_bm25 import SparseBM25Config, SparseBM25Index
 
@@ -1704,7 +1705,9 @@ class DualPathRetriever:
                 if temporal and not self._is_temporal_match(paragraph, temporal):
                     continue
                 order = item_index * max(1, max(cfg.relation_expand_per_hit, cfg.entity_expand_per_hit)) + paragraph_index
-                expanded_entries.append((float(evidence_score), order, paragraph, dict(evidence)))
+                grounded = grounding_factor(evidence, paragraph)
+                expanded_entries.append((float(evidence_score) * grounded, order, paragraph,
+                                         {**evidence, "grounding_factor": grounded}))
 
         expanded_entries.sort(key=lambda item: (-item[0], item[1]))
         evidence_by_paragraph: Dict[str, Dict[str, Any]] = {}
@@ -1744,7 +1747,11 @@ class DualPathRetriever:
 
         candidates: Dict[str, RetrievalResult] = {}
         if embedding_ok and query_emb is not None:
-            paragraph_top_k = max(top_k, int(self.config.vector_pools.paragraph_top_k))
+            multiplier = max(1, temporal.candidate_multiplier) if temporal else 1
+            paragraph_top_k = self._cap_temporal_scan_k(
+                max(top_k, int(self.config.vector_pools.paragraph_top_k)) * multiplier, temporal,
+            )
+            graph_top_k = self._cap_temporal_scan_k(graph_top_k * multiplier, temporal)
             para_ids, para_scores = await asyncio.to_thread(
                 self.paragraph_vector_store.search,
                 query_emb,
@@ -1837,6 +1844,12 @@ class DualPathRetriever:
             )
             if graph_score > 0.0:
                 score_maps["graph"][item.hash_value] = graph_score
+        configured_graph_weight = graph_weight
+        semantic_weight, sparse_weight, graph_weight, reliability = calibrate_weights(
+            [{"scores": self._candidate_score_meta(item), "evidence": self._candidate_evidence_items(item)} for item in results],
+            semantic_weight=semantic_weight, sparse_weight=sparse_weight, graph_weight=graph_weight,
+            scan_limit=max(1, top_k),
+        )
         final_scores, calibrated_score_maps = fuse_score_maps(
             score_maps,
             {
@@ -1867,6 +1880,11 @@ class DualPathRetriever:
                     "semantic_weight": semantic_weight,
                     "sparse_weight": sparse_weight,
                     "graph_weight": graph_weight,
+                    "configured_graph_weight": configured_graph_weight,
+                    "graph_reliability": reliability.score,
+                    "graph_grounding_quality": reliability.grounding_quality,
+                    "graph_channel_agreement": reliability.channel_agreement,
+                    "graph_support_coverage": reliability.support_coverage,
                     "final": final_score,
                 }
             )
