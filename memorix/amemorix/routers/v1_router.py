@@ -290,6 +290,11 @@ def _status_from_episode_summary(summary: Dict[str, Any]) -> str:
     return "ready"
 
 
+@router.get("/import/limits")
+async def import_limits(request: Request):
+    return request.app.state.import_task_manager.get_import_limits()
+
+
 @router.post("/import/tasks")
 async def create_import_task(request: Request, body: ImportTaskCreateRequest):
     manager = _task_manager(request)

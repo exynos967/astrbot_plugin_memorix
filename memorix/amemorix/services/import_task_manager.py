@@ -12,6 +12,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from ...core.strategies.chat_log import ChatLogStrategy
+from ...core.utils.import_payloads import normalize_paragraph_import_item
+
 from ..common.logging import get_logger
 from ..context import AppContext
 
@@ -109,6 +112,8 @@ class ImportFileRecord:
     default_knowledge_type: str = ""
     retry_mode: str = ""
     retry_chunk_indexes: List[int] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+    default_source: str = ""
 
     def to_dict(self, include_chunks: bool = False) -> Dict[str, Any]:
         data = {
@@ -128,6 +133,7 @@ class ImportFileRecord:
             "updated_at": self.updated_at,
             "source_path": self.source_path,
             "default_knowledge_type": self.default_knowledge_type,
+            "warnings": list(self.warnings),
             "retry_mode": self.retry_mode,
             "retry_chunk_indexes": list(self.retry_chunk_indexes),
         }
@@ -199,6 +205,7 @@ class ImportTaskManager:
         self._lock = asyncio.Lock()
         self._worker_task: Optional[asyncio.Task] = None
         self._stopping = False
+        self._last_cleanup_at = 0.0
 
         self._temp_root = (self.ctx.data_dir / "web_import_tmp").resolve()
         self._temp_root.mkdir(parents=True, exist_ok=True)
@@ -218,6 +225,35 @@ class ImportTaskManager:
     def _max_file_size_bytes(self) -> int:
         mb = max(1, _coerce_int(self._cfg("web.import.max_file_size_mb", 20), 20))
         return mb * 1024 * 1024
+
+    def get_import_limits(self) -> Dict[str, Any]:
+        return {"max_file_size_bytes": self._max_file_size_bytes(), "suffixes": sorted(ALLOWED_FILE_SUFFIXES),
+                "task_retention_seconds": 86400}
+
+    def _cleanup_expired_tasks_locked(self) -> None:
+        now = _now()
+        if now - self._last_cleanup_at < 60:
+            return
+        self._last_cleanup_at = now
+        cutoff = now - 86400
+        expired = {key for key, task in self._tasks.items() if task.status in TASK_TERMINAL and task.updated_at < cutoff}
+        protected = {Path(file.temp_path).resolve().parent for key, task in self._tasks.items() if key not in expired
+                     for file in task.files if file.temp_path}
+        for directory in self._temp_root.iterdir():
+            if directory.is_symlink() or not directory.is_dir() or directory.resolve().parent != self._temp_root:
+                continue
+            if len(directory.name) != 32 or any(ch not in "0123456789abcdef" for ch in directory.name):
+                continue
+            if directory in protected or (directory.name not in expired and directory.stat().st_mtime >= cutoff):
+                continue
+            for path in directory.iterdir():
+                if path.is_file() and not path.is_symlink():
+                    path.unlink()
+            if not any(directory.iterdir()):
+                directory.rmdir()
+        for key in expired:
+            self._tasks.pop(key, None)
+        self._task_order = deque(key for key in self._task_order if key not in expired)
 
     def _max_paste_chars(self) -> int:
         return max(1000, _coerce_int(self._cfg("web.import.max_paste_chars", 200000), 200000))
@@ -240,6 +276,7 @@ class ImportTaskManager:
 
     async def start(self) -> None:
         async with self._lock:
+            self._cleanup_expired_tasks_locked()
             self._stopping = False
             if self._worker_task is None or self._worker_task.done():
                 self._worker_task = asyncio.create_task(self._worker_loop(), name="import-task-worker")
@@ -252,6 +289,13 @@ class ImportTaskManager:
         if worker:
             worker.cancel()
             await asyncio.gather(worker, return_exceptions=True)
+        async with self._lock:
+            for task in self._tasks.values():
+                if task.status not in TASK_TERMINAL:
+                    self._mark_task_cancelled(task, "插件已停止，请重新提交任务")
+            self._queue.clear()
+            self._active_task_id = None
+            self._cleanup_expired_tasks_locked()
 
     async def _ensure_worker(self) -> None:
         if self._worker_task is None or self._worker_task.done():
@@ -324,10 +368,18 @@ class ImportTaskManager:
         if mode not in {"text", "json"}:
             raise ValueError("input_mode 必须为 text 或 json")
         knowledge_type = self._normalize_knowledge_type(payload.get("knowledge_type", ""))
+        window_size = int(payload.get("narrative_window_size", 1600))
+        overlap = int(payload.get("narrative_overlap", 400))
+        if window_size < 200 or window_size > 100000 or not 0 <= overlap < window_size:
+            raise ValueError("narrative_window_size 必须为 200-100000，overlap 必须小于窗口且非负")
         return {
             "task_kind": task_kind,
+            "source": str(payload.get("source") or "").strip()[:512],
             "input_mode": mode,
             "knowledge_type": knowledge_type,
+            "chat_log": _coerce_bool(payload.get("chat_log"), False),
+            "narrative_window_size": window_size,
+            "narrative_overlap": overlap,
             "glob": str(payload.get("glob", "*") or "*").strip() or "*",
             "recursive": _coerce_bool(payload.get("recursive"), True),
         }
@@ -347,28 +399,36 @@ class ImportTaskManager:
             task = ImportTaskRecord(task_id=uuid.uuid4().hex, source="upload", params=params)
             task_dir = self._temp_root / task.task_id
             task_dir.mkdir(parents=True, exist_ok=True)
-            for idx, uploaded in enumerate(files):
-                name = _safe_filename(getattr(uploaded, "filename", f"file_{idx}.txt"))
-                suffix = Path(name).suffix.lower()
-                if suffix not in ALLOWED_FILE_SUFFIXES:
-                    raise ValueError(f"不支持的文件后缀: {suffix or '(none)'}")
-                content = await uploaded.read()
-                if len(content) > self._max_file_size_bytes():
-                    raise ValueError(f"文件超过大小限制({self._cfg('web.import.max_file_size_mb', 20)}MB): {name}")
-                file_id = uuid.uuid4().hex
-                temp_path = task_dir / f"{file_id}_{name}"
-                temp_path.write_bytes(content)
-                mode = "json" if suffix == ".json" else params["input_mode"]
-                task.files.append(
-                    ImportFileRecord(
-                        file_id=file_id,
-                        name=name,
-                        source_kind="upload",
-                        input_mode=mode,
-                        temp_path=str(temp_path),
-                        default_knowledge_type=str(params.get("knowledge_type", "")),
+            try:
+                for idx, uploaded in enumerate(files):
+                    name = _safe_filename(getattr(uploaded, "filename", f"file_{idx}.txt"))
+                    suffix = Path(name).suffix.lower()
+                    if suffix not in ALLOWED_FILE_SUFFIXES:
+                        raise ValueError(f"不支持的文件后缀: {suffix or '(none)'}")
+                    content = await uploaded.read(self._max_file_size_bytes() + 1)
+                    if len(content) > self._max_file_size_bytes():
+                        raise ValueError(f"文件超过大小限制({self._cfg('web.import.max_file_size_mb', 20)}MB): {name}")
+                    file_id = uuid.uuid4().hex
+                    temp_path = task_dir / f"{file_id}_{name}"
+                    temp_path.write_bytes(content)
+                    mode = "json" if suffix == ".json" else params["input_mode"]
+                    task.files.append(
+                        ImportFileRecord(
+                            file_id=file_id,
+                            name=name,
+                            source_kind="upload",
+                            input_mode=mode,
+                            temp_path=str(temp_path),
+                            default_knowledge_type=str(params.get("knowledge_type", "")),
+                        default_source=str(params.get("source", "")),
+                        )
                     )
-                )
+            except BaseException:
+                for path in task_dir.iterdir():
+                    if path.is_file():
+                        path.unlink()
+                task_dir.rmdir()
+                raise
             self._tasks[task.task_id] = task
             self._task_order.appendleft(task.task_id)
             self._queue.append(task.task_id)
@@ -400,6 +460,7 @@ class ImportTaskManager:
                     input_mode="text",
                     inline_content=content,
                     default_knowledge_type=str(params.get("knowledge_type", "")),
+                        default_source=str(params.get("source", "")),
                 )
             )
             self._tasks[task.task_id] = task
@@ -447,6 +508,7 @@ class ImportTaskManager:
                         input_mode=mode,
                         source_path=str(path),
                         default_knowledge_type=str(params.get("knowledge_type", "")),
+                        default_source=str(params.get("source", "")),
                     )
                 )
             self._tasks[task.task_id] = task
@@ -522,6 +584,7 @@ class ImportTaskManager:
                             source_path=item.source_path,
                             inline_content=item.inline_content,
                             default_knowledge_type=item.default_knowledge_type,
+                            default_source=item.default_source,
                             retry_mode="chunk",
                             retry_chunk_indexes=sorted(set(idxs)),
                         )
@@ -537,6 +600,7 @@ class ImportTaskManager:
                             source_path=item.source_path,
                             inline_content=item.inline_content,
                             default_knowledge_type=item.default_knowledge_type,
+                            default_source=item.default_source,
                             retry_mode="file",
                         )
                     )
@@ -569,6 +633,11 @@ class ImportTaskManager:
                 for item in retry_files:
                     item.default_knowledge_type = override_knowledge_type
             params["task_kind"] = "retry_failed"
+            params = self._normalize_params(params, task_kind="retry_failed")
+            if any(params[key] != base.params.get(key, params[key]) for key in ("input_mode", "chat_log", "narrative_window_size", "narrative_overlap")):
+                for item in retry_files:
+                    item.retry_mode = "file"
+                    item.retry_chunk_indexes = []
 
             task = ImportTaskRecord(
                 task_id=uuid.uuid4().hex,
@@ -592,6 +661,10 @@ class ImportTaskManager:
         while not self._stopping:
             task_id = ""
             async with self._lock:
+                try:
+                    self._cleanup_expired_tasks_locked()
+                except OSError as exc:
+                    logger.warning("导入临时文件回收失败: %s", exc)
                 if self._queue:
                     task_id = self._queue.popleft()
                     self._active_task_id = task_id
@@ -622,6 +695,9 @@ class ImportTaskManager:
         async with self._lock:
             task = self._tasks.get(task_id)
             if not task:
+                return
+            if task.status == "cancel_requested":
+                self._mark_task_cancelled(task, "任务已取消")
                 return
             task.status = "preparing"
             task.current_step = "preparing"
@@ -677,12 +753,12 @@ class ImportTaskManager:
             raise ValueError("文件内容为空")
 
         await self._set_file_state(task_id, file_record.file_id, "splitting", "splitting")
-        units = self._build_units(content, file_record)
+        units = self._build_units(content, file_record, self._tasks[task_id].params)
         await self._register_chunks(task_id, file_record.file_id, units)
         await self._set_file_state(task_id, file_record.file_id, "writing", "writing")
 
         for idx, unit in enumerate(units):
-            chunk_id = f"{file_record.file_id}_{idx}"
+            chunk_id = f"{file_record.file_id}_{unit.get('index', idx)}"
             if await self._is_cancel_requested(task_id):
                 await self._cancel_chunk(task_id, file_record.file_id, chunk_id, "任务已取消")
                 continue
@@ -744,18 +820,25 @@ class ImportTaskManager:
                     out.append(line[i : i + max_len])
         return out or [str(text or "").strip()]
 
-    def _build_units(self, content: str, file_record: ImportFileRecord) -> List[Dict[str, Any]]:
+    def _build_units(self, content: str, file_record: ImportFileRecord, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        params = params or {}
         if file_record.input_mode != "json":
-            chunks = self._split_text(content)
-            if file_record.retry_mode == "chunk" and file_record.retry_chunk_indexes:
-                keep = set(file_record.retry_chunk_indexes)
-                chunks = [v for i, v in enumerate(chunks) if i in keep]
+            if params.get("chat_log"):
+                strategy = ChatLogStrategy(file_record.name, params["narrative_window_size"], params["narrative_overlap"])
+                chunks = [chunk.chunk.text for chunk in strategy.split(content)]
+                file_record.warnings = [strategy.split_warning] if strategy.split_warning else []
+                if strategy.oversized_message_count:
+                    file_record.warnings.append(f"保留了 {strategy.oversized_message_count} 条超过窗口的完整消息")
+            else:
+                chunks = self._split_text(content)
             payloads: List[Dict[str, Any]] = []
-            for chunk in chunks:
+            for index, chunk in enumerate(chunks):
+                if file_record.retry_mode == "chunk" and index not in file_record.retry_chunk_indexes:
+                    continue
                 para_payload: Dict[str, Any] = {"content": chunk}
                 if file_record.default_knowledge_type:
                     para_payload["knowledge_type"] = file_record.default_knowledge_type
-                payloads.append({"kind": "paragraph", "payload": para_payload})
+                payloads.append({"kind": "paragraph", "payload": para_payload, "index": index})
             return payloads
 
         data = json.loads(content)
@@ -780,6 +863,8 @@ class ImportTaskManager:
         if not units:
             units.append({"kind": "json_blob", "payload": data})
 
+        for index, unit in enumerate(units):
+            unit["index"] = index
         if file_record.retry_mode == "chunk" and file_record.retry_chunk_indexes:
             keep = set(file_record.retry_chunk_indexes)
             units = [v for i, v in enumerate(units) if i in keep]
@@ -797,10 +882,10 @@ class ImportTaskManager:
                 else str(file_record.default_knowledge_type or "")
             )
             await self.import_service.import_paragraph(
-                content=str(data.get("content", "")),
-                source=str(data.get("source") or f"{file_record.source_kind}:{file_record.name}"),
-                knowledge_type=knowledge_type,
-                time_meta=data.get("time_meta"),
+                **{key: value for key, value in normalize_paragraph_import_item(
+                    {**data, "knowledge_type": knowledge_type or None},
+                    default_source=file_record.default_source or f"{file_record.source_kind}:{file_record.name}",
+                ).items() if key in {"content", "source", "knowledge_type", "time_meta", "person_ids"}},
             )
             return
         if kind == "relation":
@@ -809,7 +894,7 @@ class ImportTaskManager:
                 subject=str(data.get("subject", "")),
                 predicate=str(data.get("predicate", "")),
                 obj=str(data.get("object", "")),
-                confidence=float(data.get("confidence", 1.0) or 1.0),
+                confidence=float(data.get("confidence", 1.0)),
                 source_paragraph=str(data.get("source_paragraph", "")),
             )
             return
@@ -825,8 +910,8 @@ class ImportTaskManager:
                 preview = str(payload or "")[:120]
             chunks.append(
                 ImportChunkRecord(
-                    chunk_id=f"{file_id}_{i}",
-                    index=i,
+                    chunk_id=f"{file_id}_{unit.get('index', i)}",
+                    index=int(unit.get("index", i)),
                     chunk_type=str(unit.get("kind", "unknown")),
                     content_preview=preview,
                 )

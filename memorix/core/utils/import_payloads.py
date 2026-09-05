@@ -105,6 +105,16 @@ def _normalize_relations(raw_relations: Any) -> List[Dict[str, str]]:
     return out
 
 
+def _normalize_person_ids(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ImportPayloadValidationError(
+            "person_ids 必须是字符串数组", code="paragraph_person_ids_invalid", field="person_ids",
+        )
+    return list(dict.fromkeys(item.strip() for item in value if item.strip()))
+
+
 def normalize_paragraph_import_item(
     item: Any,
     *,
@@ -135,6 +145,7 @@ def normalize_paragraph_import_item(
             "time_meta": None,
             "entities": [],
             "relations": [],
+            "person_ids": [],
         }
 
     if not isinstance(item, dict) or "content" not in item:
@@ -187,6 +198,7 @@ def normalize_paragraph_import_item(
         "time_meta": normalized_time_meta if normalized_time_meta else None,
         "entities": _normalize_entities(item.get("entities")),
         "relations": _normalize_relations(item.get("relations")),
+        "person_ids": _normalize_person_ids(item.get("person_ids")),
     }
 
 

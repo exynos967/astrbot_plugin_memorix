@@ -17,7 +17,11 @@ const graph = useGraphStore();
 const { creating } = storeToRefs(store);
 
 // 本地表单状态
-const mode = ref<ImportMode>("text");
+const mode = ref<ImportMode | "upload">("text");
+const file = ref<File | null>(null);
+const chatLog = ref(false);
+const windowSize = ref(1600);
+const overlap = ref(400);
 const payload = ref("");
 const optionsText = ref("{}");
 const source = ref("web_import");
@@ -76,8 +80,15 @@ function parseOptions(): Record<string, unknown> {
 async function onCreate(): Promise<void> {
   const parsedPayload = payloadForImport(payload.value);
   const options = parseOptions();
+  Object.assign(options, { chat_log: chatLog.value, narrative_window_size: windowSize.value, narrative_overlap: overlap.value });
+  if (mode.value === "upload") {
+    if (file.value) await store.createUpload(file.value, options);
+    return;
+  }
   await store.createImport(mode.value, parsedPayload, options);
 }
+
+function selectFile(event: Event) { file.value = (event.target as HTMLInputElement).files?.[0] || null; }
 </script>
 
 <template>
@@ -95,6 +106,7 @@ async function onCreate(): Promise<void> {
           <option value="relation">关系</option>
           <option value="json">JSON</option>
           <option value="file">文件路径</option>
+          <option value="upload">上传文件</option>
         </select>
       </div>
       <div class="field">
@@ -109,13 +121,24 @@ async function onCreate(): Promise<void> {
         />
       </div>
     </div>
-    <div class="field" style="margin-top: 10px">
+    <div v-if="mode === 'upload'" class="field" style="margin-top: 10px">
+      <label for="memory-upload">选择文件（TXT / Markdown / JSON）</label>
+      <input id="memory-upload" type="file" accept=".txt,.md,.json" @change="selectFile" />
+    </div>
+    <div v-else class="field" style="margin-top: 10px">
       <label>导入内容</label>
       <textarea
         v-model="payload"
         class="textarea"
         placeholder="粘贴文本、JSON，或输入文件路径"
       ></textarea>
+    </div>
+    <div v-if="['text', 'file', 'upload'].includes(mode)" class="field" style="margin-top: 10px">
+      <label><input v-model="chatLog" type="checkbox" /> 按聊天记录导入（保留对话窗口与重叠上下文）</label>
+      <div v-if="chatLog" class="grid-2">
+        <label>窗口字符数<input v-model.number="windowSize" type="number" min="200" max="100000" class="input" /></label>
+        <label>重叠字符数<input v-model.number="overlap" type="number" min="0" :max="windowSize - 1" class="input" /></label>
+      </div>
     </div>
     <details class="advanced-panel">
       <summary>高级选项</summary>
@@ -124,6 +147,6 @@ async function onCreate(): Promise<void> {
         <textarea v-model="optionsText" class="textarea" style="min-height: 70px"></textarea>
       </div>
     </details>
-    <button class="btn primary" :disabled="creating" @click="onCreate">创建导入任务</button>
+    <button class="btn primary" :disabled="creating || (mode === 'upload' && !file)" @click="onCreate">创建导入任务</button>
   </div>
 </template>

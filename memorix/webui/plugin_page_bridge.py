@@ -25,6 +25,7 @@ TASK_STATUS_FAILED = "failed"
 TASK_STATUS_CANCELED = "canceled"
 
 PLUGIN_PAGE_API_ROUTE = "webui/request"
+PLUGIN_PAGE_UPLOAD_ROUTE = "webui/upload"
 
 
 class _WebV1TaskManager:
@@ -73,6 +74,7 @@ class _WebV1TaskManager:
         mode = str(payload.get("mode", "text") or "text").strip().lower()
         body = payload.get("payload")
         options = payload.get("options") if isinstance(payload.get("options"), dict) else {}
+        import_options = {key: options[key] for key in ("source", "chat_log", "narrative_window_size", "narrative_overlap") if key in options}
         try:
             if mode == "text":
                 content = body if isinstance(body, str) else str(body or "")
@@ -81,6 +83,7 @@ class _WebV1TaskManager:
                 return await self.import_task_manager.create_paste_task(
                     {
                         "content": content,
+                        **import_options,
                         "name": str(options.get("name") or options.get("source") or "webui_text.txt"),
                         "knowledge_type": str(options.get("knowledge_type", "")),
                     }
@@ -89,6 +92,7 @@ class _WebV1TaskManager:
                 return await self.import_task_manager.create_raw_scan_task(
                     {
                         "alias": "raw",
+                        **import_options,
                         "relative_path": body,
                         "glob": "*",
                         "recursive": True,
@@ -121,6 +125,11 @@ class _WebV1TaskManager:
         job = asyncio.create_task(self._run_summary(task_id, payload), name=f"webui-summary-{task_id[:8]}")
         self._jobs.add(job)
         job.add_done_callback(lambda t: self._jobs.discard(t))
+        return task
+
+    async def enqueue_upload_task(self, files: list[Any], options: Dict[str, Any]) -> Dict[str, Any]:
+        task = await self.import_task_manager.create_upload_task(files, options)
+        self._native_import_task_ids.add(str(task["task_id"]))
         return task
 
     async def _run_import(self, task_id: str, payload: Dict[str, Any]) -> None:
@@ -249,6 +258,10 @@ class PluginPageWebUIBridge:
             ["POST"],
             "Memorix embedded WebUI request bridge",
         )
+        register_web_api(
+            f"/{plugin_name}/{PLUGIN_PAGE_UPLOAD_ROUTE}", self.handle_upload,
+            ["POST"], "Memorix file import",
+        )
 
     async def close(self) -> None:
         self._closing = True
@@ -269,10 +282,10 @@ class PluginPageWebUIBridge:
                 logger.warning("[memorix] embedded WebUI task manager stop failed: %s", exc)
 
     async def handle_request(self):
-        from quart import jsonify, request
+        from astrbot.api.web import json_response, request
 
         try:
-            payload = await request.get_json(force=True, silent=True)
+            payload = await request.json(default={})
             if not isinstance(payload, dict):
                 raise ValueError("request payload must be a JSON object")
 
@@ -280,10 +293,37 @@ class PluginPageWebUIBridge:
             url = str(payload.get("url") or "").strip()
             body = payload.get("data")
             result = await self.dispatch(method=method, url=url, body=body)
-            return jsonify({"status": "ok", "data": result})
+            return json_response({"status": "ok", "data": result})
         except Exception as exc:
             logger.warning("[memorix] embedded WebUI request failed: %s", exc, exc_info=True)
-            return jsonify({"status": "error", "message": str(exc)})
+            return json_response({"status": "error", "message": str(exc)})
+
+    async def handle_upload(self):
+        from astrbot.api.web import PluginUploadFile, error_response, json_response, request
+
+        try:
+            scope_key = self._resolve_scope_key(request.query.get("_scope", ""))
+            app = await self._get_app(scope_key)
+            max_size = app.import_task_manager.get_import_limits()["max_file_size_bytes"]
+            content_length = request.headers.get("content-length")
+            if content_length is None:
+                return error_response("上传请求缺少 Content-Length", status_code=411)
+            if int(content_length) < 0 or int(content_length) > max_size + 65536:
+                return error_response("文件超过上传大小限制", status_code=413)
+            files = await request.files()
+            upload = files.get("file")
+            if not isinstance(upload, PluginUploadFile):
+                return error_response("请选择上传文件")
+            options = {key: request.query.get(key) for key in
+                       ("source", "input_mode", "knowledge_type", "chat_log", "narrative_window_size", "narrative_overlap")
+                       if key in request.query}
+            task = await app.task_manager.enqueue_upload_task([upload], options)
+            return json_response({"status": "ok", "data": task})
+        except (TypeError, ValueError) as exc:
+            return error_response(str(exc))
+        except Exception as exc:
+            logger.warning("[memorix] file upload failed: %s", exc, exc_info=True)
+            return error_response("上传失败，请检查插件日志", status_code=500)
 
     async def dispatch(self, *, method: str, url: str, body: Any = None) -> Any:
         method = self._normalize_method(method)

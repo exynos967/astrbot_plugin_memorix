@@ -34,6 +34,7 @@ from ..storage.knowledge_types import ImportStrategy
 from ..storage.type_detection import looks_like_quote_text
 from ..strategies.base import KnowledgeType as StrategyKnowledgeType
 from ..strategies.base import ProcessedChunk
+from ..strategies.chat_log import ChatLogStrategy
 from ..strategies.factual import FactualStrategy
 from ..strategies.narrative import NarrativeStrategy
 from ..strategies.quote import QuoteStrategy
@@ -558,6 +559,17 @@ class ImportTaskManager:
                 time_meta=time_meta,
             )
             self._record_file_source(file_record, source)
+            people = (metadata or {}).get("person_ids", [])
+            if people:
+                existing = self.plugin.metadata_store.get_paragraph(para_hash)
+                old_people = (existing.get("metadata") or {}).get("person_ids", [])
+                self.plugin.metadata_store.update_paragraph_metadata(
+                    para_hash, {"person_ids": list(dict.fromkeys([*old_people, *people]))},
+                )
+            for person_id in (metadata or {}).get("person_ids", []):
+                self.plugin.metadata_store.enqueue_person_profile_refresh(
+                    person_id=person_id, reason="import_person_evidence",
+                )
             return para_hash
 
     async def _set_relation_vector_state_locked(
@@ -3004,6 +3016,14 @@ class ImportTaskManager:
         await self._ensure_embedding_runtime_ready()
 
         chunks = strategy.split(content)
+        if isinstance(strategy, ChatLogStrategy):
+            if strategy.split_warning:
+                await self._append_file_warning(task_id, file_record.file_id, strategy.split_warning)
+            if strategy.oversized_message_count:
+                await self._append_file_warning(
+                    task_id, file_record.file_id,
+                    f"保留了 {strategy.oversized_message_count} 条超过窗口长度的完整消息",
+                )
         selected_chunks = list(chunks)
         if file_record.retry_mode == "chunk":
             retry_index_set = set()
@@ -3301,6 +3321,7 @@ class ImportTaskManager:
                     "source": paragraph["source"],
                     "entities": paragraph["entities"],
                     "relations": paragraph["relations"],
+                    "person_ids": paragraph["person_ids"],
                     "preview": paragraph["content"][:120],
                 }
             )
@@ -3415,11 +3436,14 @@ class ImportTaskManager:
                     ).value
                     source = str(unit.get("source") or f"web_import:{file_record.name}")
                     if not skip_write:
+                        unit_metadata = dict(paragraph_metadata or {})
+                        if unit.get("person_ids"):
+                            unit_metadata["person_ids"] = unit["person_ids"]
                         para_hash = await self._add_paragraph_metadata(
                             file_record=file_record,
                             content=content,
                             source=source,
-                            metadata=paragraph_metadata,
+                            metadata=unit_metadata,
                             knowledge_type=k_type,
                             time_meta=unit.get("time_meta"),
                         )
@@ -3844,6 +3868,13 @@ JSON schema:
             override=override,
             chat_log=chat_log,
         )
+        if chat_log and strategy == ImportStrategy.NARRATIVE:
+            params = import_params or {}
+            return ChatLogStrategy(
+                filename,
+                window_size=_coerce_int(params.get("narrative_window_size"), 1600),
+                overlap=_coerce_int(params.get("narrative_overlap"), 400),
+            )
         return self._instantiate_strategy(filename, strategy, import_params=import_params)
 
     async def _set_file_strategy(self, task_id: str, file_id: str, strategy: Any) -> None:

@@ -1,5 +1,5 @@
 import { defineStore } from "pinia";
-import { ref } from "vue";
+import { ref, watch } from "vue";
 import {
   createImportTask as createImportApi,
   createSummaryTask as createSummaryApi,
@@ -13,6 +13,8 @@ import { useAppStore } from "@/stores/app";
 import { useGraphStore } from "@/stores/graph";
 import { useLogsStore } from "@/stores/logs";
 import { errText } from "@/utils/error";
+import { uploadImport } from "@/services/api";
+import type { TaskCreateResult } from "@/services/taskApi";
 
 
 /**
@@ -38,7 +40,8 @@ export const useTaskStore = defineStore("task", () => {
   const logs = useLogsStore();
 
   let timer: number | null = null;
-  let refreshing = false;
+  let refreshSeq = 0;
+  let inflightKey: string | null = null;
   /** 视图活跃标志：仅 ImportView 挂载期间为 true。防止创建请求 in-flight 时离开视图，
    *  await 返回后仍 startPolling 新建定时器导致泄漏（stopPolling 在 unmount 已执行，无可清）。 */
   let viewActive = false;
@@ -60,28 +63,33 @@ export const useTaskStore = defineStore("task", () => {
 
   async function refresh(): Promise<void> {
     // in-flight 守卫：单次 refresh > POLL_INTERVAL 时跳过后续 tick，避免并发覆盖。
-    if (refreshing) return;
     const id = currentTaskId.value.trim();
     if (!id) {
       app.pushError("请填写 task id", "refreshTask");
       return;
     }
-    refreshing = true;
+    const scope = graph.effectiveScope();
+    const type = currentTaskType.value || "import";
+    const requestKey = JSON.stringify([scope, type, id]);
+    if (inflightKey === requestKey) return;
+    inflightKey = requestKey;
+    const seq = ++refreshSeq;
+    const isCurrent = () => seq === refreshSeq && id === currentTaskId.value.trim() &&
+      type === (currentTaskType.value || "import") && scope === graph.effectiveScope();
     try {
-      const type = currentTaskType.value || "import";
       const data =
         type === "summary"
-          ? await getSummaryTask(id, graph.effectiveScope())
-          : await getImportTask(id, graph.effectiveScope());
+          ? await getSummaryTask(id, scope)
+          : await getImportTask(id, scope);
+      if (!isCurrent()) return;
       taskDetail.value = data;
       // summaryResult 随轮询同步更新：原仅创建瞬间写桩值，SummaryTaskPanel 展示永不刷新。
       if (type === "summary") summaryResult.value = data;
       if (isTerminalStatus(data.status)) stopPolling();
     } catch (err) {
-      app.pushError(errText(err), "refreshTask");
-      stopPolling();
+      if (isCurrent()) { app.pushError(errText(err), "refreshTask"); stopPolling(); }
     } finally {
-      refreshing = false;
+      if (inflightKey === requestKey) inflightKey = null;
     }
   }
 
@@ -99,8 +107,10 @@ export const useTaskStore = defineStore("task", () => {
     options: Record<string, unknown>,
   ): Promise<boolean> {
     creating.value = true;
+    const scope = graph.effectiveScope();
     try {
-      const data = await createImportApi({ mode, payload, options }, graph.effectiveScope());
+      const data = await createImportApi({ mode, payload, options }, scope);
+      if (scope !== graph.effectiveScope()) return true;
       currentTaskId.value = data.task_id || "";
       currentTaskType.value = "import";
       logs.log(`导入任务已创建：${data.task_id || ""}`, "info");
@@ -122,6 +132,7 @@ export const useTaskStore = defineStore("task", () => {
     contextLength = 50,
   ): Promise<boolean> {
     creating.value = true;
+    const scope = graph.effectiveScope();
     try {
       const data = await createSummaryApi(
         {
@@ -130,8 +141,9 @@ export const useTaskStore = defineStore("task", () => {
           messages,
           context_length: contextLength,
         },
-        graph.effectiveScope(),
+        scope,
       );
+      if (scope !== graph.effectiveScope()) return true;
       currentTaskId.value = data.task_id || "";
       currentTaskType.value = "summary";
       summaryResult.value = { task_id: data.task_id, status: data.status } as TaskDetail;
@@ -146,6 +158,29 @@ export const useTaskStore = defineStore("task", () => {
     }
   }
 
+  async function createUpload(file: File, options: Record<string, unknown>): Promise<boolean> {
+    creating.value = true;
+    const scope = graph.effectiveScope();
+    try {
+      const data = await uploadImport<TaskCreateResult>(file, options, scope);
+      logs.log(`文件导入任务已创建：${data.task_id}`, "info");
+      if (scope !== graph.effectiveScope()) return true;
+      currentTaskId.value = data.task_id;
+      currentTaskType.value = "import";
+      if (viewActive) startPolling();
+      return true;
+    } catch (error) {
+      app.pushError(errText(error), "uploadImport");
+      return false;
+    } finally { creating.value = false; }
+  }
+
+  watch(() => graph.effectiveScope(), () => {
+    ++refreshSeq;
+    stopPolling(); currentTaskId.value = ""; currentTaskType.value = "";
+    taskDetail.value = null; summaryResult.value = null;
+  });
+
   return {
     currentTaskId,
     currentTaskType,
@@ -158,6 +193,7 @@ export const useTaskStore = defineStore("task", () => {
     stopPolling,
     setViewActive,
     createImport,
+    createUpload,
     createSummary,
   };
 });
