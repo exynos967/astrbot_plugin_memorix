@@ -101,26 +101,36 @@ class MemoryService:
         return {"success": True, "count": len(hashes), "frozen_edges": len(edges)}
 
     async def restore(self, hash_value: str, restore_type: str = "relation") -> Dict[str, Any]:
+        from .delete_service import DeleteService
+        from ...services.memory_projection_service import MemoryProjectionService
+
         h = str(hash_value or "").strip().lower()
-        if not h:
-            raise ValueError("hash is empty")
-
-        if restore_type == "entity":
-            cursor = self.ctx.metadata_store._conn.cursor()
-            cursor.execute("UPDATE entities SET is_deleted=0, deleted_at=NULL WHERE hash=?", (h,))
-            self.ctx.metadata_store._conn.commit()
-            return {"success": True, "type": "entity", "hash": h}
-
-        record = self.ctx.metadata_store.restore_relation(h)
-        if not record:
-            return {"success": False, "message": "relation not found in recycle bin"}
-        s = str(record["subject"])
-        o = str(record["object"])
-        self.ctx.metadata_store.revive_entities_by_names([s, o])
-        self.ctx.graph_store.add_nodes([s, o])
-        self.ctx.graph_store.add_edges([(s, o)], weights=[float(record.get("confidence", 1.0) or 1.0)], relation_hashes=[h])
-        self.ctx.graph_store.save()
-        return {"success": True, "type": "relation", "hash": h}
+        if not h or restore_type not in {"paragraph", "entity", "relation"}:
+            raise ValueError("invalid restore type/hash")
+        owner = self.ctx.metadata_store.memory_deletion_owner(restore_type, h)
+        if owner:
+            return await DeleteService(self.ctx).restore(owner)
+        async with self.ctx.graph_mutation_lock:
+            store = self.ctx.metadata_store
+            with store.transaction(immediate=True) as conn:
+                if restore_type == "relation":
+                    current = store.get_relation(h)
+                    if current is not None:
+                        return {"success": True, "type": restore_type, "hash": h, "already_live": True}
+                    record = store.restore_relation_metadata(h)
+                    if record is None:
+                        raise ValueError("relation not found in recycle bin")
+                elif restore_type == "paragraph":
+                    if not store.restore_paragraph_by_hash(h):
+                        raise ValueError("paragraph not found in recycle bin")
+                    store.enqueue_episode_rebuilds([store.get_paragraph(h).get("source")], "legacy_restore")
+                else:
+                    result = conn.execute("UPDATE entities SET is_deleted = 0, deleted_at = NULL WHERE hash = ? AND is_deleted = 1", (h,))
+                    if result.rowcount != 1:
+                        raise ValueError("entity not found in recycle bin")
+                store.enqueue_memory_projection(restore_type, h)
+            projection = await MemoryProjectionService(self.ctx).reconcile_locked()
+            return {"success": True, "type": restore_type, "hash": h, "projection": projection}
 
     async def _resolve_relations(self, query: str) -> List[str]:
         value = str(query or "").strip()

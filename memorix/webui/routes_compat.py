@@ -10,6 +10,8 @@ from pydantic import BaseModel
 from astrbot.api import logger
 from ..core.utils.hash import compute_hash
 from ..amemorix.settings import mask_sensitive
+from ..services.graph_mutation_service import GraphMutationService
+from ..amemorix.services import DeleteService, MemoryService
 
 class EdgeWeightUpdate(BaseModel):
     source: str
@@ -588,173 +590,37 @@ class MemorixServer:
 
         @self.app.post("/api/edge/weight")
         async def update_edge_weight(data: EdgeWeightUpdate):
-            """更新边权重"""
-            if self.plugin.graph_store is None:
-                raise HTTPException(status_code=503, detail="Graph store not initialized")
-            
-            try:
-                # 计算增量 (因为 update_edge_weight 是基于增量的)
-                # 或者我们需要一个直接设置权重的方法。
-                # 查看 GraphStore源码，update_edge_weight 是 add weight.
-                # 如果我们要 set weight，我们需要先获取当前权重。
-                
-                current_weight = self.plugin.graph_store.get_edge_weight(data.source, data.target)
-                delta = data.weight - current_weight
-                
-                new_weight = self.plugin.graph_store.update_edge_weight(data.source, data.target, delta)
-                # 持久化保存到磁盘
-                self.plugin.graph_store.save()
-                return {"success": True, "new_weight": new_weight}
-            except Exception as e:
-                logger.error(f"Update weight failed: {e}")
-                raise HTTPException(status_code=500, detail=str(e))
+            result = await GraphMutationService(self.plugin).execute("update_edge_weight", source=data.source, target=data.target, weight=data.weight)
+            return result
 
         @self.app.delete("/api/node")
         async def delete_node(data: NodeDelete):
-            """删除节点"""
-            if self.plugin.graph_store is None:
-                raise HTTPException(status_code=503, detail="Graph store not initialized")
-                
-            try:
-                # 使用 GraphStore.delete_nodes 方法
-                deleted_count = self.plugin.graph_store.delete_nodes([data.node_id])
-                
-                # 同时从 MetadataStore 删除实体
-                if self.plugin.metadata_store:
-                    self.plugin.metadata_store.delete_entity(data.node_id)
-                
-                # 持久化保存
-                self.plugin.graph_store.save()
-                self._relation_cache = None
-                return {"success": True, "deleted_count": deleted_count}
-            except Exception as e:
-                logger.error(f"Delete node failed: {e}")
-                raise HTTPException(status_code=500, detail=str(e))
+            result = await GraphMutationService(self.plugin).execute("delete_node", node_id=data.node_id)
+            self._relation_cache = None
+            return {**result, "deleted_count": int(bool(result.get("success")))}
 
         @self.app.delete("/api/edge")
         async def delete_edge(data: EdgeDelete):
-            """删除边"""
-            if self.plugin.graph_store is None or self.plugin.metadata_store is None:
-                raise HTTPException(status_code=503, detail="Graph store not initialized")
-            
-            try:
-                relation_hashes = _edge_relation_hashes(data.source, data.target)
-                deleted_relations = 0
-                if relation_hashes:
-                    deleted_relations = self.plugin.metadata_store.backup_and_delete_relations(relation_hashes)
-                    self.plugin.graph_store.delete_edges([(data.source, data.target)])
-                    if self.plugin.vector_store:
-                        self.plugin.vector_store.delete(relation_hashes)
-                else:
-                    self.plugin.graph_store.delete_edges([(data.source, data.target)])
-                
-                _save_available_stores()
-                self._relation_cache = None
-                return {"success": True, "deleted_relations": deleted_relations}
-            except Exception as e:
-                logger.error(f"Delete edge failed: {e}")
-                raise HTTPException(status_code=500, detail=str(e))
+            result = await GraphMutationService(self.plugin).execute("delete_edge", source=data.source, target=data.target)
+            self._relation_cache = None
+            return {**result, "deleted_relations": (result.get("deleted", {}).get("relation", 0) if isinstance(result.get("deleted"), dict) else result.get("deleted", 0))}
 
         @self.app.post("/api/node")
         async def create_node(data: NodeCreate):
-            """创建节点"""
-            if self.plugin.graph_store is None:
-                raise HTTPException(status_code=503, detail="Graph store not initialized")
-            
-            try:
-                # 1. 使用 GraphStore.add_nodes 方法建立物理节点
-                added_count = self.plugin.graph_store.add_nodes([data.node_id])
-                
-                # 2. 同时在 MetadataStore 注册实体，保证元数据一致性
-                if self.plugin.metadata_store:
-                    self.plugin.metadata_store.add_entity(name=data.node_id)
-                
-                # 持久化保存
-                self.plugin.graph_store.save()
-                return {"success": True, "added_count": added_count, "node_id": data.node_id}
-            except Exception as e:
-                logger.error(f"Create node failed: {e}")
-                raise HTTPException(status_code=500, detail=str(e))
+            result = await GraphMutationService(self.plugin).execute("create_node", node_id=data.node_id)
+            return {**result, "node_id": data.node_id}
 
         @self.app.post("/api/edge")
         async def create_edge(data: EdgeCreate):
-            """创建边 (支持语义关系)"""
-            if self.plugin.graph_store is None:
-                raise HTTPException(status_code=503, detail="Graph store not initialized")
-            
-            try:
-                # 确保节点存在
-                self.plugin.graph_store.add_nodes([data.source, data.target])
-                
-                # 1. 如果有语义关系，先存入 MetadataStore
-                if data.predicate and self.plugin.metadata_store:
-                   relation_hash = self.plugin.metadata_store.add_relation(
-                       subject=data.source, 
-                       predicate=data.predicate, 
-                       obj=data.target,
-                       confidence=data.weight
-                   )
-                else:
-                   relation_hash = _relation_hash(data.source, data.predicate or "关联", data.target)
-
-                # 2. 使用 GraphStore.add_edges 方法建立物理连接
-                added_count = self.plugin.graph_store.add_edges(
-                    [(data.source, data.target)],
-                    weights=[data.weight],
-                    relation_hashes=[relation_hash],
-                )
-                
-                # 持久化保存
-                self.plugin.graph_store.save()
-                self._relation_cache = None
-                return {"success": True, "added_count": added_count, "predicate": data.predicate, "relation_hash": relation_hash}
-            except Exception as e:
-                logger.error(f"Create edge failed: {e}")
-                raise HTTPException(status_code=500, detail=str(e))
+            result = await GraphMutationService(self.plugin).execute("create_edge", source=data.source, target=data.target, predicate=data.predicate, weight=data.weight)
+            self._relation_cache = None
+            return {**result, "added_count": int(bool(result.get("success"))), "predicate": data.predicate, "relation_hash": result.get("edge", {}).get("hash", "")}
 
         @self.app.put("/api/node/rename")
         async def rename_node(data: NodeRename):
-            """重命名节点 (实际上是创建新节点，复制边，删除旧节点)"""
-            if self.plugin.graph_store is None:
-                raise HTTPException(status_code=503, detail="Graph store not initialized")
-            
-            try:
-                # 检查旧节点是否存在
-                if not self.plugin.graph_store.has_node(data.old_id):
-                    raise HTTPException(status_code=404, detail=f"Node '{data.old_id}' not found")
-                
-                # 获取旧节点的所有边
-                neighbors = self.plugin.graph_store.get_neighbors(data.old_id)
-                
-                # 添加新节点
-                self.plugin.graph_store.add_nodes([data.new_id])
-                
-                # 复制边到新节点
-                for neighbor in neighbors:
-                    weight = self.plugin.graph_store.get_edge_weight(data.old_id, neighbor)
-                    if weight > 0:
-                        self.plugin.graph_store.add_edges([(data.new_id, neighbor)], weights=[weight])
-                
-                # 获取指向旧节点的边 (反向边)
-                all_nodes = self.plugin.graph_store.get_nodes()
-                for node in all_nodes:
-                    if node != data.old_id and node != data.new_id:
-                        weight = self.plugin.graph_store.get_edge_weight(node, data.old_id)
-                        if weight > 0:
-                            self.plugin.graph_store.add_edges([(node, data.new_id)], weights=[weight])
-                
-                # 删除旧节点
-                self.plugin.graph_store.delete_nodes([data.old_id])
-                
-                # 持久化保存
-                self.plugin.graph_store.save()
-                self._relation_cache = None
-                return {"success": True, "old_id": data.old_id, "new_id": data.new_id}
-            except HTTPException:
-                raise
-            except Exception as e:
-                logger.error(f"Rename node failed: {e}")
-                raise HTTPException(status_code=500, detail=str(e))
+            result = await GraphMutationService(self.plugin).execute("rename_node", old_name=data.old_id, new_name=data.new_id)
+            self._relation_cache = None
+            return {**result, "old_id": data.old_id, "new_id": data.new_id}
 
         @self.app.post("/api/source/list")
         async def list_sources(data: SourceListRequest):
@@ -812,116 +678,20 @@ class MemorixServer:
 
         @self.app.post("/api/source/batch_delete")
         async def batch_delete_source(data: BatchSourceDeleteRequest):
-            """按来源批量删除（文件删除）"""
-            if not self.plugin.metadata_store or not self.plugin.vector_store or not self.plugin.graph_store:
-                 raise HTTPException(status_code=503, detail="Stores not fully initialized")
-                 
             try:
-                # 1. 找出所有相关段落
-                paragraphs = self.plugin.metadata_store.get_paragraphs_by_source(data.source)
-                if not paragraphs:
-                    return {"success": True, "message": "No paragraphs found for this source", "count": 0}
-                
-                deleted_count = 0
-                errors = []
-                
-                # 2. 逐个删除 (复用原子删除逻辑)
-                # 考虑到性能，这里是简单的循环。如果有成千上万条，可能需要优化为批量事务。
-                for p in paragraphs:
-                    try:
-                        # Phase 1: DB Transaction
-                        cleanup_plan = self.plugin.metadata_store.delete_paragraph_atomic(p['hash'])
-                        
-                        # Phase 2: Memory Store Cleanup
-                        vec_id = cleanup_plan.get("vector_id_to_remove")
-                        if vec_id:
-                            try:
-                                self.plugin.vector_store.delete([vec_id])
-                            except Exception:
-                                pass # ignore missing vector
-                                
-                        edges_to_remove = cleanup_plan.get("edges_to_remove", [])
-                        if edges_to_remove:
-                            try:
-                                self.plugin.graph_store.delete_edges(edges_to_remove)
-                            except Exception:
-                                pass
-                                
-                        deleted_count += 1
-                        
-                    except Exception as pe:
-                        logger.error(f"Failed to delete paragraph {p['hash']}: {pe}")
-                        errors.append(f"{p['hash']}: {pe}")
-                
-                # 3. 保存变更
-                try:
-                    self.plugin.vector_store.save()
-                    self.plugin.graph_store.save()
-                except Exception as se:
-                    logger.warning(f"Auto-save after batch delete failed: {se}")
-                    
-                msg = f"Successfully deleted {deleted_count} paragraphs from source '{data.source}'"
-                if errors:
-                    msg += f". Errors: {len(errors)} occurred."
-                    
+                result = await DeleteService(self.plugin).source([data.source])
                 self._relation_cache = None
-                return {"success": True, "message": msg, "count": deleted_count, "errors": errors}
-                
-            except Exception as e:
-                logger.error(f"Batch source delete failed: {e}")
-                raise HTTPException(status_code=500, detail=str(e))
+                return {**result, "count": result["deleted"]["paragraph"]}
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         @self.app.delete("/api/source")
         async def delete_source(data: SourceDeleteRequest):
-            """删除来源段落（两阶段提交）"""
-            if not self.plugin.metadata_store or not self.plugin.vector_store or not self.plugin.graph_store:
-                 raise HTTPException(status_code=503, detail="Stores not fully initialized")
-                 
             try:
-                # === Phase 1: DB Transaction & Plan Generation ===
-                # 调用我们在 MetadataStore 实现的原子方法
-                cleanup_plan = self.plugin.metadata_store.delete_paragraph_atomic(data.paragraph_hash)
-                
-                # === Phase 2: Post-Commit Cleanup (In-Memory Stores) ===
-                # 这一步失败不会回滚 DB，但保证了 DB 的一致性
-                errors = []
-                
-                # 1. 清理向量 (使用稳定 ID)
-                vec_id = cleanup_plan.get("vector_id_to_remove")
-                if vec_id:
-                    try:
-                        # VectorStore.delete 接受 ID 列表
-                        self.plugin.vector_store.delete([vec_id])
-                    except Exception as ve:
-                        logger.error(f"Vector cleanup failed for {vec_id}: {ve}")
-                        errors.append(f"Vector cleanup error: {ve}")
-                        
-                # 2. 清理图边 (批量删除)
-                edges_to_remove = cleanup_plan.get("edges_to_remove", [])
-                if edges_to_remove:
-                    try:
-                        self.plugin.graph_store.delete_edges(edges_to_remove)
-                    except Exception as ge:
-                        logger.error(f"Graph cleanup failed: {ge}")
-                        errors.append(f"Graph cleanup error: {ge}")
-                
-                # 如果有非致命错误，记录并在响应中提示
-                msg = "来源删除成功"
-                if errors:
-                    msg += f"，但带有清理警告: {'; '.join(errors)}"
-                    
-                # 触发保存以持久化内存中的变更
-                try:
-                    self.plugin.vector_store.save()
-                    self.plugin.graph_store.save()
-                except Exception as se:
-                    logger.warning(f"删除来源后的自动保存失败: {se}")
-                
+                result = await DeleteService(self.plugin).paragraph(data.paragraph_hash)
                 self._relation_cache = None
-                return {"success": True, "message": msg, "details": cleanup_plan}
-                
-            except Exception as e:
-                logger.error(f"Delete source failed: {e}")
-                raise HTTPException(status_code=500, detail=str(e))
+                return result
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         # --- V5 记忆管理端点 ---
         
@@ -963,42 +733,12 @@ class MemorixServer:
 
         @self.app.post("/api/memory/restore")
         async def restore_memory(data: MemoryRestoreRequest):
-            """从回收站恢复记忆"""
-            if not self.plugin.metadata_store or not self.plugin.graph_store:
-                raise HTTPException(status_code=503, detail="Stores missing")
-
             try:
-                if data.type == "entity":
-                    # 复活实体
-                    cursor = self.plugin.metadata_store._conn.cursor()
-                    cursor.execute("UPDATE entities SET is_deleted=0, deleted_at=NULL WHERE hash=?", (data.hash,))
-                    self.plugin.metadata_store._conn.commit()
-                    return {"success": True, "type": "entity", "hash": data.hash}
-
-                # relation: 先从回收站恢复元数据，再回灌图边
-                record = self.plugin.metadata_store.restore_relation(data.hash)
-                if not record:
-                    raise HTTPException(status_code=404, detail="回收站中未找到该记忆")
-
-                s, t = record["subject"], record["object"]
-
-                # 若实体处于软删除状态，先复活再补图。
-                self.plugin.metadata_store.revive_entities_by_names([s, t])
-                self.plugin.graph_store.add_nodes([s, t])
-                self.plugin.graph_store.add_edges(
-                    [(s, t)],
-                    weights=[record["confidence"]],
-                    relation_hashes=[data.hash],
-                )
-                self.plugin.graph_store.save()
+                result = await MemoryService(self.plugin).restore(data.hash, data.type or "relation")
                 self._relation_cache = None
-
-                return {"success": True, "type": "relation", "hash": data.hash}
-            except HTTPException:
-                raise
-            except Exception as e:
-                logger.error(f"Restore failed: {e}")
-                raise HTTPException(status_code=500, detail=str(e))
+                return result
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         @self.app.post("/api/memory/reinforce")
         async def reinforce_memory(data: MemoryActionRequest):

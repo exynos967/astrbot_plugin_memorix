@@ -11,6 +11,7 @@ Episode 聚合与落库服务。
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections import Counter
@@ -517,10 +518,66 @@ class EpisodeService:
             "group_count": len(groups),
         }
 
+    def generation_hash(self) -> str:
+        return compute_hash(json.dumps({
+            "protocol": 1,
+            "episode": self._cfg("episode", {}),
+            "exclude_stale": self._cfg("integration.feedback_correction_paragraph_hard_filter_enabled", True),
+        }, sort_keys=True, ensure_ascii=False, default=str))
+
     async def rebuild_source(self, source: str) -> Dict[str, Any]:
+        source = str(source or "").strip()
+        if not source:
+            raise ValueError("source is empty")
+        self.metadata_store.enqueue_episode_rebuilds([source], "manual_rebuild")
+        job = self.metadata_store.claim_episode_rebuild(self.generation_hash(), source=source)
+        if job is None:
+            return {"source": source, "status": "pending", "episode_count": 0}
+        return await self._run_rebuild_job(job)
+
+    async def process_rebuild_batch(self, *, limit=20, max_retry=3) -> Dict[str, Any]:
+        items, failures = [], []
+        for _ in range(max(1, int(limit))):
+            job = self.metadata_store.claim_episode_rebuild(self.generation_hash(), max_retry=max_retry)
+            if job is None:
+                break
+            try:
+                items.append(await self._run_rebuild_job(job))
+            except Exception as exc:
+                failures.append({"source": job["source"], "error": str(exc)[:500]})
+                logger.warning("Episode rebuild failed for source=%s: %s", job["source"], exc)
+        return {"processed": len(items) + len(failures),
+                "rebuilt": sum(item.get("status") == "done" for item in items),
+                "failed": len(failures), "items": items, "failures": failures}
+
+    async def _run_rebuild_job(self, job) -> Dict[str, Any]:
+        async def heartbeat():
+            while True:
+                await asyncio.sleep(40)
+                if not self.metadata_store.renew_episode_rebuild(job):
+                    return
+
+        keeper = asyncio.create_task(heartbeat(), name="memorix-episode-lease")
+        try:
+            plan = await self.plan_source_rebuild(job["source"])
+            payloads = plan.pop("payloads")
+            result = self.metadata_store.publish_episode_rebuild(job, payloads, self.generation_hash())
+            return {**plan, **result}
+        except asyncio.CancelledError:
+            self.metadata_store.fail_episode_rebuild(job)
+            raise
+        except Exception as exc:
+            self.metadata_store.fail_episode_rebuild(job, str(exc))
+            raise
+        finally:
+            keeper.cancel()
+            await asyncio.gather(keeper, return_exceptions=True)
+
+    async def plan_source_rebuild(self, source: str) -> Dict[str, Any]:
         token = str(source or "").strip()
         if not token:
             return {
+                "payloads": [],
                 "source": "",
                 "episode_count": 0,
                 "fallback_count": 0,
@@ -536,10 +593,10 @@ class EpisodeService:
             exclude_stale=hard_filter_enabled,
         )
         if not paragraphs:
-            replace_result = self.metadata_store.replace_episodes_for_source(token, [])
             return {
                 "source": token,
-                "episode_count": int(replace_result.get("episode_count") or 0),
+                "episode_count": 0,
+                "payloads": [],
                 "fallback_count": 0,
                 "group_count": 0,
                 "paragraph_count": 0,
@@ -554,10 +611,10 @@ class EpisodeService:
             payloads.extend(list(result.get("payloads") or []))
             fallback_count += int(result.get("fallback_count") or 0)
 
-        replace_result = self.metadata_store.replace_episodes_for_source(token, payloads)
         return {
             "source": token,
-            "episode_count": int(replace_result.get("episode_count") or 0),
+            "episode_count": len(payloads),
+            "payloads": payloads,
             "fallback_count": fallback_count,
             "group_count": len(groups),
             "paragraph_count": len(paragraphs),

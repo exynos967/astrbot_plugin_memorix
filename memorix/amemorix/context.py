@@ -47,6 +47,7 @@ class AppContext:
     _request_dedup_cache: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     _request_dedup_inflight: Dict[str, asyncio.Future] = field(default_factory=dict)
     _request_dedup_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    graph_mutation_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # 双池子存储：始终构造，ready 标志决定是否启用双池检索/写入路径。
     paragraph_vector_store: Optional[VectorStore] = None
     graph_vector_store: Optional[VectorStore] = None

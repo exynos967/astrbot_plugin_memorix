@@ -81,11 +81,6 @@ class PersonFactWritebackService:
         except (TypeError, ValueError):
             return 4
 
-    def _max_registry_facts(self) -> int:
-        try:
-            return max(1, int(self._cfg("person_fact_writeback.max_registry_facts", 30) or 30))
-        except (TypeError, ValueError):
-            return 30
 
     def _max_evidence_chars(self) -> int:
         try:
@@ -207,7 +202,7 @@ class PersonFactWritebackService:
             if stored_hash:
                 stored.append(stored_hash)
         if stored:
-            self._merge_registry_facts(ctx.metadata_store, person_id=person_id, facts=facts)
+            # 新事实以可撤回账本为准，不再追加到无法追溯证据的 registry 字符串。
             logger.debug("[memorix] person facts stored count=%s person=%s", len(stored), person_id)
 
     def _person_id(self, item: PersonFactWritebackItem) -> str:
@@ -331,6 +326,7 @@ class PersonFactWritebackService:
             "source_type": "person_fact",
             "chat_id": item.session_id,
             "person_ids": [person_id],
+            "person_id": person_id,
             "participants": [person_name],
             "sender_id": item.user_id,
             "sender_name": item.sender_name,
@@ -348,6 +344,17 @@ class PersonFactWritebackService:
             knowledge_type="factual",
             time_meta={"event_time": timestamp},
         )
+        claim = ctx.metadata_store.upsert_fact_claim(
+            scope_type="person", scope_id=person_id,
+            fact_key=f"statement:{paragraph_hash}", value_text=content,
+            stability="uncertain", profile_section="uncertain_notes",
+            authority="summary_derived", confidence=0.5,
+            evidence_type="paragraph", evidence_id=paragraph_hash,
+            evidence_metadata={"message_id": item.message_id, "chat_id": item.session_id},
+            reason="astrbot_person_fact_writeback", observed_at=timestamp,
+        )
+        ctx.metadata_store.update_paragraph_metadata(paragraph_hash, {"fact_claim_ids": [claim["claim_id"]]})
+        ctx.metadata_store.enqueue_person_profile_refresh(person_id=person_id, reason="fact_evidence_written")
         try:
             paragraph_vector_service = getattr(ctx, "paragraph_vector_service", None)
             if paragraph_vector_service is not None and hasattr(paragraph_vector_service, "ensure_paragraph_vector"):
@@ -384,33 +391,6 @@ class PersonFactWritebackService:
             logger.debug("[memorix] person fact persist failed", exc_info=True)
         return paragraph_hash
 
-    def _merge_registry_facts(self, metadata_store: Any, *, person_id: str, facts: List[str]) -> None:
-        if not bool(self._cfg("person_fact_writeback.update_registry_memory_points", True)):
-            return
-        record = metadata_store.get_person_registry(person_id)
-        if not record:
-            return
-        existing = record.get("memory_points") if isinstance(record.get("memory_points"), list) else []
-        merged: List[str] = []
-        seen = set()
-        for item in [*existing, *facts]:
-            text = normalize_text(str(item or ""))
-            if not text or text in seen:
-                continue
-            seen.add(text)
-            merged.append(text)
-        merged = merged[-self._max_registry_facts() :]
-        metadata_store.upsert_person_registry(
-            person_id=person_id,
-            person_name=str(record.get("person_name", "") or ""),
-            nickname=str(record.get("nickname", "") or ""),
-            user_id=str(record.get("user_id", "") or ""),
-            platform=str(record.get("platform", "") or ""),
-            group_nick_name=record.get("group_nick_name") or [],
-            memory_points=merged,
-            last_know=time.time(),
-            metadata=record.get("metadata") if isinstance(record.get("metadata"), dict) else {},
-        )
 
     @staticmethod
     def _truncate(text: str, max_chars: int) -> str:

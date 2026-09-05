@@ -57,6 +57,7 @@ class TaskManager:
         self._workers.append(asyncio.create_task(self._paragraph_vector_backfill_loop(), name="paragraph-vector-loop"))
         self._workers.append(asyncio.create_task(self._person_profile_refresh_loop(), name="person-profile-loop"))
         self._workers.append(asyncio.create_task(self._episode_generation_loop(), name="episode-generation-loop"))
+        self._workers.append(asyncio.create_task(self._memory_projection_loop(), name="memory-projection-loop"))
         logger.info("TaskManager started with %s workers", len(self._workers))
 
     async def stop(self) -> None:
@@ -421,18 +422,12 @@ class TaskManager:
                 hashes_to_freeze: List[str] = []
                 edges_to_deactivate = []
                 for src, tgt in low_edges:
-                    src_c = self.ctx.graph_store._canonicalize(src)  # noqa: SLF001
-                    tgt_c = self.ctx.graph_store._canonicalize(tgt)  # noqa: SLF001
-                    s_idx = self.ctx.graph_store._node_to_idx.get(src_c)  # noqa: SLF001
-                    t_idx = self.ctx.graph_store._node_to_idx.get(tgt_c)  # noqa: SLF001
-                    if s_idx is None or t_idx is None:
-                        continue
-                    edge_hashes = list(self.ctx.graph_store._edge_hash_map.get((s_idx, t_idx), set()))  # noqa: SLF001
+                    edge_hashes = list(self.ctx.graph_store.get_relation_hashes_for_edge(src, tgt))
                     if not edge_hashes:
                         continue
                     status = self.ctx.metadata_store.get_relation_status_batch(edge_hashes)
                     protected = any(
-                        (v.get("is_pinned") or ((v.get("protected_until") or 0) > datetime.datetime.now().timestamp()))
+                        (v.get("is_pinned") or v.get("is_permanent") or ((v.get("protected_until") or 0) > datetime.datetime.now().timestamp()))
                         for v in status.values()
                     )
                     if not protected:
@@ -447,16 +442,9 @@ class TaskManager:
                 cutoff = datetime.datetime.now().timestamp() - max(1.0, freeze_hours * 3600.0)
                 expired = self.ctx.metadata_store.get_prune_candidates(cutoff)
                 if expired:
-                    cursor = self.ctx.metadata_store._conn.cursor()
-                    placeholders = ",".join(["?"] * len(expired))
-                    cursor.execute(
-                        f"SELECT hash, subject, object FROM relations WHERE hash IN ({placeholders})",
-                        expired,
-                    )
-                    ops = [(str(row[1]), str(row[2]), str(row[0])) for row in cursor.fetchall()]
-                    if ops:
-                        self.ctx.graph_store.prune_relation_hashes(ops)
-                    self.ctx.metadata_store.backup_and_delete_relations(expired)
+                    from .services.delete_service import DeleteService
+
+                    await DeleteService(self.ctx).execute("relation", expired, reason="freeze_expired", requested_by="maintenance")
                 await asyncio.to_thread(self.ctx.graph_store.save)
             except asyncio.CancelledError:
                 break
@@ -541,34 +529,25 @@ class TaskManager:
 
                 batch_size = int(self.ctx.get_config("episode.generation_batch_size", 20))
                 max_retry = int(self.ctx.get_config("episode.max_retry", 3))
-                rows = self.ctx.metadata_store.fetch_episode_source_rebuild_batch(
-                    limit=max(1, batch_size),
-                    max_retry=max(0, max_retry),
+                await self.ctx.episode_service.process_rebuild_batch(
+                    limit=max(1, batch_size), max_retry=max(0, max_retry),
                 )
-                for row in rows:
-                    source = str(row.get("source", "") or "").strip()
-                    requested_at = row.get("requested_at")
-                    if not source:
-                        continue
-                    if not self.ctx.metadata_store.mark_episode_source_running(
-                        source,
-                        requested_at=requested_at,
-                    ):
-                        continue
-                    try:
-                        await self.ctx.episode_service.rebuild_source(source)
-                        self.ctx.metadata_store.mark_episode_source_done(
-                            source,
-                            requested_at=requested_at,
-                        )
-                    except Exception as exc:
-                        self.ctx.metadata_store.mark_episode_source_failed(
-                            source,
-                            str(exc),
-                            requested_at=requested_at,
-                        )
-                        logger.warning("Episode rebuild failed for source=%s: %s", source, exc)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 logger.warning("Episode generation loop error: %s", exc, exc_info=True)
+
+    async def _memory_projection_loop(self) -> None:
+        from ..services.memory_projection_service import MemoryProjectionService
+
+        service = MemoryProjectionService(self.ctx)
+        while not self._stopping:
+            try:
+                result = await service.reconcile()
+                if result["pending"]:
+                    logger.info("Memory index reconciliation pending=%s", result["pending"])
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning("Memory index reconciliation failed: %s", exc)
+            await asyncio.sleep(30)

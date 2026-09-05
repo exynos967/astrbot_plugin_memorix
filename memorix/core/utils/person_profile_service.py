@@ -133,6 +133,11 @@ class PersonProfileService:
             return ""
         if len(value) == 32 and all(ch in "0123456789abcdefABCDEF" for ch in value):
             return value.lower()
+        manual_matches = self.metadata_store.find_person_ids_by_manual_alias(value)
+        if len(manual_matches) > 1:
+            raise ValueError("人物别名不唯一，请使用 person_id")
+        if manual_matches:
+            return manual_matches[0]
         try:
             return self.metadata_store.resolve_person_registry(value) or ""
         except Exception:
@@ -184,7 +189,7 @@ class PersonProfileService:
             traits.append(text)
         return traits[:10]
 
-    def get_person_aliases(self, person_id: str) -> Tuple[List[str], str, List[str]]:
+    def get_person_aliases(self, person_id: str, *, include_override: bool = True) -> Tuple[List[str], str, List[str]]:
         aliases: List[str] = []
         primary_name = ""
         memory_traits: List[str] = []
@@ -192,9 +197,7 @@ class PersonProfileService:
             return aliases, primary_name, memory_traits
 
         try:
-            record = self.metadata_store.get_person_registry(person_id)
-            if not record:
-                return aliases, primary_name, memory_traits
+            record = self.metadata_store.get_person_registry(person_id) or {}
 
             person_name = str(record.get("person_name", "") or "").strip()
             nickname = str(record.get("nickname", "") or "").strip()
@@ -218,7 +221,40 @@ class PersonProfileService:
                 aliases.append(norm)
         except Exception as exc:
             logger.warning("Parse person aliases failed: %s", exc)
+        if include_override:
+            override = self.metadata_store.get_person_profile_alias_override(person_id)
+            if override is not None:
+                aliases = override["aliases"]
         return aliases, primary_name, memory_traits
+
+    def get_person_alias_details(self, person_id: str) -> Dict[str, Any]:
+        derived, primary_name, _ = self.get_person_aliases(person_id, include_override=False)
+        override = self.metadata_store.get_person_profile_alias_override(person_id)
+        return {
+            "person_id": person_id,
+            "person_name": primary_name,
+            "derived_aliases": derived,
+            "manual_aliases": override["aliases"] if override else None,
+            "effective_aliases": override["aliases"] if override else derived,
+        }
+
+    def _with_fact_claims(self, person_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        # 每次读取当前账本，避免事实到期后仍沿用 TTL 内的缓存投影。
+        claims = self.metadata_store.list_person_profile_fact_claims(person_id)
+        result = dict(payload)
+        result["fact_claims"] = claims
+        result["alias_details"] = self.get_person_alias_details(person_id)
+        lines = [str(result.get("profile_text", "") or "")]
+        for uncertain, heading in ((False, "当前确认事实"), (True, "待确认事实线索")):
+            values = [str(claim["value_text"]) for claim in claims if (claim["stability"] == "uncertain") == uncertain]
+            if uncertain:
+                if not self._cfg("person_fact_writeback.update_registry_memory_points", True):
+                    continue
+                values = values[:max(1, int(self._cfg("person_fact_writeback.max_registry_facts", 30)))]
+            if values:
+                lines.append(heading + ":\n" + "\n".join(f"- {value}" for value in values))
+        result["profile_text"] = "\n".join(lines)
+        return result
 
     def _collect_relation_evidence(self, aliases: List[str], limit: int = 30) -> List[Dict[str, Any]]:
         relation_by_hash: Dict[str, Dict[str, Any]] = {}
@@ -282,6 +318,15 @@ class PersonProfileService:
         if not aliases:
             return False
 
+        paragraph = self.metadata_store.get_paragraph(str(item.get("hash", "")))
+        if paragraph is not None:
+            if paragraph.get("is_deleted"):
+                return False
+            paragraph_metadata = paragraph.get("metadata") or {}
+            # 人物事实由账本投影，避免撤回后仍从向量证据重新注入。
+            if isinstance(paragraph_metadata, dict) and paragraph_metadata.get("fact_claim_ids"):
+                return False
+
         if self._text_matches_alias(str(item.get("content", "") or ""), aliases):
             return True
 
@@ -323,7 +368,7 @@ class PersonProfileService:
                             "metadata": {},
                         }
                     )
-            return fallback[:top_k]
+            return [item for item in fallback if self._is_person_related_vector_item(item, alias_queries)][:top_k]
 
         per_alias_top_k = max(2, int(top_k / max(1, len(alias_queries))))
         seen_hash = set()
@@ -374,8 +419,7 @@ class PersonProfileService:
             lines.append(f"主称呼: {primary_name}")
         if aliases:
             lines.append(f"别名: {', '.join(aliases[:8])}")
-        if memory_traits:
-            lines.append(f"记忆特征: {'; '.join(memory_traits[:6])}")
+        # registry.memory_points 没有证据生命周期，保留原数据供管理查看，不参与自动注入。
 
         if relation_edges:
             lines.append("关系证据:")
@@ -449,7 +493,10 @@ class PersonProfileService:
     ) -> Dict[str, Any]:
         pid = str(person_id or "").strip()
         if not pid and person_keyword:
-            pid = self.resolve_person_id(person_keyword)
+            try:
+                pid = self.resolve_person_id(person_keyword)
+            except ValueError as error:
+                return {"success": False, "error": str(error)}
         if not pid and person_keyword:
             # basic 场景里常见“人物”只作为图谱实体存在，尚未进入 person_registry。
             # 允许直接使用关键词生成轻量画像，避免候选表为空时功能不可用。
@@ -469,7 +516,7 @@ class PersonProfileService:
             }
             if aliases and not payload.get("aliases"):
                 payload["aliases"] = aliases
-            return self._apply_manual_override(pid, payload)
+            return self._apply_manual_override(pid, self._with_fact_claims(pid, payload))
 
         aliases, primary_name, memory_traits = self.get_person_aliases(pid)
         if not aliases and person_keyword:
@@ -518,7 +565,7 @@ class PersonProfileService:
             "from_cache": False,
             **snapshot,
         }
-        return self._apply_manual_override(pid, payload)
+        return self._apply_manual_override(pid, self._with_fact_claims(pid, payload))
 
     @staticmethod
     def format_persona_profile_block(profile: Dict[str, Any]) -> str:

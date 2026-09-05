@@ -6,7 +6,6 @@ import re
 from typing import Any, Dict, Iterable, Sequence
 
 from ...core.utils.hash import compute_hash, normalize_text
-
 from ..context import AppContext
 
 
@@ -63,14 +62,14 @@ class DeleteService:
             graph_store.save()
         return deleted
 
-    async def paragraph(self, paragraph_spec: str) -> Dict[str, Any]:
+    def resolve_paragraph(self, paragraph_spec: str) -> str:
         query = str(paragraph_spec or "").strip()
         if not query:
             raise ValueError("paragraph_spec is empty")
 
         target = None
         if self._looks_like_hash(query):
-            target = self.ctx.metadata_store.get_paragraph(query)
+            target = self.ctx.metadata_store.get_paragraph(query.lower())
             if not target:
                 raise ValueError(f"paragraph not found: {query}")
         else:
@@ -86,70 +85,16 @@ class DeleteService:
             else:
                 target = matches[0]
 
-        paragraph_hash = str(target["hash"])
-        plan = self.ctx.metadata_store.delete_paragraph_atomic(paragraph_hash)
-        relation_prune_ops = plan.get("relation_prune_ops", []) or []
-        edges_to_remove = plan.get("edges_to_remove", []) or []
+        return str(target["hash"])
 
-        if relation_prune_ops and hasattr(self.ctx.graph_store, "prune_relation_hashes"):
-            self.ctx.graph_store.prune_relation_hashes(relation_prune_ops)
-        elif edges_to_remove:
-            self.ctx.graph_store.delete_edges(edges_to_remove)
-
-        paragraph_ids = []
-        relation_ids = []
-        vid = plan.get("vector_id_to_remove")
-        if vid:
-            paragraph_ids.append(str(vid))
-        for op in relation_prune_ops:
-            if len(op) >= 3 and op[2]:
-                relation_ids.append(str(op[2]))
-        deleted_vectors = self._delete_vectors(
-            paragraph_hashes=paragraph_ids,
-            relation_hashes=relation_ids,
-        )
-        self.ctx.graph_store.save()
-        return {
-            "success": True,
-            "paragraph_hash": paragraph_hash,
-            "relation_prune_count": len(relation_prune_ops),
-            "deleted_vectors": deleted_vectors,
-        }
+    async def paragraph(self, paragraph_spec: str) -> Dict[str, Any]:
+        paragraph_hash = self.resolve_paragraph(paragraph_spec)
+        return {**await self.execute("paragraph", [paragraph_hash]), "paragraph_hash": paragraph_hash}
 
     async def entity(self, entity_name: str) -> Dict[str, Any]:
-        target = str(entity_name or "").strip()
-        if not target:
-            raise ValueError("entity_name is empty")
-        canonical = target.lower()
-        if not self.ctx.graph_store.has_node(canonical):
-            raise ValueError(f"entity not found: {canonical}")
+        return {**await self.execute("entity", [entity_name]), "entity_name": entity_name}
 
-        neighbors = self.ctx.graph_store.get_neighbors(canonical)
-        rel_hashes = {
-            str(r["hash"])
-            for r in (
-                self.ctx.metadata_store.get_relations(subject=canonical)
-                + self.ctx.metadata_store.get_relations(object=canonical)
-            )
-            if r.get("hash")
-        }
-
-        self.ctx.graph_store.delete_nodes([canonical])
-        self.ctx.metadata_store.delete_entity(canonical)
-        entity_hash = compute_hash(canonical)
-        deleted_vectors = self._delete_vectors(
-            entity_hashes=[entity_hash],
-            relation_hashes=list(rel_hashes),
-        )
-        self.ctx.graph_store.save()
-        return {
-            "success": True,
-            "entity_name": canonical,
-            "deleted_edges": len(neighbors),
-            "deleted_vectors": deleted_vectors,
-        }
-
-    async def relation(self, relation_spec: str) -> Dict[str, Any]:
+    def resolve_relation(self, relation_spec: str) -> str:
         query = str(relation_spec or "").strip()
         if not query:
             raise ValueError("relation_spec is empty")
@@ -176,48 +121,30 @@ class DeleteService:
             if not relation:
                 raise ValueError("relation not found")
 
-        # Keep relation restore path functional: delete into recycle-bin first.
-        deleted_count = self.ctx.metadata_store.backup_and_delete_relations([rel_hash])
-        if int(deleted_count) <= 0:
-            raise RuntimeError("delete relation failed")
+        return rel_hash
 
-        subject = str(relation.get("subject", ""))
-        obj = str(relation.get("object", ""))
-        if hasattr(self.ctx.graph_store, "prune_relation_hashes"):
-            self.ctx.graph_store.prune_relation_hashes([(subject, obj, rel_hash)])
-        else:
-            self.ctx.graph_store.delete_edges([(subject, obj)])
-
-        deleted_vectors = self._delete_vectors(relation_hashes=[rel_hash])
-        self.ctx.graph_store.save()
-        return {
-            "success": True,
-            "relation_hash": rel_hash,
-            "subject": subject,
-            "predicate": str(relation.get("predicate", "")),
-            "object": obj,
-            "deleted_vectors": deleted_vectors,
-        }
+    async def relation(self, relation_spec: str) -> Dict[str, Any]:
+        rel_hash = self.resolve_relation(relation_spec)
+        return {**await self.execute("relation", [rel_hash]), "relation_hash": rel_hash}
 
     async def clear(self) -> Dict[str, Any]:
-        counts = {
-            "paragraphs": self.ctx.metadata_store.count_paragraphs(),
-            "relations": self.ctx.metadata_store.count_relations(),
-            "entities": self.ctx.metadata_store.count_entities(),
-            "vectors": self.ctx.vector_store.num_vectors,
-        }
-        self.ctx.vector_store.clear()
-        if self._dual_pools_enabled():
-            paragraph_store = getattr(self.ctx, "paragraph_vector_store", None)
-            graph_vector_store = getattr(self.ctx, "graph_vector_store", None)
-            if paragraph_store is not None:
-                paragraph_store.clear()
-                paragraph_store.save()
-            if graph_vector_store is not None:
-                graph_vector_store.clear()
-                graph_vector_store.save()
-        self.ctx.graph_store.clear()
-        self.ctx.metadata_store.clear_all()
-        self.ctx.vector_store.save()
-        self.ctx.graph_store.save()
-        return {"success": True, "deleted": counts}
+        return await self.execute("clear", [])
+
+    async def source(self, sources: Sequence[str]) -> Dict[str, Any]:
+        return await self.execute("source", sources)
+
+    async def execute(self, mode: str, selectors: Sequence[str], *, reason="", requested_by="") -> Dict[str, Any]:
+        from ...services.memory_projection_service import MemoryProjectionService
+
+        async with self.ctx.graph_mutation_lock:
+            result = self.ctx.metadata_store.delete_memories(mode, selectors, reason=reason, requested_by=requested_by)
+            result["projection"] = await MemoryProjectionService(self.ctx).reconcile_locked(operation_id=result.get("operation_id"))
+            return result
+
+    async def restore(self, operation_id: str) -> Dict[str, Any]:
+        from ...services.memory_projection_service import MemoryProjectionService
+
+        async with self.ctx.graph_mutation_lock:
+            result = self.ctx.metadata_store.restore_memory_operation(operation_id)
+            result["projection"] = await MemoryProjectionService(self.ctx).reconcile_locked(limit=10, operation_id=operation_id)
+            return result

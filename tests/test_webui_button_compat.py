@@ -112,20 +112,20 @@ class _FakeBridgeResponse:
         return self.payload
 
 
-def _install_quart_request(payload):
-    quart_mod = types.ModuleType("quart")
+def _install_plugin_web_request(payload):
+    web_mod = types.ModuleType("astrbot.api.web")
 
     class _Request:
-        async def get_json(self, *args, **kwargs):
+        async def json(self, *args, **kwargs):
             del args, kwargs
             return payload
 
     def jsonify(data):
         return _FakeBridgeResponse(data)
 
-    quart_mod.request = _Request()
-    quart_mod.jsonify = jsonify
-    sys.modules["quart"] = quart_mod
+    web_mod.request = _Request()
+    web_mod.json_response = jsonify
+    sys.modules["astrbot.api.web"] = web_mod
 
 
 def test_webui_import_button_prefers_native_import_manager():
@@ -139,13 +139,13 @@ def test_webui_import_button_prefers_native_import_manager():
 
     assert result["task_id"] == "native-paste"
     assert native_import_manager.calls == [
-        ("paste", {"content": "hello", "name": "manual-source", "knowledge_type": ""})
+        ("paste", {"content": "hello", "name": "manual-source", "knowledge_type": "", "source": "manual-source"})
     ]
     assert manager.get_task("native-paste")["status"] == "queued"
 
 
 def test_webui_bridge_preserves_frontend_errors():
-    _install_quart_request({"method": "GET", "url": "/api/graph"})
+    _install_plugin_web_request({"method": "GET", "url": "/api/graph"})
     bridge = PluginPageWebUIBridge(
         runtime_manager=object(),
         scope_resolver=lambda: "default",

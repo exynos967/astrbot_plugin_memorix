@@ -696,6 +696,7 @@ def _admin_parameters(actions: str) -> dict:
             "selector": {"type": "object", "description": "delete_admin 选择器对象。"},
             "restore_type": {"type": "string", "description": "恢复类型：relation/entity。"},
             "person_id": {"type": "string", "description": "人物 ID。"},
+            "aliases": {"type": "array", "items": {"type": "string"}, "description": "人工确认的完整人物别名集合。"},
             "person_keyword": {"type": "string", "description": "人物关键词。"},
             "keyword": {"type": "string", "description": "关键词。"},
             "override_text": {"type": "string", "description": "人物画像手工覆盖内容。"},
@@ -796,7 +797,7 @@ class MemorixProfileAdminTool(MemorixAdminToolBase):
     name: str = "memory_profile_admin"
     description: str = "人物画像管理接口；仅 AstrBot 管理员可用。"
     admin_method: str = "profile_admin"
-    parameters: dict = Field(default_factory=lambda: _admin_parameters("query/list/status/set_override/delete_override"))
+    parameters: dict = Field(default_factory=lambda: _admin_parameters("query/list/status/set_override/delete_override/get_aliases/set_aliases/delete_aliases"))
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
         return await self._call_admin(context, **kwargs)
@@ -902,6 +903,40 @@ class MemorixFuzzyModifyAdminTool(MemorixAdminToolBase):
         return await self._call_admin(context, **kwargs)
 
 
+@dataclass
+class MemorixFactAdminTool(MemorixAdminToolBase):
+    name: str = "memory_fact_admin"
+    description: str = "管理当前记忆作用域内的结构化事实，支持显式修正、撤回和恢复；仅 AstrBot 管理员可用。"
+    admin_method: str = "fact_admin"
+    parameters: dict = Field(default_factory=lambda: {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["get", "list", "create", "update", "retract", "restore"]},
+            "claim_id": {"type": "string", "description": "get/update/retract/restore 必填。"},
+            "scope_type": {"type": "string", "enum": ["person", "chat"]},
+            "scope_id": {"type": "string", "description": "当前记忆库内的人物或聊天 ID；list/create 必填。"},
+            "fact_key": {"type": "string"},
+            "value_text": {"type": "string"},
+            "polarity": {"type": "string", "enum": ["positive", "negative"]},
+            "cardinality": {"type": "string", "enum": ["single", "set"]},
+            "stability": {"type": "string", "enum": ["stable", "temporal", "uncertain"]},
+            "authority": {"type": "string", "enum": ["manual", "direct_user", "imported", "summary_derived"]},
+            "profile_section": {"type": "string", "enum": ["identity_settings", "relationship_settings", "stable_facts", "interaction_preferences", "recent_interactions", "uncertain_notes"]},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "valid_from": {"type": ["number", "null"]},
+            "valid_to": {"type": ["number", "null"]},
+            "statuses": {"type": "array", "items": {"type": "string", "enum": ["active", "conflicted", "superseded", "retracted"]}},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+            "reason": {"type": "string"},
+        },
+        "required": ["action"],
+        "additionalProperties": False,
+    })
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
+        return await self._call_admin(context, **kwargs)
+
+
 def build_memorix_tools(plugin: Any) -> list[FunctionTool[AstrAgentContext]]:
     return [
         MemorixSearchTool(plugin=plugin),
@@ -914,6 +949,7 @@ def build_memorix_tools(plugin: Any) -> list[FunctionTool[AstrAgentContext]]:
         MemorixSourceAdminTool(plugin=plugin),
         MemorixEpisodeAdminTool(plugin=plugin),
         MemorixProfileAdminTool(plugin=plugin),
+        MemorixFactAdminTool(plugin=plugin),
         MemorixRuntimeAdminTool(plugin=plugin),
         MemorixImportAdminTool(plugin=plugin),
         MemorixTuningAdminTool(plugin=plugin),

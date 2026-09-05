@@ -270,19 +270,29 @@ class ScopeRuntimeManager:
             task_manager = TaskManager(ctx)
             runtime = ScopeRuntime(scope_key=key, settings=settings, context=ctx, task_manager=task_manager)
 
-            embedding_enabled = bool(settings.get("embedding.enabled", False))
-            if embedding_enabled:
-                endpoint_cfg = settings.get_openapi_endpoint_config()
-                logger.info(
-                    "openapi embedding enabled: scope=%s base_url=%s model=%s",
-                    key,
-                    str(endpoint_cfg.get("base_url", "") or "<not-configured>"),
-                    str(endpoint_cfg.get("model", "") or "<not-configured>"),
-                )
-            else:
-                self._patch_local_embedding(runtime)
+            try:
+                embedding_enabled = bool(settings.get("embedding.enabled", False))
+                if embedding_enabled:
+                    endpoint_cfg = settings.get_openapi_endpoint_config()
+                    logger.info(
+                        "openapi embedding enabled: scope=%s base_url=%s model=%s",
+                        key,
+                        str(endpoint_cfg.get("base_url", "") or "<not-configured>"),
+                        str(endpoint_cfg.get("model", "") or "<not-configured>"),
+                    )
+                else:
+                    self._patch_local_embedding(runtime)
 
-            await task_manager.start()
+                from .services.graph_rename_service import GraphRenameService
+
+                await GraphRenameService(ctx).reconcile()
+                await task_manager.start()
+            except BaseException:
+                try:
+                    await task_manager.stop()
+                finally:
+                    await ctx.close()
+                raise
             self._runtimes[key] = runtime
             logger.info(
                 "runtime ready: scope=%s embedding_mode=%s",

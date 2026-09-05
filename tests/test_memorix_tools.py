@@ -173,6 +173,7 @@ EXPECTED_TOOL_NAMES = [
     "memory_source_admin",
     "memory_episode_admin",
     "memory_profile_admin",
+    "memory_fact_admin",
     "memory_runtime_admin",
     "memory_import_admin",
     "memory_tuning_admin",
