@@ -60,6 +60,22 @@ export async function request<T = unknown>(
   return unwrapEnvelope<T>(envelope, finalUrl, method);
 }
 
+export async function uploadImport<T>(file: File, options: Record<string, unknown>, scope: string): Promise<T> {
+  const limits = await request<{ max_file_size_bytes: number; suffixes: string[] }>("GET", "/v1/import/limits", undefined, { scope });
+  if (file.size > limits.max_file_size_bytes) throw new ApiError(`文件超过 ${Math.floor(limits.max_file_size_bytes / 1048576)} MB 上限`, "webui/upload", "POST");
+  const suffix = `.${file.name.split(".").pop()?.toLowerCase()}`;
+  if (!limits.suffixes.includes(suffix)) throw new ApiError("不支持此文件类型", "webui/upload", "POST");
+  const bridge = resolveBridge();
+  await bridge.ready();
+  if (typeof bridge.upload !== "function") throw new ApiError("当前 AstrBot 不支持文件上传", "webui/upload", "POST");
+  const params = new URLSearchParams({ _scope: scope });
+  for (const key of ["source", "input_mode", "knowledge_type", "chat_log", "narrative_window_size", "narrative_overlap"]) {
+    if (options[key] != null) params.set(key, String(options[key]));
+  }
+  const endpoint = `webui/upload?${params}`;
+  return unwrapEnvelope<T>(await bridge.upload(endpoint, file), endpoint, "POST");
+}
+
 function unwrapEnvelope<T>(envelope: unknown, url: string, method: HttpMethod): T {
   if (envelope && typeof envelope === "object") {
     const env = envelope as { status?: string; data?: unknown; message?: string };

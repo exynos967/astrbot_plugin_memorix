@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import copy
 import dataclasses
 import json
 from pathlib import Path
 
-from astrbot_plugin_memorix.memorix.amemorix.bootstrap import _dual_vector_ready
+from astrbot_plugin_memorix.memorix.amemorix.bootstrap import _dual_vector_ready, build_context
 from astrbot_plugin_memorix.memorix.amemorix.context import AppContext
-from astrbot_plugin_memorix.memorix.amemorix.settings import DEFAULT_CONFIG
+from astrbot_plugin_memorix.memorix.amemorix.settings import DEFAULT_CONFIG, AppSettings
 
 
 def test_dual_vector_ready_false_on_empty_dir(tmp_path: Path) -> None:
@@ -61,6 +62,8 @@ def test_default_config_dual_pool_defaults_align_with_maibot() -> None:
     assert vector_pools["relation_intent"]["sparse_weight"] == 0.15
     assert vector_pools["relation_intent"]["graph_weight"] == 0.40
     assert vector_pools["relation_intent"]["return_relation_items"] is False
+    assert vector_pools["score_calibration_method"] == "none"
+    assert vector_pools["score_calibration_rrf_k"] == 60
     relation_vectorization = DEFAULT_CONFIG["retrieval"]["relation_vectorization"]
     assert relation_vectorization["enabled"] is False
     assert relation_vectorization["backfill_enabled"] is False
@@ -84,6 +87,8 @@ def test_conf_schema_exposes_dual_pool_config() -> None:
     assert relation_intent["sparse_weight"]["default"] == 0.15
     assert relation_intent["graph_weight"]["default"] == 0.4
     assert relation_intent["return_relation_items"]["default"] is False
+    assert vector_pools["items"]["score_calibration_method"]["default"] == "none"
+    assert vector_pools["items"]["score_calibration_rrf_k"]["default"] == 60
 
 
 def test_appcontext_has_dual_pool_fields_and_method() -> None:
@@ -103,3 +108,26 @@ def test_appcontext_dual_pool_enabled_reflects_ready_flag() -> None:
     assert ctx._dual_vector_pools_enabled() is False
     ctx._dual_vector_pools_ready = True
     assert ctx._dual_vector_pools_enabled() is True
+
+
+def test_build_context_wires_dual_stores_when_ready(tmp_path: Path) -> None:
+    """ready manifest 存在时，检索器应接到独立 paragraph/graph 向量池。"""
+    vectors_dir = tmp_path / "vectors"
+    (vectors_dir / "paragraph").mkdir(parents=True)
+    (vectors_dir / "graph").mkdir(parents=True)
+    (vectors_dir / "dual_ready.json").write_text(
+        json.dumps({"status": "ready", "dimension": 1024}),
+        encoding="utf-8",
+    )
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    config["storage"]["data_dir"] = str(tmp_path)
+    ctx = build_context(AppSettings(config=config))
+    try:
+        assert ctx._dual_vector_pools_ready is True
+        assert ctx.retriever.paragraph_vector_store is ctx.paragraph_vector_store
+        assert ctx.retriever.graph_vector_store is ctx.graph_vector_store
+        assert ctx.retriever.config.vector_pools.mode == "dual"
+    finally:
+        closer = getattr(ctx.metadata_store, "close", None)
+        if callable(closer):
+            closer()

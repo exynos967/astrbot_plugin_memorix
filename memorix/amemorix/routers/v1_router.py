@@ -18,6 +18,34 @@ from ...core.utils.runtime_self_check import ensure_runtime_self_check
 
 router = APIRouter(prefix="/v1", tags=["v1"])
 
+
+class StructuredAdminRequest(BaseModel):
+    action: str
+    payload: Dict[str, Any] = Field(default_factory=dict)
+
+
+@router.post("/memory/delete-admin")
+async def delete_admin(request: Request, body: StructuredAdminRequest):
+    payload = {key: value for key, value in body.payload.items() if key not in {"scope_key", "action"}}
+    try:
+        return await _admin_service(request).delete_admin(scope_key=_scope_key(request), action=body.action, **payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/facts")
+async def fact_admin(request: Request, body: StructuredAdminRequest):
+    payload = {key: value for key, value in body.payload.items() if key not in {"scope_key", "action"}}
+    return await _admin_service(request).fact_admin(scope_key=_scope_key(request), action=body.action, **payload)
+
+
+@router.post("/person/aliases")
+async def person_alias_admin(request: Request, body: StructuredAdminRequest):
+    if body.action not in {"get_aliases", "set_aliases", "delete_aliases"}:
+        raise HTTPException(status_code=400, detail="不支持的人物别名操作")
+    payload = {key: value for key, value in body.payload.items() if key not in {"scope_key", "action"}}
+    return await _admin_service(request).profile_admin(scope_key=_scope_key(request), action=body.action, **payload)
+
 QUERY_EVENT_RETENTION_SECONDS = 2 * 60 * 60
 QUERY_TREND_BUCKET_SECONDS = 5 * 60
 
@@ -290,6 +318,11 @@ def _status_from_episode_summary(summary: Dict[str, Any]) -> str:
     return "ready"
 
 
+@router.get("/import/limits")
+async def import_limits(request: Request):
+    return request.app.state.import_task_manager.get_import_limits()
+
+
 @router.post("/import/tasks")
 async def create_import_task(request: Request, body: ImportTaskCreateRequest):
     manager = _task_manager(request)
@@ -460,37 +493,9 @@ async def episode_rebuild(request: Request, body: EpisodeRebuildRequest):
     if not source:
         raise HTTPException(status_code=400, detail="source is required")
 
-    queue_row = ctx.metadata_store.get_episode_source_rebuild(source)
-    queue_status = str((queue_row or {}).get("status", "") or "").strip().lower()
-    requested_at = (queue_row or {}).get("requested_at")
-    managed_queue = False
-
-    if queue_status == "running":
-        raise HTTPException(status_code=409, detail="Episode source rebuild is already running")
-    if queue_status in {"pending", "failed"}:
-        managed_queue = ctx.metadata_store.mark_episode_source_running(
-            source,
-            requested_at=requested_at,
-        )
-        if not managed_queue:
-            latest = ctx.metadata_store.get_episode_source_rebuild(source)
-            latest_status = str((latest or {}).get("status", "") or "").strip().lower()
-            if latest_status == "running":
-                raise HTTPException(status_code=409, detail="Episode source rebuild is already running")
-            requested_at = None
-
     try:
-        result = await ctx.episode_service.rebuild_source(source)
-        if managed_queue:
-            ctx.metadata_store.mark_episode_source_done(source, requested_at=requested_at)
-        return result
+        return await ctx.episode_service.rebuild_source(source)
     except Exception as exc:
-        if managed_queue:
-            ctx.metadata_store.mark_episode_source_failed(
-                source,
-                str(exc),
-                requested_at=requested_at,
-            )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 

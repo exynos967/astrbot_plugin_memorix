@@ -77,7 +77,8 @@ class _FakeRetriever:
 
 
 class _FakeMetadataStore:
-    pass
+    def get_paragraph(self, hash_value):
+        return None
 
 
 def test_collect_vector_evidence_filters_unrelated_items():
@@ -134,7 +135,7 @@ def test_parse_fact_list_extracts_json_array_from_text():
     assert facts == ["A 喜欢猫"]
 
 
-def test_person_fact_writeback_stores_paragraph_and_registry_points(tmp_path):
+def test_person_fact_writeback_stores_paragraph_and_ledger(tmp_path):
     metadata_store = MetadataStore(tmp_path)
     metadata_store.connect()
     try:
@@ -171,7 +172,11 @@ def test_person_fact_writeback_stores_paragraph_and_registry_points(tmp_path):
 
         record = metadata_store.get_person_registry("qq:u1")
         assert record is not None
-        assert "小明喜欢深夜打游戏" in record["memory_points"]
+        assert "小明喜欢深夜打游戏" not in record["memory_points"]
+        claims = metadata_store.list_person_profile_fact_claims("qq:u1")
+        assert len(claims) == 1
+        assert claims[0]["stability"] == "uncertain"
+        assert claims[0]["value_text"] == "小明喜欢深夜打游戏"
         paragraphs = metadata_store.get_paragraphs_by_source("person_fact:s1:qq:u1")
         assert len(paragraphs) == 1
         assert "小明喜欢深夜打游戏" in paragraphs[0]["content"]

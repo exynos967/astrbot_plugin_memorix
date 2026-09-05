@@ -155,9 +155,8 @@ class MemorixToolBase(FunctionTool[AstrAgentContext]):
         return event
 
     def _scope_key(self, event: AstrMessageEvent, scope_key: str = "") -> str:
-        explicit = str(scope_key or "").strip()
-        if explicit:
-            return explicit
+        # LLM 传入的 scope_key 一律丢弃：成员工具不能跨会话读写，管理员工具也不当 confused deputy。
+        del scope_key
         return self.plugin._resolve_scope(event)
 
     def _adapted(self, event: AstrMessageEvent, scope_key: str):
@@ -182,14 +181,14 @@ class MemorixToolBase(FunctionTool[AstrAgentContext]):
         runtime_manager = getattr(self.plugin, "runtime_manager", None)
         get_runtime = getattr(runtime_manager, "get_runtime", None)
         if not callable(get_runtime):
-            return True
+            return False
 
         adapted = self._adapted(event, scope_key)
         try:
             runtime = await get_runtime(scope_key)
             checker = getattr(runtime.context, "is_chat_enabled", None)
             if not callable(checker):
-                return True
+                return False
             return bool(
                 checker(
                     stream_id=str(chat_id or adapted.session_id or "").strip(),
@@ -199,7 +198,7 @@ class MemorixToolBase(FunctionTool[AstrAgentContext]):
             )
         except Exception as exc:
             logger.warning("[memorix] tool chat filter check failed: %s", exc, exc_info=True)
-            return True
+            return False
 
     async def _upsert_current_sender(
         self,
@@ -261,27 +260,27 @@ class MemorixSearchTool(MemorixToolBase):
                     "type": "string",
                     "description": "结束时间，支持 YYYY-MM-DD/今天等；使用 mode=time/hybrid 时至少填它或 time_start。",
                 },
-                "respect_filter": {"type": "boolean", "description": "是否限定当前聊天来源，默认 true。"},
-                "scope_key": {"type": "string", "description": "高级：显式指定 Memorix scope，通常留空。"},
             },
-            "required": [],
+            "required": ["query"],
         }
     )
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
         event = self._event(context)
-        scope_key = self._scope_key(event, str(kwargs.get("scope_key", "") or ""))
+        scope_key = self._scope_key(event)
         adapted = self._adapted(event, scope_key)
         mode = str(kwargs.get("mode", "search") or "search").strip().lower()
         if mode not in {"search", "time", "hybrid", "episode", "aggregate"}:
             mode = "search"
         query = str(kwargs.get("query", "") or "").strip()
+        if not query:
+            return _tool_result({"success": False, "error": "query is required", "scope": scope_key})
         limit = _to_int(kwargs.get("limit", 5), 5, min_value=1, max_value=50)
         chat_id = str(kwargs.get("chat_id", "") or "").strip() or adapted.session_id
         person_id = str(kwargs.get("person_id", "") or "").strip()
         time_start = str(kwargs.get("time_start", "") or "").strip() or None
         time_end = str(kwargs.get("time_end", "") or "").strip() or None
-        respect_filter = bool(kwargs.get("respect_filter", True))
+        respect_filter = True
         source = self._source_for_event(event, scope_key) if respect_filter else None
         strict_source = bool(source)
         group_id = adapted.group_id
@@ -422,8 +421,6 @@ class MemorixIngestTextTool(MemorixToolBase):
                     "description": "结构化关系，可选。每项包含 subject/predicate/object/confidence。",
                     "items": {"type": "object"},
                 },
-                "respect_filter": {"type": "boolean", "description": "是否应用聊天过滤配置，默认 true。"},
-                "scope_key": {"type": "string", "description": "高级：显式指定 Memorix scope，通常留空。"},
             },
             "required": ["text"],
         }
@@ -431,12 +428,12 @@ class MemorixIngestTextTool(MemorixToolBase):
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
         event = self._event(context)
-        scope_key = self._scope_key(event, str(kwargs.get("scope_key", "") or ""))
+        scope_key = self._scope_key(event)
         adapted = self._adapted(event, scope_key)
         text = str(kwargs.get("text", "") or "").strip()
         if not text:
             return _tool_result({"success": False, "error": "text is empty", "scope": scope_key})
-        respect_filter = bool(kwargs.get("respect_filter", True))
+        respect_filter = True
         await self._upsert_current_sender(event, scope_key, respect_filter=respect_filter)
 
         timestamp = _to_float_or_none(kwargs.get("timestamp")) or float(adapted.timestamp or time.time())
@@ -490,8 +487,6 @@ class MemorixIngestSummaryTool(MemorixToolBase):
                 "participants": {"type": "array", "items": {"type": "string"}, "description": "参与者，可选。"},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "标签，可选。"},
                 "metadata": {"type": "object", "description": "附加元数据，可选。"},
-                "respect_filter": {"type": "boolean", "description": "是否应用聊天过滤配置，默认 true。"},
-                "scope_key": {"type": "string", "description": "高级：显式指定 Memorix scope，通常留空。"},
             },
             "required": ["text"],
         }
@@ -499,12 +494,12 @@ class MemorixIngestSummaryTool(MemorixToolBase):
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
         event = self._event(context)
-        scope_key = self._scope_key(event, str(kwargs.get("scope_key", "") or ""))
+        scope_key = self._scope_key(event)
         adapted = self._adapted(event, scope_key)
         text = str(kwargs.get("text", "") or "").strip()
         if not text:
             return _tool_result({"success": False, "error": "text is empty", "scope": scope_key})
-        respect_filter = bool(kwargs.get("respect_filter", True))
+        respect_filter = True
         await self._upsert_current_sender(event, scope_key, respect_filter=respect_filter)
 
         chat_id = str(kwargs.get("chat_id", "") or "").strip() or adapted.session_id
@@ -548,8 +543,6 @@ class MemorixPersonProfileTool(MemorixToolBase):
                 "person_keyword": {"type": "string", "description": "人物关键词/昵称；person_id 不确定时使用。"},
                 "chat_id": {"type": "string", "description": "聊天流/session_id；可选。"},
                 "limit": {"type": "integer", "description": "证据条数，默认 10。"},
-                "respect_filter": {"type": "boolean", "description": "是否应用聊天过滤配置，默认 true。"},
-                "scope_key": {"type": "string", "description": "高级：显式指定 Memorix scope，通常留空。"},
             },
             "required": [],
         }
@@ -557,7 +550,7 @@ class MemorixPersonProfileTool(MemorixToolBase):
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
         event = self._event(context)
-        scope_key = self._scope_key(event, str(kwargs.get("scope_key", "") or ""))
+        scope_key = self._scope_key(event)
         adapted = self._adapted(event, scope_key)
         person_id = str(kwargs.get("person_id", "") or "").strip()
         keyword = str(kwargs.get("person_keyword", "") or "").strip()
@@ -566,7 +559,7 @@ class MemorixPersonProfileTool(MemorixToolBase):
             keyword = adapted.sender_name or adapted.sender_id
         limit = _to_int(kwargs.get("limit", 10), 10, min_value=1, max_value=50)
         chat_id = str(kwargs.get("chat_id", "") or "").strip() or adapted.session_id
-        if bool(kwargs.get("respect_filter", True)) and not await self._is_chat_enabled(
+        if not await self._is_chat_enabled(
             event,
             scope_key,
             chat_id=chat_id,
@@ -607,14 +600,12 @@ class MemorixMaintainTool(MemorixToolBase):
             "properties": {
                 "action": {
                     "type": "string",
-                    "description": "动作：reinforce/protect/restore/freeze/status/recycle_bin。",
-                    "enum": ["reinforce", "protect", "restore", "freeze", "status", "recycle_bin"],
+                    "description": "动作：reinforce/protect/restore/freeze/status。回收站请使用 memory_v5_admin。",
+                    "enum": ["reinforce", "protect", "restore", "freeze", "status"],
                 },
                 "target": {"type": "string", "description": "目标 hash 或查询文本。"},
                 "hours": {"type": "number", "description": "protect 的保护时长；<=0 表示永久 pin。"},
                 "restore_type": {"type": "string", "description": "restore 类型：relation/entity。"},
-                "limit": {"type": "integer", "description": "recycle_bin 返回条数，默认 50。"},
-                "scope_key": {"type": "string", "description": "高级：显式指定 Memorix scope，通常留空。"},
             },
             "required": ["action"],
         }
@@ -622,7 +613,7 @@ class MemorixMaintainTool(MemorixToolBase):
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
         event = self._event(context)
-        scope_key = self._scope_key(event, str(kwargs.get("scope_key", "") or ""))
+        scope_key = self._scope_key(event)
         action = str(kwargs.get("action", "") or "").strip().lower()
         target = str(kwargs.get("target", "") or "").strip()
         try:
@@ -644,12 +635,6 @@ class MemorixMaintainTool(MemorixToolBase):
                 )
             elif action == "freeze":
                 data = await self.plugin.memory_service.freeze(scope_key=scope_key, query_or_hash=target)
-            elif action == "recycle_bin":
-                data = await self.plugin.admin_service.v5_admin(
-                    scope_key=scope_key,
-                    action="recycle_bin",
-                    limit=_to_int(kwargs.get("limit", 50), 50, min_value=1, max_value=500),
-                )
             else:
                 return _tool_result({"success": False, "error": f"unsupported action: {action}", "scope": scope_key})
             data["scope"] = scope_key
@@ -666,16 +651,14 @@ class MemorixStatsTool(MemorixToolBase):
     parameters: dict = Field(
         default_factory=lambda: {
             "type": "object",
-            "properties": {
-                "scope_key": {"type": "string", "description": "高级：显式指定 Memorix scope，通常留空。"},
-            },
+            "properties": {},
             "required": [],
         }
     )
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
         event = self._event(context)
-        scope_key = self._scope_key(event, str(kwargs.get("scope_key", "") or ""))
+        scope_key = self._scope_key(event)
         try:
             data = await self.plugin.query_service.stats(scope_key=scope_key)
             data["scope"] = scope_key
@@ -693,7 +676,6 @@ def _admin_parameters(actions: str) -> dict:
             "target": {"type": "string", "description": "目标标识、hash 或查询文本，可选。"},
             "query": {"type": "string", "description": "查询文本，可选。"},
             "limit": {"type": "integer", "description": "返回条数，默认按动作决定。"},
-            "scope_key": {"type": "string", "description": "高级：显式指定 Memorix scope，通常留空。"},
             "source": {"type": "string", "description": "来源批次/source，可选。"},
             "sources": {"type": "array", "items": {"type": "string"}, "description": "来源批次列表，可选。"},
             "node": {"type": "string", "description": "节点名，可选。"},
@@ -714,6 +696,7 @@ def _admin_parameters(actions: str) -> dict:
             "selector": {"type": "object", "description": "delete_admin 选择器对象。"},
             "restore_type": {"type": "string", "description": "恢复类型：relation/entity。"},
             "person_id": {"type": "string", "description": "人物 ID。"},
+            "aliases": {"type": "array", "items": {"type": "string"}, "description": "人工确认的完整人物别名集合。"},
             "person_keyword": {"type": "string", "description": "人物关键词。"},
             "keyword": {"type": "string", "description": "关键词。"},
             "override_text": {"type": "string", "description": "人物画像手工覆盖内容。"},
@@ -721,6 +704,9 @@ def _admin_parameters(actions: str) -> dict:
             "task_id": {"type": "string", "description": "导入任务 ID。"},
             "file_id": {"type": "string", "description": "导入任务文件 ID。"},
             "content": {"type": "string", "description": "粘贴导入文本。"},
+            "chat_log": {"type": "boolean", "description": "按时间和发送者消息边界切分聊天记录。"},
+            "narrative_window_size": {"type": "integer", "minimum": 200, "maximum": 100000},
+            "narrative_overlap": {"type": "integer", "minimum": 0},
             "alias": {"type": "string", "description": "导入扫描路径别名。"},
             "relative_path": {"type": "string", "description": "导入扫描相对路径。"},
             "include_chunks": {"type": "boolean", "description": "是否包含导入 chunks。"},
@@ -731,7 +717,7 @@ def _admin_parameters(actions: str) -> dict:
             "reason": {"type": "string", "description": "操作原因。"},
         },
         "required": ["action"],
-        "additionalProperties": True,
+        "additionalProperties": False,
     }
 
 
@@ -751,7 +737,8 @@ class MemorixAdminToolBase(MemorixToolBase):
         try:
             event = self._event(context)
             self._require_admin(event)
-            scope_key = self._scope_key(event, str(kwargs.pop("scope_key", "") or ""))
+            kwargs.pop("scope_key", None)
+            scope_key = self._scope_key(event)
             action = str(kwargs.pop("action", "") or "").strip().lower()
             if not action:
                 return _tool_result({"success": False, "error": "action is required", "scope": scope_key})
@@ -799,7 +786,7 @@ class MemorixEpisodeAdminTool(MemorixAdminToolBase):
     name: str = "memory_episode_admin"
     description: str = "Episode 管理接口；仅 AstrBot 管理员可用。"
     admin_method: str = "episode_admin"
-    parameters: dict = Field(default_factory=lambda: _admin_parameters("query/list/get/status/rebuild/process_pending"))
+    parameters: dict = Field(default_factory=lambda: _admin_parameters("query/list/get/status/rebuild/process_pending/process_sources"))
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
         return await self._call_admin(context, **kwargs)
@@ -810,7 +797,7 @@ class MemorixProfileAdminTool(MemorixAdminToolBase):
     name: str = "memory_profile_admin"
     description: str = "人物画像管理接口；仅 AstrBot 管理员可用。"
     admin_method: str = "profile_admin"
-    parameters: dict = Field(default_factory=lambda: _admin_parameters("query/list/status/set_override/delete_override"))
+    parameters: dict = Field(default_factory=lambda: _admin_parameters("query/list/status/set_override/delete_override/get_aliases/set_aliases/delete_aliases"))
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
         return await self._call_admin(context, **kwargs)
@@ -876,7 +863,7 @@ class MemorixDeleteAdminTool(MemorixAdminToolBase):
     name: str = "memory_delete_admin"
     description: str = "长期记忆删除管理接口；仅 AstrBot 管理员可用。"
     admin_method: str = "delete_admin"
-    parameters: dict = Field(default_factory=lambda: _admin_parameters("preview/execute/restore"))
+    parameters: dict = Field(default_factory=lambda: _admin_parameters("preview/execute/restore/list_operations/get_operation/purge"))
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
         return await self._call_admin(context, **kwargs)
@@ -891,7 +878,6 @@ class MemorixFuzzyModifyAdminTool(MemorixAdminToolBase):
         default_factory=lambda: {
             "type": "object",
             "properties": {
-                "scope_key": {"type": "string", "description": "作用域 key"},
                 "action": {
                     "type": "string",
                     "enum": ["preview", "execute", "get", "list", "rollback", "reconcile"],
@@ -908,10 +894,44 @@ class MemorixFuzzyModifyAdminTool(MemorixAdminToolBase):
                 "requested_by": {"type": "string"},
                 "reason": {"type": "string"},
             },
-            "required": ["scope_key", "action"],
-            "additionalProperties": True,
+            "required": ["action"],
+            "additionalProperties": False,
         }
     )
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
+        return await self._call_admin(context, **kwargs)
+
+
+@dataclass
+class MemorixFactAdminTool(MemorixAdminToolBase):
+    name: str = "memory_fact_admin"
+    description: str = "管理当前记忆作用域内的结构化事实，支持显式修正、撤回和恢复；仅 AstrBot 管理员可用。"
+    admin_method: str = "fact_admin"
+    parameters: dict = Field(default_factory=lambda: {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["get", "list", "create", "update", "retract", "restore"]},
+            "claim_id": {"type": "string", "description": "get/update/retract/restore 必填。"},
+            "scope_type": {"type": "string", "enum": ["person", "chat"]},
+            "scope_id": {"type": "string", "description": "当前记忆库内的人物或聊天 ID；list/create 必填。"},
+            "fact_key": {"type": "string"},
+            "value_text": {"type": "string"},
+            "polarity": {"type": "string", "enum": ["positive", "negative"]},
+            "cardinality": {"type": "string", "enum": ["single", "set"]},
+            "stability": {"type": "string", "enum": ["stable", "temporal", "uncertain"]},
+            "authority": {"type": "string", "enum": ["manual", "direct_user", "imported", "summary_derived"]},
+            "profile_section": {"type": "string", "enum": ["identity_settings", "relationship_settings", "stable_facts", "interaction_preferences", "recent_interactions", "uncertain_notes"]},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "valid_from": {"type": ["number", "null"]},
+            "valid_to": {"type": ["number", "null"]},
+            "statuses": {"type": "array", "items": {"type": "string", "enum": ["active", "conflicted", "superseded", "retracted"]}},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+            "reason": {"type": "string"},
+        },
+        "required": ["action"],
+        "additionalProperties": False,
+    })
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
         return await self._call_admin(context, **kwargs)
@@ -929,6 +949,7 @@ def build_memorix_tools(plugin: Any) -> list[FunctionTool[AstrAgentContext]]:
         MemorixSourceAdminTool(plugin=plugin),
         MemorixEpisodeAdminTool(plugin=plugin),
         MemorixProfileAdminTool(plugin=plugin),
+        MemorixFactAdminTool(plugin=plugin),
         MemorixRuntimeAdminTool(plugin=plugin),
         MemorixImportAdminTool(plugin=plugin),
         MemorixTuningAdminTool(plugin=plugin),

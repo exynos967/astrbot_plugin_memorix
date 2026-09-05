@@ -65,7 +65,10 @@ class AstrbotEventAdapter:
         group_name = AstrbotEventAdapter._group_name_from_event(message_obj)
         message_id = str(getattr(message_obj, "message_id", "") or "")
         message_text = str(getattr(event, "message_str", "") or "").strip()
-        timestamp = int(getattr(message_obj, "timestamp", 0) or 0)
+        try:
+            timestamp = int(getattr(message_obj, "timestamp", 0) or 0)
+        except (TypeError, ValueError):
+            timestamp = 0
         return MemorixEvent(
             scope_key=scope_key,
             platform=platform,

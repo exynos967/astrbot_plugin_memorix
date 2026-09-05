@@ -1260,34 +1260,10 @@ class FeedbackService:
         if metadata_store is None or episode_service is None:
             return {"processed": 0, "rebuilt": 0, "failed": 0, "items": [], "failures": []}
 
-        rows = metadata_store.fetch_episode_source_rebuild_batch(
+        return await episode_service.process_rebuild_batch(
             limit=max(1, int(limit or 1)),
             max_retry=max(1, int(ctx.get_config("episode.pending_max_retry", 3) or 3)),
         )
-        items: List[Dict[str, Any]] = []
-        failures: List[Dict[str, Any]] = []
-        for row in rows:
-            source = str(row.get("source", "") or "").strip()
-            requested_at = row.get("requested_at")
-            if not source:
-                continue
-            if not metadata_store.mark_episode_source_running(source, requested_at=requested_at):
-                continue
-            try:
-                result = await episode_service.rebuild_source(source)
-                metadata_store.mark_episode_source_done(source, requested_at=requested_at)
-                items.append(result if isinstance(result, dict) else {"source": source})
-            except Exception as exc:
-                error = str(exc)[:500]
-                metadata_store.mark_episode_source_failed(source, error, requested_at=requested_at)
-                failures.append({"source": source, "error": error})
-        return {
-            "processed": len(items) + len(failures),
-            "rebuilt": len(items),
-            "failed": len(failures),
-            "items": items,
-            "failures": failures,
-        }
 
     # ------------------------------------------------------------------ #
     # 回滚

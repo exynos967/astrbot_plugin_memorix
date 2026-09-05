@@ -63,7 +63,7 @@ export const useDashboardStore = defineStore("dashboard", () => {
 
   async function loadRuntime(force = false): Promise<RuntimeReport | null> {
     try {
-      const data = await fetchRuntimeSelfCheck(force);
+      const data = await fetchRuntimeSelfCheck(force, graph.effectiveScope());
       runtime.value = data;
       logs.log(`运行时自检：${data.ok ? "通过" : "失败"}`, data.ok ? "info" : "warn");
       return data;
@@ -75,7 +75,7 @@ export const useDashboardStore = defineStore("dashboard", () => {
 
   async function loadConfig(): Promise<ConfigPayload | null> {
     try {
-      const data = await fetchConfig();
+      const data = await fetchConfig(graph.effectiveScope());
       config.value = data;
       return data;
     } catch (err) {

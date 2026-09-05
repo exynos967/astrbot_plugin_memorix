@@ -7,14 +7,18 @@ features return an explicit payload instead of silently creating fake behavior.
 
 from __future__ import annotations
 
+import time
 from typing import Any, Dict, Iterable, Optional
 
 from ..amemorix.services import DeleteService, PersonProfileApiService
 from ..amemorix.services import MemoryService as BaseMemoryService
 from ..amemorix.services.import_task_manager import ImportTaskManager
+from ..amemorix.settings import mask_sensitive
 from ..app_context import ScopeRuntimeManager
 from ..core.utils.retrieval_tuning_manager import RetrievalTuningManager
 from ..core.utils.runtime_self_check import ensure_runtime_self_check
+from .fact_admin_service import FactAdminService
+from .graph_mutation_service import GraphMutationService
 
 
 class _TuningPluginAdapter:
@@ -118,27 +122,8 @@ class AdminService:
                 str(kwargs.get("target") or kwargs.get("object") or ""),
                 kwargs,
             )
-        if act == "create_node":
-            name = str(kwargs.get("name") or kwargs.get("node") or kwargs.get("node_id") or "").strip()
-            if not name:
-                return self._err("node name 不能为空")
-            added = ctx.graph_store.add_nodes([name])
-            entity_hash = ctx.metadata_store.add_entity(name=name, metadata=kwargs.get("metadata") or {})
-            await ctx.save_all()
-            return {"success": True, "added_count": added, "node": {"name": name, "hash": entity_hash}}
-        if act == "delete_node":
-            name = str(kwargs.get("name") or kwargs.get("node") or kwargs.get("node_id") or kwargs.get("target") or "").strip()
-            if not name:
-                return self._err("node name 不能为空")
-            return await DeleteService(ctx).entity(name)
-        if act == "rename_node":
-            return await self._rename_node(ctx, kwargs)
-        if act == "create_edge":
-            return await self._create_edge(ctx, kwargs)
-        if act == "delete_edge":
-            return await self._delete_edge(ctx, kwargs)
-        if act == "update_edge_weight":
-            return self._update_edge_weight(ctx, kwargs)
+        if act in {"create_node", "delete_node", "rename_node", "create_edge", "delete_edge", "update_edge_weight"}:
+            return await GraphMutationService(ctx).execute(act, **kwargs)
         return self._unsupported("graph", act)
 
     async def source_admin(self, *, scope_key: str, action: str, **kwargs) -> Dict[str, Any]:
@@ -213,15 +198,39 @@ class AdminService:
                 except Exception as exc:
                     failures.append({"source": src, "error": str(exc)})
             return {"success": not failures, "items": results, "failures": failures, "count": len(results)}
-        if act == "process_pending":
+        if act in {"process_pending", "process_sources"}:
             return {"success": True, **await self._process_episode_pending(ctx, kwargs)}
         return self._unsupported("episode", act)
+
+    async def fact_admin(self, *, scope_key: str, action: str, **kwargs) -> Dict[str, Any]:
+        runtime = await self.runtime_manager.get_runtime(scope_key)
+        return await FactAdminService(runtime.context).memory_fact_admin(action=action, **kwargs)
 
     async def profile_admin(self, *, scope_key: str, action: str, **kwargs) -> Dict[str, Any]:
         runtime = await self.runtime_manager.get_runtime(scope_key)
         ctx = runtime.context
         service = PersonProfileApiService(ctx)
         act = self._action(action)
+        if act in {"get_aliases", "set_aliases", "delete_aliases"}:
+            person_id = str(kwargs.get("person_id", "") or "").strip()
+            if not person_id:
+                return self._err("person_id 不能为空")
+            try:
+                with ctx.metadata_store.transaction(immediate=True) as conn:
+                    if act == "set_aliases":
+                        ctx.metadata_store.set_person_profile_alias_override(
+                            person_id=person_id, aliases=kwargs.get("aliases"),
+                            updated_by="astrbot_admin", source="astrbot", conn=conn,
+                        )
+                    elif act == "delete_aliases":
+                        ctx.metadata_store.delete_person_profile_alias_override(person_id, conn=conn)
+                    if act != "get_aliases":
+                        ctx.metadata_store.enqueue_person_profile_refresh(
+                            person_id=person_id, reason="aliases_changed", conn=conn,
+                        )
+                return {"success": True, **ctx.person_profile_service.get_person_alias_details(person_id)}
+            except (TypeError, ValueError) as error:
+                return self._err(str(error))
         if act == "query":
             return await service.query(
                 person_id=str(kwargs.get("person_id", "") or ""),
@@ -257,9 +266,10 @@ class AdminService:
             await ctx.save_all()
             return {"success": True, "saved": True, "data_dir": str(ctx.data_dir)}
         if act == "get_config":
+            raw_config = ctx.config if isinstance(ctx.config, dict) else {}
             return {
                 "success": True,
-                "config": ctx.config,
+                "config": mask_sensitive(raw_config),
                 "data_dir": str(ctx.data_dir),
                 "auto_save": bool(ctx.get_config("advanced.enable_auto_save", True)),
                 "runtime_ready": True,
@@ -461,11 +471,38 @@ class AdminService:
         if act == "execute":
             return await self._delete_execute(ctx, mode, selector)
         if act == "restore":
+            operation_id = str(kwargs.get("operation_id") or selector.get("operation_id") or "").strip()
+            if operation_id:
+                return await DeleteService(ctx).restore(operation_id)
             target = str(selector.get("hash") or selector.get("target") or selector.get("query") or "").strip()
             restore_type = str(selector.get("restore_type") or selector.get("type") or mode or "relation")
             return await BaseMemoryService(ctx).restore(hash_value=target, restore_type=restore_type)
-        if act in {"list_operations", "get_operation", "purge"}:
-            return self._err(f"当前 AstrBot 内嵌运行时暂不支持 delete action: {act}")
+        if act == "list_operations":
+            items = ctx.metadata_store.list_delete_operations(
+                limit=self._int(kwargs.get("limit"), 50, 1, 200),
+                mode=str(kwargs.get("mode") or selector.get("mode") or ""),
+            )
+            return {"success": True, "items": items, "count": len(items)}
+        if act == "get_operation":
+            operation_id = str(
+                kwargs.get("operation_id") or selector.get("operation_id") or selector.get("target") or ""
+            ).strip()
+            operation = ctx.metadata_store.get_delete_operation(operation_id)
+            if operation is None:
+                return self._err("delete operation 不存在")
+            return {"success": True, "operation": operation}
+        if act == "purge":
+            hours = self._float_or_none(kwargs.get("older_than_hours")) or 24.0
+            cutoff = time.time() - max(0.0, float(hours)) * 3600.0
+            from .memory_projection_service import MemoryProjectionService
+
+            async with ctx.graph_mutation_lock:
+                purged = ctx.metadata_store.purge_memory_operations(
+                    cutoff, limit=self._int(kwargs.get("limit"), 1000, 1, 10000),
+                )
+                projection = await MemoryProjectionService(ctx).reconcile_locked()
+            return {"success": True, "purged": purged, "count": len(purged), "cutoff_time": cutoff, "projection": projection}
+
         return self._unsupported("delete", act)
 
     async def _import_manager(self, scope_key: str, ctx: Any) -> ImportTaskManager:
@@ -542,87 +579,14 @@ class AdminService:
             "paragraphs": paragraphs[: self._int(kwargs.get("paragraph_limit"), 20, 1, 200)],
         }
 
-    async def _rename_node(self, ctx: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        old_name = str(kwargs.get("old_name") or kwargs.get("name") or kwargs.get("node") or "").strip()
-        new_name = str(kwargs.get("new_name") or kwargs.get("target_name") or "").strip()
-        if not old_name or not new_name:
-            return self._err("old_name/new_name 不能为空")
-        if not ctx.graph_store.has_node(old_name):
-            return self._err(f"node 不存在: {old_name}")
-        out_neighbors = ctx.graph_store.get_neighbors(old_name)
-        in_neighbors = ctx.graph_store.get_in_neighbors(old_name)
-        ctx.graph_store.add_nodes([new_name])
-        for neighbor in out_neighbors:
-            weight = ctx.graph_store.get_edge_weight(old_name, neighbor)
-            if weight > 0:
-                ctx.graph_store.add_edges([(new_name, neighbor)], weights=[weight])
-        for neighbor in in_neighbors:
-            weight = ctx.graph_store.get_edge_weight(neighbor, old_name)
-            if weight > 0:
-                ctx.graph_store.add_edges([(neighbor, new_name)], weights=[weight])
-        deleted = ctx.graph_store.delete_nodes([old_name])
-        ctx.metadata_store.add_entity(name=new_name)
-        await ctx.save_all()
-        return {"success": True, "old_name": old_name, "new_name": new_name, "deleted_old_nodes": deleted}
 
-    async def _create_edge(self, ctx: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        subject = str(kwargs.get("subject") or kwargs.get("source") or "").strip()
-        predicate = str(kwargs.get("predicate") or kwargs.get("label") or "关联").strip()
-        obj = str(kwargs.get("object") or kwargs.get("target") or "").strip()
-        if not subject or not obj:
-            return self._err("subject/object 不能为空")
-        confidence = float(kwargs.get("confidence", kwargs.get("weight", 1.0)) or 1.0)
-        relation_hash = ctx.metadata_store.add_relation(
-            subject=subject,
-            predicate=predicate,
-            obj=obj,
-            confidence=confidence,
-            source_paragraph=kwargs.get("source_paragraph"),
-            metadata=kwargs.get("metadata") or {},
-        )
-        ctx.graph_store.add_edges([(subject, obj)], weights=[confidence], relation_hashes=[relation_hash])
-        await ctx.save_all()
-        return {"success": True, "edge": {"hash": relation_hash, "subject": subject, "predicate": predicate, "object": obj, "weight": confidence}}
 
-    async def _delete_edge(self, ctx: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        relation_hash = str(kwargs.get("hash") or kwargs.get("relation_hash") or "").strip()
-        if relation_hash:
-            return await DeleteService(ctx).relation(relation_hash)
-        subject = str(kwargs.get("subject") or kwargs.get("source") or "").strip()
-        obj = str(kwargs.get("object") or kwargs.get("target") or "").strip()
-        if not subject or not obj:
-            return self._err("subject/object 不能为空")
-        rels = ctx.metadata_store.get_relations(subject=subject, object=obj)
-        deleted = []
-        for rel in rels:
-            rel_hash = str(rel.get("hash", "") or "")
-            if rel_hash:
-                deleted.append(await DeleteService(ctx).relation(rel_hash))
-        return {"success": True, "deleted": len(deleted), "items": deleted}
 
-    def _update_edge_weight(self, ctx: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        source = str(kwargs.get("subject") or kwargs.get("source") or "").strip()
-        target = str(kwargs.get("object") or kwargs.get("target") or "").strip()
-        if not source or not target:
-            return self._err("source/target 不能为空")
-        weight = float(kwargs.get("weight", kwargs.get("confidence", 1.0)) or 1.0)
-        current = ctx.graph_store.get_edge_weight(source, target)
-        new_weight = ctx.graph_store.update_edge_weight(source, target, weight - current)
-        ctx.graph_store.save()
-        return {"success": True, "source": source, "target": target, "new_weight": new_weight}
 
     async def _delete_sources(self, ctx: Any, sources: Iterable[str]) -> Dict[str, Any]:
-        deleted = 0
-        errors = []
-        service = DeleteService(ctx)
-        for source in sources:
-            for para in ctx.metadata_store.get_paragraphs_by_source(str(source)):
-                try:
-                    await service.paragraph(str(para.get("hash") or ""))
-                    deleted += 1
-                except Exception as exc:
-                    errors.append({"source": source, "paragraph_hash": para.get("hash"), "error": str(exc)})
-        return {"success": not errors, "deleted_count": deleted, "errors": errors}
+        result = await DeleteService(ctx).source(list(sources))
+        return {**result, "deleted_count": result["deleted"]["paragraph"], "errors": []}
+
 
     async def _process_episode_pending(self, ctx: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
         limit = self._int(kwargs.get("limit"), 20, 1, 200)
@@ -667,12 +631,19 @@ class AdminService:
         return {"success": True, "count": changed, "hashes": hashes}
 
     def _delete_preview(self, ctx: Any, mode: str, selector: Dict[str, Any]) -> Dict[str, Any]:
-        if mode == "source":
-            sources = self._tokens(selector.get("sources")) or [str(selector.get("source", "") or "")]
-            count = sum(len(ctx.metadata_store.get_paragraphs_by_source(src)) for src in sources if src)
-            return {"success": True, "mode": mode, "paragraph_count": count, "sources": sources}
+        service = DeleteService(ctx)
         query = str(selector.get("query") or selector.get("target") or selector.get("hash") or "").strip()
-        return {"success": True, "mode": mode, "selector": selector, "target": query, "dry_run": True}
+        if mode == "source":
+            selectors = self._tokens(selector.get("sources")) or [str(selector.get("source", "") or "")]
+        elif mode == "paragraph":
+            selectors = [service.resolve_paragraph(query)]
+        elif mode == "relation":
+            selectors = [service.resolve_relation(query)]
+        elif mode == "entity":
+            selectors = [str(selector.get("entity_name") or selector.get("name") or query)]
+        else:
+            selectors = []
+        return {"success": True, "dry_run": True, **ctx.metadata_store.preview_memory_delete(mode, selectors)}
 
     async def _delete_execute(self, ctx: Any, mode: str, selector: Dict[str, Any]) -> Dict[str, Any]:
         service = DeleteService(ctx)

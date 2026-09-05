@@ -29,13 +29,13 @@ from .memorix.webui.plugin_page_bridge import PluginPageWebUIBridge
 if TYPE_CHECKING:
     from astrbot.api.provider import LLMResponse, ProviderRequest
 
-PLUGIN_VERSION = "0.9.5"
+PLUGIN_VERSION = "1.3.0"
 
 
 @register(
     "astrbot_plugin_memorix",
     "薄暝",
-    "A_Memorix memory plugin with embedded WebUI",
+    "让 AstrBot 拥有可检索、可维护、可追溯的长期记忆",
     PLUGIN_VERSION,
 )
 class MemorixPlugin(Star):
@@ -84,11 +84,8 @@ class MemorixPlugin(Star):
             self.context.add_llm_tools(*self._llm_tools)
             await self.person_fact_writeback_service.start()
             await self.feedback_service.start_background_loops()
-        except Exception:
-            self._remove_llm_tools()
-            await self._close_component("feedback service", self.feedback_service.stop_background_loops)
-            await self._close_component("person fact writeback", self.person_fact_writeback_service.close)
-            await self._close_component("webui", self.webui_page_bridge.close)
+        except BaseException:
+            await self.terminate()
             raise
         logger.info("[memorix] initialize done")
 
@@ -102,6 +99,7 @@ class MemorixPlugin(Star):
             except asyncio.TimeoutError:
                 for task in pending:
                     task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
         await self._close_component("person fact writeback", self.person_fact_writeback_service.close)
         await self._close_component("webui", self.webui_page_bridge.close)
         await self._close_component("feedback service", self.feedback_service.stop_background_loops)
@@ -131,13 +129,9 @@ class MemorixPlugin(Star):
             logger.warning("[memorix] get LLM tool manager failed during cleanup", exc_info=True)
             return
 
-        remove_func = getattr(tool_manager, "remove_func", None)
-        if not callable(remove_func):
-            logger.warning("[memorix] LLM tool manager does not provide remove_func")
-            return
         for tool in tools:
             try:
-                remove_func(tool.name)
+                tool_manager.remove_func(tool.name)
             except Exception:
                 logger.warning("[memorix] remove LLM tool failed: %s", tool.name, exc_info=True)
 
@@ -155,7 +149,7 @@ class MemorixPlugin(Star):
         return task
 
     def _resolve_dashboard_webui_scope(self) -> str:
-        known_scopes = self.runtime_manager.get_known_scopes()
+        known_scopes = self.runtime_manager.list_scope_keys()
         return str(known_scopes[-1]) if known_scopes else "default"
 
     @staticmethod
@@ -207,7 +201,7 @@ class MemorixPlugin(Star):
             runtime = await self.runtime_manager.get_runtime(adapted.scope_key)
             checker = getattr(runtime.context, "is_chat_enabled", None)
             if not callable(checker):
-                return True
+                return False
             return bool(
                 checker(
                     stream_id=adapted.session_id,
@@ -217,7 +211,7 @@ class MemorixPlugin(Star):
             )
         except Exception:
             logger.warning("[memorix] chat filter check failed: scope=%s", adapted.scope_key, exc_info=True)
-            return True
+            return False
 
     async def feedback_service_enabled(self, scope_key: str) -> bool:
         try:

@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 
 from ...core.storage import KnowledgeType, detect_knowledge_type
 from ...core.utils.time_parser import normalize_time_meta
+from ...core.utils.import_payloads import _normalize_person_ids, normalize_paragraph_import_item
 
 from ..common.logging import get_logger
 from ..context import AppContext
@@ -57,6 +58,7 @@ class ImportService:
                     source=str(payload.get("source", options.get("source", "v1_import"))),
                     knowledge_type=str(payload.get("knowledge_type", "")),
                     time_meta=payload.get("time_meta"),
+                    person_ids=payload.get("person_ids"),
                 )
             return await self.import_paragraph(content=str(payload or ""), source=str(options.get("source", "v1_import")))
         if mode == "relation":
@@ -94,6 +96,7 @@ class ImportService:
         source: str = "v1_import",
         knowledge_type: str = "",
         time_meta: Optional[Dict[str, Any]] = None,
+        person_ids: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         text = str(content or "").strip()
         if not text:
@@ -104,12 +107,21 @@ class ImportService:
         else:
             resolved_kt = detect_knowledge_type(text).value
 
+        normalized_people = _normalize_person_ids(person_ids)
         hash_value = self.ctx.metadata_store.add_paragraph(
             content=text,
             source=source,
             knowledge_type=resolved_kt if resolved_kt else KnowledgeType.MIXED.value,
             time_meta=normalize_time_meta(time_meta or {}),
+            metadata={"person_ids": normalized_people},
         )
+        if normalized_people:
+            existing = self.ctx.metadata_store.get_paragraph(hash_value)
+            old_people = (existing.get("metadata") or {}).get("person_ids", [])
+            merged_people = list(dict.fromkeys([*_normalize_person_ids(old_people), *normalized_people]))
+            self.ctx.metadata_store.update_paragraph_metadata(hash_value, {"person_ids": merged_people})
+        for person_id in normalized_people:
+            self.ctx.metadata_store.enqueue_person_profile_refresh(person_id=person_id, reason="import_person_evidence")
         vector_result = await self._ensure_paragraph_vector(hash_value, text)
         payload = {
             "mode": "paragraph",
@@ -188,23 +200,12 @@ class ImportService:
         hashes: List[str] = []
 
         for item in data.get("paragraphs", []) if isinstance(data, dict) else []:
-            if isinstance(item, str):
-                result = await self.import_paragraph(content=item, source="v1_json")
-            else:
-                result = await self.import_paragraph(
-                    content=str(item.get("content", "")),
-                    source=str(item.get("source", "v1_json")),
-                    knowledge_type=str(item.get("knowledge_type", "")),
-                    time_meta=item.get("time_meta")
-                    or {
-                        "event_time": item.get("event_time"),
-                        "event_time_start": item.get("event_time_start"),
-                        "event_time_end": item.get("event_time_end"),
-                        "time_range": item.get("time_range"),
-                        "time_granularity": item.get("time_granularity"),
-                        "time_confidence": item.get("time_confidence"),
-                    },
-                )
+            paragraph = normalize_paragraph_import_item(item, default_source="v1_json")
+            result = await self.import_paragraph(
+                content=paragraph["content"], source=paragraph["source"],
+                knowledge_type=paragraph["knowledge_type"], time_meta=paragraph["time_meta"],
+                person_ids=paragraph["person_ids"],
+            )
             paragraph_count += 1
             hashes.append(str(result["hash"]))
 

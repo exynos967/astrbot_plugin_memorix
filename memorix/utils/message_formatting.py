@@ -306,7 +306,7 @@ class AstrBotMessageFormatter:
             return ""
         if self._captioned_images >= max(0, int(self.options.image_caption_max_count)):
             return ""
-        provider = self._resolve_caption_provider()
+        provider = await self._resolve_caption_provider()
         if provider is None:
             return ""
         try:
@@ -325,7 +325,7 @@ class AstrBotMessageFormatter:
             logger.debug("[memorix] image caption provider call failed", exc_info=True)
             return ""
 
-    def _resolve_caption_provider(self) -> Optional[Provider]:
+    async def _resolve_caption_provider(self) -> Optional[Provider]:
         if self.context is None:
             return None
         provider = None
@@ -334,7 +334,8 @@ class AstrBotMessageFormatter:
             if provider_id:
                 provider = self.context.get_provider_by_id(provider_id)
             if provider is None:
-                provider = self.context.get_using_provider(getattr(self.event, "unified_msg_origin", None))
+                current_id = await self.context.get_current_chat_provider_id(self.event.unified_msg_origin)
+                provider = self.context.get_provider_by_id(current_id)
         except Exception:
             return None
         return provider if isinstance(provider, Provider) else None
@@ -437,7 +438,7 @@ async def copy_images_to_safe_dir(event: Any) -> list[str]:
     return safe_paths
 
 
-def resolve_vision_provider(context: Any, config: dict[str, Any], event: Any) -> Provider | None:
+async def resolve_vision_provider(context: Any, config: dict[str, Any], event: Any) -> Provider | None:
     """Resolve the vision-capable provider from config/context."""
     if context is None:
         return None
@@ -449,7 +450,8 @@ def resolve_vision_provider(context: Any, config: dict[str, Any], event: Any) ->
         if provider_id:
             provider = context.get_provider_by_id(provider_id)
         if provider is None:
-            provider = context.get_using_provider(getattr(event, "unified_msg_origin", None))
+            current_id = await context.get_current_chat_provider_id(event.unified_msg_origin)
+            provider = context.get_provider_by_id(current_id)
     except Exception:
         return None
     return provider if isinstance(provider, Provider) else None
@@ -478,7 +480,7 @@ async def enrich_text_with_captions(
         for p in safe_paths:
             _remove_quiet(p)
         return text
-    provider = resolve_vision_provider(context, config, event)
+    provider = await resolve_vision_provider(context, config, event)
     if provider is None:
         for p in safe_paths:
             _remove_quiet(p)

@@ -391,6 +391,17 @@ class EmbeddingAPIAdapter:
     def is_model_loaded(self) -> bool:
         return True
 
+    async def close(self) -> None:
+        client = self._client
+        self._client = None
+        if client is None:
+            return
+        closer = getattr(client, "close", None)
+        if callable(closer):
+            result = closer()
+            if asyncio.iscoroutine(result):
+                await result
+
     def __repr__(self) -> str:
         return (
             "EmbeddingAPIAdapter("

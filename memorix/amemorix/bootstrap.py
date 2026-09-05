@@ -14,6 +14,7 @@ from ..core.retrieval.dual_path import (
     DualPathRetrieverConfig,
     FusionConfig,
     RelationIntentConfig,
+    VectorPoolsConfig,
 )
 from ..core.retrieval.graph_relation_recall import GraphRelationRecallConfig
 from ..core.retrieval.posterior_graph import PosteriorGraphConfig
@@ -242,6 +243,12 @@ def build_context(settings: AppSettings) -> AppContext:
     relation_intent_raw = search_raw.get("relation_intent", {}) if isinstance(search_raw, dict) else {}
     graph_recall_raw = search_raw.get("graph_recall", {}) if isinstance(search_raw, dict) else {}
     posterior_graph_raw = search_raw.get("posterior_graph", {}) if isinstance(search_raw, dict) else {}
+    vector_pools_for_retriever = (
+        dict(vector_pools_cfg) if isinstance(vector_pools_cfg, dict) else {}
+    )
+    if not dual_vector_pools_ready:
+        vector_pools_for_retriever["mode"] = "single"
+
     retriever_config = DualPathRetrieverConfig(
         top_k_paragraphs=_safe_int(settings.get("retrieval.top_k_paragraphs", 20), 20),
         top_k_relations=_safe_int(settings.get("retrieval.top_k_relations", 10), 10),
@@ -264,6 +271,7 @@ def build_context(settings: AppSettings) -> AppContext:
         posterior_graph=PosteriorGraphConfig(
             **(posterior_graph_raw if isinstance(posterior_graph_raw, dict) else {})
         ),
+        vector_pools=VectorPoolsConfig(**vector_pools_for_retriever),
     )
 
     retriever = DualPathRetriever(
@@ -273,6 +281,8 @@ def build_context(settings: AppSettings) -> AppContext:
         embedding_manager=adapter,
         sparse_index=sparse_index,
         config=retriever_config,
+        paragraph_vector_store=paragraph_vector_store if dual_vector_pools_ready else vector_store,
+        graph_vector_store=graph_vector_store if dual_vector_pools_ready else vector_store,
     )
 
     threshold_filter = DynamicThresholdFilter(
@@ -290,12 +300,12 @@ def build_context(settings: AppSettings) -> AppContext:
     relation_write_service = RelationWriteService(
         metadata_store=metadata_store,
         graph_store=graph_store,
-        vector_store=vector_store,
+        vector_store=graph_vector_store if dual_vector_pools_ready else vector_store,
         embedding_manager=adapter,
     )
     paragraph_vector_service = ParagraphVectorWriteService(
         metadata_store=metadata_store,
-        vector_store=vector_store,
+        vector_store=paragraph_vector_store if dual_vector_pools_ready else vector_store,
         embedding_manager=adapter,
     )
 
@@ -325,6 +335,8 @@ def build_context(settings: AppSettings) -> AppContext:
         sparse_index=sparse_index,
         plugin_config=service_config,
         retriever=retriever,
+        paragraph_vector_store=paragraph_vector_store if dual_vector_pools_ready else None,
+        graph_vector_store=graph_vector_store if dual_vector_pools_ready else None,
     )
 
     ctx = AppContext(

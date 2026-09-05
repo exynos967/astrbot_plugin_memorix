@@ -50,6 +50,7 @@ async def generate_text(
     temperature: float = 0.2,
     max_tokens: int = 1200,
     request_type: str = "",
+    unified_msg_origin: str = "",
 ) -> LLMResult:
     """本土化主入口：解析客户端并执行一次文本生成，统一返回 LLMResult。"""
 
@@ -59,6 +60,7 @@ async def generate_text(
             str(prompt or ""),
             temperature=float(temperature),
             max_tokens=int(max_tokens),
+            unified_msg_origin=str(unified_msg_origin or ""),
         )
         text = str(text or "")
         if not text:

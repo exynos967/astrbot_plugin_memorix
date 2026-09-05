@@ -25,3 +25,15 @@ def test_list_scope_keys_hides_internal_cron_scope(tmp_path, monkeypatch):
     manager = ScopeRuntimeManager(plugin_name="astrbot_plugin_memorix", plugin_config={})
 
     assert manager.list_scope_keys() == ["aiocqhttp:group:123"]
+
+
+def test_scope_dir_collision_uses_hash_fallback(tmp_path, monkeypatch):
+    monkeypatch.setattr(app_context, "get_astrbot_data_path", lambda: str(tmp_path))
+    manager = ScopeRuntimeManager(plugin_name="astrbot_plugin_memorix", plugin_config={})
+
+    first = manager._scope_dir("aiocqhttp:group:foo:bar")
+    second = manager._scope_dir("aiocqhttp:group:foo_bar")
+
+    assert first != second
+    assert (first / ".scope.json").exists()
+    assert (second / ".scope.json").exists()

@@ -60,7 +60,8 @@ def test_connect_patches_legacy_episode_position_column(tmp_path):
     conn.close()
 
     store = MetadataStore(tmp_path)
-    store.connect()
+    # 此夹具只创建单个兼容模块的表，不代表完整的当前版本数据库。
+    store.connect(enforce_schema=False)
     try:
         columns = {row[1] for row in store._conn.execute("PRAGMA table_info(episode_paragraphs)").fetchall()}
         assert "position" in columns
@@ -209,7 +210,8 @@ def test_connect_patches_legacy_transcript_position_column(tmp_path):
     conn.close()
 
     store = MetadataStore(tmp_path)
-    store.connect()
+    # 此夹具只创建单个兼容模块的表，不代表完整的当前版本数据库。
+    store.connect(enforce_schema=False)
     try:
         columns = {row[1] for row in store._conn.execute("PRAGMA table_info(transcript_messages)").fetchall()}
         assert "position" in columns
@@ -298,7 +300,8 @@ def test_existing_version_db_still_gets_episode_position_patch(tmp_path):
     conn.close()
 
     store = MetadataStore(tmp_path)
-    store.connect()
+    # 此夹具只创建单个兼容模块的表，不代表完整的当前版本数据库。
+    store.connect(enforce_schema=False)
     try:
         columns = {row[1] for row in store._conn.execute("PRAGMA table_info(episode_paragraphs)").fetchall()}
         assert "position" in columns
@@ -415,7 +418,8 @@ def test_connect_patches_037_metadata_columns_and_summary_state(tmp_path):
     conn.close()
 
     store = MetadataStore(tmp_path)
-    store.connect()
+    # 此夹具只创建单个兼容模块的表，不代表完整的当前版本数据库。
+    store.connect(enforce_schema=False)
     try:
         transcript_session_columns = {
             row[1] for row in store._conn.execute("PRAGMA table_info(transcript_sessions)").fetchall()
@@ -484,8 +488,8 @@ _VNEXT_TABLES = (
 )
 
 
-def test_v8_schema_error_points_to_existing_migration_script(tmp_path):
-    """v8 旧库的报错应给出可直接执行的实际迁移脚本。"""
+def test_incomplete_v8_schema_is_rejected_without_changes(tmp_path):
+    """仅有版本号不足以识别旧库，不能盲目迁移。"""
 
     db_path = tmp_path / "metadata.db"
     conn = sqlite3.connect(db_path)
@@ -505,20 +509,16 @@ def test_v8_schema_error_points_to_existing_migration_script(tmp_path):
     finally:
         store.close()
 
-    repo_root = Path(__file__).resolve().parents[1]
-    script = repo_root / "scripts" / "migrate_schema_v8_to_v13.py"
     message = str(exc_info.value)
-
     assert "current=8" in message
     assert f"expected={SCHEMA_VERSION}" in message
-    assert script.is_file()
-    assert f'"{sys.executable}" "{script}" --db "{db_path}"' in message
-    assert "release_vnext_migrate.py" not in message
+    assert "无法识别旧库结构" in message
+    assert not (tmp_path / "backups").exists()
 
 
 @pytest.mark.skipif(SCHEMA_VERSION < 13, reason="vendored core 未升级到 2.0.0 (SCHEMA_VERSION>=13)")
 def test_v8_legacy_db_migrates_to_current_schema(tmp_path):
-    """模拟历史 v8 库，离线迁移后应出现全部 vNext 表且老数据保留。"""
+    """模拟历史 v8 库，首次打开自动迁移并保留数据和备份。"""
 
     db_path = tmp_path / "metadata.db"
     conn = sqlite3.connect(db_path)
@@ -568,15 +568,10 @@ def test_v8_legacy_db_migrates_to_current_schema(tmp_path):
     conn.close()
 
     store = MetadataStore(tmp_path)
-    # enforce_schema=False 走离线迁移路径，避免 v8 库在 _assert_schema_compatible 直接抛错。
-    store.connect(enforce_schema=False)
     try:
-        store._migrate_schema()
-        store.rebuild_relation_hash_aliases()
-        store.normalize_paragraph_knowledge_types()
-        store.set_schema_version(SCHEMA_VERSION)
-        if store._conn is not None:
-            store._conn.commit()
+        store.connect()
+        assert store.migration_report["from_version"] == 8
+        assert Path(store.migration_report["backup_path"]).is_file()
     finally:
         store.close()
 
@@ -683,9 +678,9 @@ def test_schema_migration_script_discovers_scope_dbs(tmp_path):
 
 
 def test_schema_13_db_runtime_auto_migrates_to_15(tmp_path):
-    """模拟上一版 schema=13 库，connect() 应自动迁移到当前 schema=15。"""
+    """模拟上一版 schema=13 库，connect() 应自动迁移到当前 schema=23。"""
 
-    assert SCHEMA_VERSION == 15
+    assert SCHEMA_VERSION == 23
     db_path = tmp_path / "metadata.db"
     conn = sqlite3.connect(db_path)
     conn.executescript(
@@ -742,7 +737,7 @@ def test_schema_13_db_runtime_auto_migrates_to_15(tmp_path):
     store = MetadataStore(tmp_path)
     store.connect()
     try:
-        assert store.get_schema_version() == 15
+        assert store.get_schema_version() == 23
         tables = {row[0] for row in store._conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         assert "memory_fuzzy_modify_plans" in tables
 

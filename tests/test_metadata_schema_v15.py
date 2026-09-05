@@ -6,9 +6,9 @@ from astrbot_plugin_memorix.memorix.core.storage.metadata_store import (
 )
 
 
-def test_schema_version_is_15() -> None:
-    """SCHEMA 15 升级后模块级版本号应为 15。"""
-    assert SCHEMA_VERSION == 15
+def test_schema_version_is_current() -> None:
+    """当前模块级版本号使用 AstrBot 原生 schema 23。"""
+    assert SCHEMA_VERSION == 23
 
 
 def test_fuzzy_modify_plans_table_and_indexes_exist(tmp_path) -> None:
@@ -104,5 +104,29 @@ def test_fuzzy_modify_plan_scope_filter(tmp_path) -> None:
         assert {item["plan_id"] for item in only_memory} == {"plan_scope_mem"}
         only_profile = store.list_fuzzy_modify_plans(scope="person_profile")
         assert {item["plan_id"] for item in only_profile} == {"plan_scope_profile"}
+    finally:
+        store.close()
+
+
+def test_schema_21_upstream_tables_and_plugin_pending_queue(tmp_path) -> None:
+    """新库应具备 schema 21 上游表，同时保留插件本地 pending 队列。"""
+    store = MetadataStore(tmp_path)
+    store.connect()
+    try:
+        tables = {
+            row[0] for row in store._conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        assert {"fact_claims", "fact_evidence", "fact_transitions", "storage_cleanup_jobs"} <= tables
+        assert "episode_pending_paragraphs" in tables
+        relation_columns = {
+            row[1] for row in store._conn.execute("PRAGMA table_info(relations)").fetchall()
+        }
+        assert {"retention_strength", "retention_anchor_at", "lifecycle_revision"} <= relation_columns
+        paragraph_columns = {
+            row[1] for row in store._conn.execute("PRAGMA table_info(paragraphs)").fetchall()
+        }
+        assert {"expires_at", "deletion_reason"} <= paragraph_columns
+        version = store._conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+        assert int(version) == 21
     finally:
         store.close()

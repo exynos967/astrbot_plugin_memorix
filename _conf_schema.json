@@ -225,6 +225,30 @@
             "hint": "dual 融合时图谱向量召回的权重。",
             "default": 0.15
           },
+          "score_calibration_method": {
+            "type": "string",
+            "description": "双池分数校准方法",
+            "hint": "none 保持原始加权；minmax / rank_percentile / weighted_rrf 等会在查询内校准各通道分数后再融合。",
+            "default": "none",
+            "options": [
+              "none",
+              "minmax",
+              "rank_percentile",
+              "robust_sigmoid",
+              "softmax",
+              "weighted_rrf",
+              "semantic_minmax",
+              "semantic_rrf",
+              "semantic_sparse_rrf",
+              "semantic_graph_rrf"
+            ]
+          },
+          "score_calibration_rrf_k": {
+            "type": "int",
+            "description": "RRF 校准常数",
+            "hint": "仅在 RRF 类校准方法下生效，值越大排名差异越平滑。",
+            "default": 60
+          },
           "relation_intent": {
             "type": "object",
             "description": "关系意图权重",
@@ -647,8 +671,8 @@
       },
       "max_registry_facts": {
         "type": "int",
-        "description": "每个用户最多保留多少条特征",
-        "hint": "用户画像中保留的特征条目上限。超出后最早的特征会被新的替换掉。",
+        "description": "画像待确认事实条目上限",
+        "hint": "限制画像中展示的待确认事实数量；完整事实与证据仍保留在账本中。",
         "default": 30
       },
       "max_evidence_chars": {
@@ -659,8 +683,8 @@
       },
       "update_registry_memory_points": {
         "type": "bool",
-        "description": "同时更新用户画像",
-        "hint": "开启后，提取出的个人信息会同步写入用户画像中，让画像更丰富。",
+        "description": "在画像中展示待确认事实",
+        "hint": "开启后，自动提取的信息以待确认事实进入画像。v1.2.0 起从事实账本投影，不再追加到旧 registry 字符串。",
         "default": true
       },
       "chat_provider_id": {
