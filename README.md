@@ -8,8 +8,8 @@
 
 图谱 + 向量混合检索 · 记忆生命周期管理 · 人物画像 · 总结导入 · 内嵌 WebUI
 
-[![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16-blue)](https://github.com/Soulter/AstrBot)
-[![Version](https://img.shields.io/badge/version-v1.1.1-green)]()
+[![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.26-blue)](https://github.com/Soulter/AstrBot)
+[![Version](https://img.shields.io/badge/version-v1.3.0-green)]()
 [![Platforms](https://img.shields.io/badge/platforms-QQ%20%7C%20Telegram%20%7C%20Discord-orange)]()
 
 </div>
@@ -51,7 +51,7 @@
 
 ### 人物事实写回
 
-机器人回复后，自动从用户发言中提取稳定的个人事实（如「我是学生」「我喜欢打篮球」），写入长期记忆和用户画像。支持队列化异步提取、每用户特征上限管理、独立 Provider 和温度参数配置。
+机器人回复后，自动从用户发言中提取个人事实候选（如「我是学生」「我喜欢打篮球」），写入长期记忆账本，并以「待确认事实线索」进入画像。管理员可确认、修正、撤回或恢复；自动写回不会恢复已被撤回的事实。支持队列化异步提取、每用户特征上限管理、独立 Provider 和温度参数配置。
 
 ### 总结导入
 
@@ -85,6 +85,22 @@ Dashboard 内嵌导入视图默认启用。页面可进行如下三种导入：
 - **默认启用**：`integration.fuzzy_modify.enabled=True`，与上游 A_memorix 对齐；如需关闭可显式设为 `False`。
 - **安全默认**：`auto_execute_enabled=False`（必须经过显式 confirmed 才会执行）、`confirm_threshold=0.85`、`allow_global_scope=False`（禁止跨作用域全局修改）。
 - **管理入口**：管理工具 `memory_fuzzy_modify_admin`（actions：`preview` / `execute` / `get` / `list` / `rollback` / `reconcile`），仅 AstrBot 管理员事件可调用；WebUI 路由 `POST /v1/fuzzy_modify`。
+
+### v1.3.0 升级说明
+
+- `memory_fact_admin` 提供 `get/list/create/update/retract/restore`，操作限定在当前事件的记忆库内，需 AstrBot 管理员权限。`create` 至少提供 `scope_type`（`person` 或 `chat`）、`scope_id`、`fact_key`、`value_text`；`update/retract/restore/get` 使用 `claim_id`。
+- 人物别名由 `memory_profile_admin` 的 `get_aliases/set_aliases/delete_aliases` 管理。`set_aliases` 使用 `person_id` 与完整 `aliases` 字符串数组；人工集合优先于登记信息推导的集合。
+- 聊天记录导入可传 `chat_log=true`、`narrative_window_size`（默认 1600）、`narrative_overlap`（默认 400）。不会切断单条消息；未识别到消息头时回退普通叙事切块并报告 warning。
+- JSON 段落可提供 `person_ids: ["aiocqhttp:用户ID"]`。同内容重导入会合并人物关联。
+- 旧人物事实段落会按原有明确人物 ID 回填成待确认事实，不推断人物身份或事实槽位。旧 `person_registry.memory_points` 原数据保留供管理查看，但不再直接作为自动注入内容。
+- 图谱重命名先提交 metadata 与审计，再更新图和向量。派生索引更新失败会保留待处理记录，在同一作用域下次启动或再次重命名时重试；错误仍未解决时不接受后续重命名。
+- 可识别的旧库（包括 v8、schema 9–22 和字段指纹匹配的无版本库）在首次打开时自动备份并迁移到原生 schema 23；失败整体回滚，未知结构及更高版本不会被自动改写。
+
+Dashboard 的 API 隧道提供 `POST /v1/facts`、`POST /v1/person/aliases`、`POST /v1/memory/delete-admin`，请求结构为 `{"action": "...", "payload": {...}}`。删除返回 `operation_id`，可恢复整次操作；`purge` 才会销毁过期快照。图和向量同步失败保留任务，后台按当前数据重试。
+
+新版使用 AstrBot 4.26 起的公开 Web API。Vue 源码新增事实/别名表单、删除操作恢复和 Plugin Pages 文件上传；**本次未执行前端构建，分发静态页面仍需在发布前重新生成**。上传任务临时文件保留 24 小时供重试，未完成导入不跨插件重启恢复。
+
+本版能力取舍、模块边界及验证限制见 [AstrBot 原生记忆设计](docs/architecture/astrbot-native-memory.md)；前一阶段记录见 [A_memorix v22 升级 review](docs/reviews/amemorix-v22.md)。
 
 #### 本插件基于 A_Dawn 的 A_Memorix 设计理念开发，并针对 AstrBot 做了完整适配。
 
@@ -137,7 +153,7 @@ https://github.com/exynos967/astrbot_plugin_memorix
 ## 使用方式
 
 - **日常记忆写入/召回**：请求前会自动注入当前聊天相关的长期记忆和人物画像；LLM 也可继续通过 `search_memory`、`get_person_profile` 等工具按需补查，通过 `ingest_summary`、`ingest_text`、`maintain_memory`、`memory_stats` 写入或维护记忆。
-- **管理员记忆维护**：已注册的管理工具 `memory_graph_admin`、`memory_source_admin`、`memory_episode_admin`、`memory_profile_admin`、`memory_runtime_admin`、`memory_import_admin`、`memory_tuning_admin`、`memory_v5_admin`、`memory_delete_admin`；这些工具仅 AstrBot 管理员事件可调用。
+- **管理员记忆维护**：已注册的管理工具 `memory_graph_admin`、`memory_source_admin`、`memory_episode_admin`、`memory_profile_admin`、`memory_fact_admin`、`memory_runtime_admin`、`memory_import_admin`、`memory_tuning_admin`、`memory_v5_admin`、`memory_delete_admin`；这些工具仅 AstrBot 管理员事件可调用。
 - **图谱、检索、导入、总结、回收站、画像覆盖等管理操作**：可在 AstrBot Dashboard 的插件详情页打开 `Memorix 控制台`，也可由管理员通过上述管理工具让 LLM 执行。
 - **作用域、检索、生命周期、人物画像、自动总结等策略**：在 AstrBot 插件配置页修改配置项。
 
@@ -169,26 +185,23 @@ data/plugin_data/astrbot_plugin_memorix/scopes/<scope_key>/
 
 ### 数据库 Schema 版本
 
-> **破坏性更新提醒**
->
-> 从 `main` 旧版升级到 feat2.0 / SCHEMA 21 时，旧版 `metadata.db` 为 `SCHEMA_VERSION=8`，新版本运行时不会直接打开 v8 库。请先停止插件，备份 `data/plugin_data/astrbot_plugin_memorix/`，并按下方步骤执行一次离线迁移脚本，自动扫描所有 scope 后再启动新版本。
+当前元数据版本为 **SCHEMA 23**。更新插件并重启后，每个 scope 的记忆库在首次打开时自动检查版本，迁移完成后才启动该库的后台任务，不需要先手工执行迁移命令。
 
-当前元数据 Schema 版本为 **SCHEMA 21**。相对 SCHEMA 15，本次对齐上游 A_memorix 的结构变更包括：
+- **已有旧库**：支持可识别的历史结构，包括 v8、schema 9–22 和字段指纹匹配的无版本数据库。逐列补齐缺失字段，保留段落、关系、事实和 AstrBot 本地数据。
+- **备份与回滚**：迁移前通过 SQLite Backup API 创建包含 WAL 已提交数据的完整快照，存放在该库相邻的 `metadata/backups/`。全部升级步骤与版本号在一个事务中提交；备份或校验失败则停止，迁移失败回滚，备份路径记录到日志。已有备份不自动删除。
+- **版本保护**：未知结构、当前版本但必需字段缺失、比插件支持版本更新的库会明确报错，不猜测结构、不自动降级。当前完整版本重复打开不会重复迁移或备份。
+- **全新安装**：直接创建 schema 23；空库无需保存迁移备份。
 
-- **新增 `fuzzy_modify_plans` 表**：存放模糊修正功能的修改计划与执行状态（preview / confirmed / executed / rolled_back），与模糊修正功能配套。
-- **`stale_relation` 表新增三列**：`source_type`、`source_id`、`source_operation_id`，用于精确标记关系条目的来源类型与具体来源操作 ID，便于追溯与回收。
+离线脚本仍可用于批量预检查或停机后的手动操作，并复用同一套自动迁移逻辑：
 
-升级路径：
+```bash
+uv run --no-project python scripts/migrate_schema_v8_to_v13.py --dry-run
+uv run --no-project python scripts/migrate_schema_v8_to_v13.py
+```
 
-- **从 `main` 旧版升级**：`main` 使用 `SCHEMA_VERSION=8`，feat2.0 运行时不会直接打开 v8 库。升级代码后、启动插件前，执行一次离线迁移脚本即可自动扫描所有 scope：
+脚本默认查找 `data/plugin_data/astrbot_plugin_memorix/scopes/*/metadata/metadata.db`。可用 `--plugin-data-dir` 指定插件数据目录，或用 `--db` 选择一个数据库；停止插件后可用 `--db <数据库> --restore <备份>` 恢复。脚本名称保留历史命名，目标始终是当前代码版本。数据库版本升级与下方的双向量池分流是两件独立的事。
 
-  ```bash
-  uv run --no-project python scripts/migrate_schema_v8_to_v13.py
-  ```
-
-  脚本默认查找 `data/plugin_data/astrbot_plugin_memorix/scopes/*/metadata/metadata.db`；如果数据目录不在默认位置，可加 `--plugin-data-dir /path/to/data/plugin_data/astrbot_plugin_memorix`。高级用户仍可用 `--db /path/to/metadata.db` 只迁移单个数据库。脚本文件名保留历史兼容，实际目标版本取当前代码的 `SCHEMA_VERSION`（本版为 21）。脚本会先备份原库，迁移后旧段落/关系数据保留。
-- **从已版本化的新库升级**：`schema_version >= 9 && < 21` 时，插件启动会自动迁移到 21。
-- **全新安装**：直接创建 SCHEMA 21 库。
+实现与验证边界见 [自动迁移说明](docs/architecture/database-migrations.md)。
 
 ### 双向量池架构（dual-pool）
 
@@ -243,9 +256,9 @@ SCHEMA 15 起支持双向量池模式，将 **段落向量** 与 **图谱向量*
 | `person_fact_writeback.queue_maxsize` | int | `256` | 待处理队列上限 |
 | `person_fact_writeback.min_user_text_chars` | int | `4` | 用户消息最少字符数才尝试提取 |
 | `person_fact_writeback.max_facts_per_turn` | int | `5` | 单轮最多写入事实数 |
-| `person_fact_writeback.max_registry_facts` | int | `30` | 每用户画像最多保留的特征条目数 |
+| `person_fact_writeback.max_registry_facts` | int | `30` | 画像最多展示的待确认事实条目数，账本不因此删除 |
 | `person_fact_writeback.max_evidence_chars` | int | `800` | 发给 LLM 分析的用户消息最大字符数 |
-| `person_fact_writeback.update_registry_memory_points` | bool | `true` | 同步把事实追加到人物画像 memory_points |
+| `person_fact_writeback.update_registry_memory_points` | bool | `true` | 在画像中展示待确认账本事实；保留旧键名兼容配置 |
 | `person_fact_writeback.chat_provider_id` | string | `""` | 事实提取专用 Provider ID，留空使用当前/默认 Provider |
 | `person_fact_writeback.temperature` | float | `0.1` | 事实提取 LLM 温度参数 |
 | `person_fact_writeback.max_tokens` | int | `800` | 事实提取最大输出 token 数 |
