@@ -6151,6 +6151,82 @@ class MetadataStore(MemoryOperationsMixin, EpisodeJobsMixin, MetadataFactMixin, 
             "failed": failed,
         }
 
+    def discard_migration_episode_rebuilds(self, *, dry_run: bool = True) -> Dict[str, Any]:
+        """清理旧 schema 迁移产生的 Episode 重建任务。
+
+        仅处理迁移专用 reason，保留用户主动触发的重建任务。默认 dry-run，
+        方便管理界面先展示影响范围再执行删除。
+        """
+
+        reasons = (
+            "schema_19_pending_migration",
+            "schema_19_source_discovery",
+            "schema_21_pending_copy",
+        )
+        placeholders = ",".join("?" for _ in reasons)
+        params = (*reasons,)
+        with self.transaction(immediate=not dry_run) as conn:
+            columns = table_columns(conn.cursor(), "episode_rebuild_sources")
+            lease_clause = ""
+            if {"lease_token", "lease_until"}.issubset(columns):
+                lease_clause = " AND (lease_token IS NULL OR lease_token = '' OR COALESCE(lease_until, 0) <= strftime('%s', 'now'))"
+            candidate_where = f"reason IN ({placeholders}) AND status != 'running'{lease_clause}"
+            rows = conn.execute(
+                f"""
+                SELECT status, COUNT(*) AS count
+                FROM episode_rebuild_sources
+                WHERE {candidate_where}
+                GROUP BY status
+                """,
+                params,
+            ).fetchall()
+            by_status = {str(row["status"] or ""): int(row["count"] or 0) for row in rows}
+            candidates = sum(by_status.values())
+            sample = [
+                str(row["source"] or "")
+                for row in conn.execute(
+                    f"""
+                    SELECT source
+                    FROM episode_rebuild_sources
+                    WHERE {candidate_where}
+                    ORDER BY requested_at ASC, source ASC
+                    LIMIT 10
+                    """,
+                    params,
+                ).fetchall()
+            ]
+            active_clause = "status = 'running'"
+            if {"lease_token", "lease_until"}.issubset(columns):
+                active_clause = (
+                    "(status = 'running' OR "
+                    "(lease_token IS NOT NULL AND lease_token != '' AND COALESCE(lease_until, 0) > strftime('%s', 'now')))"
+                )
+            active_skipped = int(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM episode_rebuild_sources WHERE reason IN ({placeholders}) AND {active_clause}",
+                    params,
+                ).fetchone()[0]
+            )
+            discarded = 0
+            if not dry_run and candidates:
+                discarded = int(
+                    conn.execute(
+                        f"""
+                        DELETE FROM episode_rebuild_sources
+                        WHERE {candidate_where}
+                        """,
+                        params,
+                    ).rowcount
+                )
+        return {
+            "dry_run": bool(dry_run),
+            "candidates": candidates,
+            "discarded": discarded,
+            "active_skipped": active_skipped,
+            "by_status": by_status,
+            "sample_sources": sample,
+        }
+
     def get_live_paragraphs_by_source(self, source: str, *, exclude_stale: bool = False) -> List[Dict[str, Any]]:
         """获取指定 source 下所有 live paragraphs。"""
         token = self._normalize_episode_source(source)
@@ -6220,22 +6296,54 @@ class MetadataStore(MemoryOperationsMixin, EpisodeJobsMixin, MetadataFactMixin, 
         return self._dedupe_episode_sources([row["source"] for row in cursor.fetchall()])
 
     def is_episode_source_query_blocked(self, source: str) -> bool:
-        """判断 source 是否处于重建中或失败状态。"""
-        token = self._normalize_episode_source(source)
-        if not token:
-            return False
+        """仅在尚无任何物化 Episode 时报告 source 阻塞。"""
+        return self.get_episode_source_query_blocked_flags([source]).get(source, False)
+
+    def get_episode_source_query_blocked_flags(self, sources: List[str]) -> Dict[str, bool]:
+        """批量判断 source 阻塞状态，避免来源列表页触发 N+1 查询。"""
+
+        normalized: Dict[str, str] = {}
+        for source in sources:
+            token = self._normalize_episode_source(source)
+            if token:
+                normalized[str(source)] = token
+        if not normalized:
+            return {str(source): False for source in sources}
+
+        tokens = sorted(set(normalized.values()))
+        placeholders = ",".join("?" for _ in tokens)
         cursor = self._conn.cursor()
+        columns = table_columns(cursor, "episode_rebuild_sources")
+        if {"desired_revision", "built_revision"}.issubset(columns):
+            state_clause = "COALESCE(built_revision, 0) < COALESCE(desired_revision, 0)"
+        else:
+            state_clause = "status IN ('pending', 'running', 'failed')"
         cursor.execute(
-            """
-            SELECT 1
+            f"""
+            SELECT source
             FROM episode_rebuild_sources
-            WHERE source = ?
-              AND status IN ('pending', 'running', 'failed')
-            LIMIT 1
+            WHERE source IN ({placeholders})
+              AND {state_clause}
             """,
-            (token,),
+            tuple(tokens),
         )
-        return cursor.fetchone() is not None
+        candidates = {str(row["source"] or "") for row in cursor.fetchall()}
+        if candidates:
+            cursor.execute(
+                f"""
+                SELECT DISTINCT TRIM(COALESCE(source, '')) AS source
+                FROM episodes
+                WHERE TRIM(COALESCE(source, '')) IN ({placeholders})
+                """,
+                tuple(candidates),
+            )
+            materialized = {str(row["source"] or "") for row in cursor.fetchall() if row["source"]}
+        else:
+            materialized = set()
+        return {
+            source: token in candidates and token not in materialized
+            for source, token in normalized.items()
+        }
 
     def replace_episodes_for_source(
         self,

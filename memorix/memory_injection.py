@@ -318,6 +318,7 @@ class MemoryInjectionController:
                 person_keyword=candidate.person_name or candidate.user_id,
                 top_k=4,
                 force_refresh=False,
+                context_text=str(getattr(event, "message_str", "") or ""),
             )
             for candidate in candidates
         ]
@@ -326,7 +327,15 @@ class MemoryInjectionController:
                 logger.debug("[memorix] profile query skipped: %s", result)
                 continue
             payload = cast(dict, result)
-            profile_text = build_profile_injection_text(self._profile_text_from_payload(payload))
+            uncertain_candidates = [
+                item.get("text", "")
+                for item in (payload.get("uncertain_candidates") or [])
+                if isinstance(item, dict) and item.get("text")
+            ]
+            profile_text = build_profile_injection_text(
+                self._profile_text_from_payload(payload),
+                uncertain_candidates=uncertain_candidates,
+            )
             if not profile_text:
                 continue
             display_name = str(

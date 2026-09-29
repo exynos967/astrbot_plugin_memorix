@@ -992,6 +992,53 @@ class MetadataFactMixin:
         )
         return [self._fact_claim_row(row) or {} for row in cursor.fetchall()]
 
+    def count_uncertain_person_fact_claims(self, person_id: str) -> int:
+        """统计当前有效的未确认人物事实，避免为计数加载全部账本记录。"""
+
+        token = _required_token("person_id", person_id)
+        point = datetime.now().timestamp()
+        rows = self.query(
+            """
+            SELECT COUNT(*) AS total
+            FROM fact_claims
+            WHERE scope_type = 'person' AND scope_id = ? AND status = 'active'
+              AND stability = 'uncertain' AND authority = 'summary_derived'
+              AND profile_section = 'uncertain_notes'
+              AND (valid_from IS NULL OR valid_from <= ?)
+              AND (valid_to IS NULL OR valid_to > ?)
+            """,
+            (token, point, point),
+        )
+        return int(rows[0]["total"] if rows else 0)
+
+    def list_uncertain_person_fact_claims(
+        self,
+        person_id: str,
+        *,
+        effective_at: Optional[float] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """读取当前有效的未确认人物事实，并支持候选数量上限。"""
+
+        token = _required_token("person_id", person_id)
+        point = float(effective_at) if effective_at is not None else datetime.now().timestamp()
+        sql = """
+            SELECT *
+            FROM fact_claims
+            WHERE scope_type = 'person' AND scope_id = ? AND status = 'active'
+              AND stability = 'uncertain' AND authority = 'summary_derived'
+              AND profile_section = 'uncertain_notes'
+              AND (valid_from IS NULL OR valid_from <= ?)
+              AND (valid_to IS NULL OR valid_to > ?)
+            ORDER BY last_confirmed_at DESC, claim_id ASC
+        """
+        params: List[Any] = [token, point, point]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(max(1, int(limit)))
+        rows = self.query(sql, tuple(params))
+        return [self._fact_claim_row(row) or {} for row in rows]
+
     def backfill_person_fact_claims(self, *, limit: Optional[int] = None) -> Dict[str, int]:
         """把现有原子人物事实段落确定性迁移到事实账本。
 

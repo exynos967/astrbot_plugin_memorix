@@ -58,6 +58,8 @@ def build_profile_injection_text(
     *,
     recent_limit: int = 2,
     uncertain_fallback_limit: int = 1,
+    uncertain_candidates: Iterable[object] = (),
+    include_uncertain_fallback: bool = True,
 ) -> str:
     """Build a compact injection view from structured profile text.
 
@@ -81,9 +83,34 @@ def build_profile_injection_text(
         meaningful_found = True
         selected.extend([f"## {title}", *lines, ""])
 
-    if not meaningful_found:
+    selected_uncertain = _dedupe_profile_bullets(uncertain_candidates, limit=2)
+    if selected_uncertain:
+        selected.extend(["## 不确定信息（未确认，不可当作确定事实）", *selected_uncertain, ""])
+    elif not meaningful_found and include_uncertain_fallback:
         uncertain = sections.get("不确定信息", [])[: max(0, int(uncertain_fallback_limit))]
         if not _section_is_empty(uncertain):
             selected.extend(["## 不确定信息（未确认）", *uncertain, ""])
 
     return "\n".join(selected).strip()
+
+
+def _dedupe_profile_bullets(values: Iterable[object], *, limit: int) -> list[str]:
+    """Normalize, deduplicate and cap externally supplied uncertain candidates."""
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        while text.startswith("-"):
+            text = text[1:].strip()
+        if not text or text == "暂无":
+            continue
+        bullet = f"- {text}"
+        key = bullet.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(bullet)
+        if len(result) >= max(1, int(limit)):
+            break
+    return result

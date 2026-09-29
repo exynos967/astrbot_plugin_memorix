@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+import unicodedata
 from typing import Any, Dict, Optional
 
 from ..amemorix.services.person_profile_service import PersonProfileApiService
@@ -13,6 +14,44 @@ from ..app_context import ScopeRuntimeManager
 class ProfileService:
     def __init__(self, runtime_manager: ScopeRuntimeManager):
         self.runtime_manager = runtime_manager
+
+    @staticmethod
+    def _relevance_grams(value: str) -> set[str]:
+        normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+        token = "".join(char for char in normalized if char.isalnum())
+        ignored = {"用户", "这个", "那个", "自己", "喜欢"}
+        return {token[index : index + 2] for index in range(max(0, len(token) - 1))} - ignored
+
+    @staticmethod
+    def uncertain_profile_candidates(ctx: Any, person_id: str, context_text: str = "") -> Dict[str, Any]:
+        """Return relevant uncertain facts without treating them as confirmed profile data."""
+
+        store = getattr(ctx, "metadata_store", None)
+        if store is None or not person_id:
+            return {"uncertain_fact_count": 0, "uncertain_candidates": []}
+        count_fn = getattr(store, "count_uncertain_person_fact_claims", None)
+        list_fn = getattr(store, "list_uncertain_person_fact_claims", None)
+        if not callable(count_fn) or not callable(list_fn):
+            return {"uncertain_fact_count": 0, "uncertain_candidates": []}
+        count = int(count_fn(person_id))
+        claims = list_fn(person_id)
+        query_grams = ProfileService._relevance_grams(context_text)
+        ranked = []
+        for claim in claims:
+            value = str(claim.get("value_text", "") or "")
+            overlap = query_grams & ProfileService._relevance_grams(value)
+            if overlap:
+                ranked.append((len(overlap), float(claim.get("last_confirmed_at", 0) or 0), claim))
+        ranked.sort(key=lambda item: (-item[0], -item[1], str(item[2].get("claim_id", ""))))
+        return {
+            "uncertain_fact_count": count,
+            "uncertain_candidates": [
+                {"claim_id": str(claim.get("claim_id", "")), "text": str(claim.get("value_text", ""))}
+                for _, _, claim in ranked[:2]
+            ],
+        }
+
+    _uncertain_profile_candidates = uncertain_profile_candidates
 
     @staticmethod
     def _parse_group_aliases(raw_value: Any) -> list[Dict[str, Any]]:
@@ -162,16 +201,28 @@ class ProfileService:
         person_keyword: str = "",
         top_k: int = 12,
         force_refresh: bool = False,
+        context_text: str = "",
     ) -> Dict[str, Any]:
         runtime = await self.runtime_manager.get_runtime(scope_key)
         service = PersonProfileApiService(runtime.context)
-        return await service.query(
+        result = await service.query(
             person_id=person_id,
             person_keyword=person_keyword,
             top_k=top_k,
             force_refresh=force_refresh,
             source_note="astrbot:profile_query",
         )
+        if not isinstance(result, dict):
+            return {"success": False, "error": "invalid profile payload"}
+        if result.get("success") and result.get("person_id") and str(context_text or "").strip():
+            result.update(
+                self.uncertain_profile_candidates(
+                    runtime.context,
+                    str(result["person_id"]),
+                    str(context_text or ""),
+                )
+            )
+        return result
 
     async def is_injection_enabled(
         self,
