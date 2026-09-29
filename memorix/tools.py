@@ -786,7 +786,11 @@ class MemorixEpisodeAdminTool(MemorixAdminToolBase):
     name: str = "memory_episode_admin"
     description: str = "Episode 管理接口；仅 AstrBot 管理员可用。"
     admin_method: str = "episode_admin"
-    parameters: dict = Field(default_factory=lambda: _admin_parameters("query/list/get/status/rebuild/process_pending/process_sources"))
+    parameters: dict = Field(
+        default_factory=lambda: _admin_parameters(
+            "query/list/get/status/rebuild/process_pending/process_sources/discard_migration_backfill"
+        )
+    )
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
         return await self._call_admin(context, **kwargs)
