@@ -29,7 +29,7 @@ from .memorix.webui.plugin_page_bridge import PluginPageWebUIBridge
 if TYPE_CHECKING:
     from astrbot.api.provider import LLMResponse, ProviderRequest
 
-PLUGIN_VERSION = "1.3.0"
+PLUGIN_VERSION = "1.4.0"
 
 
 @register(

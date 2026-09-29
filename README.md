@@ -9,7 +9,7 @@
 图谱 + 向量混合检索 · 记忆生命周期管理 · 人物画像 · 总结导入 · 内嵌 WebUI
 
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.26-blue)](https://github.com/Soulter/AstrBot)
-[![Version](https://img.shields.io/badge/version-v1.3.0-green)]()
+[![Version](https://img.shields.io/badge/version-v1.4.0-green)]()
 [![Platforms](https://img.shields.io/badge/platforms-QQ%20%7C%20Telegram%20%7C%20Discord-orange)]()
 
 </div>
@@ -86,6 +86,12 @@ Dashboard 内嵌导入视图默认启用。页面可进行如下三种导入：
 - **安全默认**：`auto_execute_enabled=False`（必须经过显式 confirmed 才会执行）、`confirm_threshold=0.85`、`allow_global_scope=False`（禁止跨作用域全局修改）。
 - **管理入口**：管理工具 `memory_fuzzy_modify_admin`（actions：`preview` / `execute` / `get` / `list` / `rollback` / `reconcile`），仅 AstrBot 管理员事件可调用；WebUI 路由 `POST /v1/fuzzy_modify`。
 
+### v1.4.0 升级说明
+
+- 对齐 A_memorix 最新人物事实语义：未确认事实单独计数与候选读取，画像注入明确标注“未确认，不可当作确定事实”，避免把摘要推断当成稳定画像。
+- Episode 来源重建状态支持批量阻塞判断；已物化 Episode 的来源不会因历史失败任务被误判为不可检索。
+- 新增迁移遗留 Episode 重建任务（schema 19/21）的 dry-run/清理管理动作，默认只预览，执行路径通过线程池避免阻塞 AstrBot 事件循环。
+
 ### v1.3.0 升级说明
 
 - `memory_fact_admin` 提供 `get/list/create/update/retract/restore`，操作限定在当前事件的记忆库内，需 AstrBot 管理员权限。`create` 至少提供 `scope_type`（`person` 或 `chat`）、`scope_id`、`fact_key`、`value_text`；`update/retract/restore/get` 使用 `claim_id`。
@@ -153,7 +159,7 @@ https://github.com/exynos967/astrbot_plugin_memorix
 ## 使用方式
 
 - **日常记忆写入/召回**：请求前会自动注入当前聊天相关的长期记忆和人物画像；LLM 也可继续通过 `search_memory`、`get_person_profile` 等工具按需补查，通过 `ingest_summary`、`ingest_text`、`maintain_memory`、`memory_stats` 写入或维护记忆。
-- **管理员记忆维护**：已注册的管理工具 `memory_graph_admin`、`memory_source_admin`、`memory_episode_admin`、`memory_profile_admin`、`memory_fact_admin`、`memory_runtime_admin`、`memory_import_admin`、`memory_tuning_admin`、`memory_v5_admin`、`memory_delete_admin`；这些工具仅 AstrBot 管理员事件可调用。
+- **管理员记忆维护**：已注册的管理工具 `memory_graph_admin`、`memory_source_admin`、`memory_episode_admin`、`memory_profile_admin`、`memory_fact_admin`、`memory_runtime_admin`、`memory_import_admin`、`memory_tuning_admin`、`memory_v5_admin`、`memory_delete_admin`；这些工具仅 AstrBot 管理员事件可调用。`memory_episode_admin` 支持 `discard_migration_backfill`（默认 dry-run）清理旧迁移遗留队列。
 - **图谱、检索、导入、总结、回收站、画像覆盖等管理操作**：可在 AstrBot Dashboard 的插件详情页打开 `Memorix 控制台`，也可由管理员通过上述管理工具让 LLM 执行。
 - **作用域、检索、生命周期、人物画像、自动总结等策略**：在 AstrBot 插件配置页修改配置项。
 
