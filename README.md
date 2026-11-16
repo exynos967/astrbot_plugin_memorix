@@ -6,10 +6,10 @@
 
 **为 AstrBot 打造的完整记忆系统插件**
 
-图谱 + 向量混合检索 · 记忆生命周期管理 · 人物画像 · 总结导入 · 内嵌 WebUI
+图谱 + 双池向量混合检索 · 记忆生命周期管理 · 人物画像与事实去重 · 多模态图片记忆 · 知识包迁移 · 内嵌 WebUI
 
-[![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.26-blue)](https://github.com/Soulter/AstrBot)
-[![Version](https://img.shields.io/badge/version-v1.4.0-green)]()
+[![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.26%2C%3C5-blue)](https://github.com/Soulter/AstrBot)
+[![Version](https://img.shields.io/badge/version-v2.0.0-green)]()
 [![Platforms](https://img.shields.io/badge/platforms-QQ%20%7C%20Telegram%20%7C%20Discord-orange)]()
 
 </div>
@@ -49,9 +49,18 @@
 
 自动从消息中提取发送者信息，后台定期刷新画像（默认 6 小时 TTL）。LLM 请求时自动注入发送者画像作为上下文参考。支持手动覆盖与清除。
 
-### 人物事实写回
+### 人物事实写回与作用域去重
 
-机器人回复后，自动从用户发言中提取个人事实候选（如「我是学生」「我喜欢打篮球」），写入长期记忆账本，并以「待确认事实线索」进入画像。管理员可确认、修正、撤回或恢复；自动写回不会恢复已被撤回的事实。支持队列化异步提取、每用户特征上限管理、独立 Provider 和温度参数配置。
+机器人回复后，自动从用户发言中提取个人事实候选（如「我是学生」「我喜欢打篮球」），结合 `FactDeduplicator` 进行作用域级事实去重与证据链记录：首次提取以 `uncertain` 待确认状态写入账本，跨消息二次独立确认后自动晋升为 `stable` 稳定事实并复用既有段落；对同义改写事实支持 LLM 语义复用，且绝不恢复已被人工撤回的事实。支持队列化异步提取、独立 Provider 和温度参数配置。
+
+### 多模态图片记忆（v2.0）
+
+默认开启（`image_memory.enabled=true`、`image_memory.require_embedding=true`、`image_memory.auto_inject_enabled=true`），全面对齐上游防识图报错门控：未配置多模态图片嵌入模型（`image_memory.openapi` 或宿主自定义图片嵌入器）时，运行时会自动暂停图片记忆而不污染或篡改用户已保存的插件配置，彻底避免未配置识图/向量接口导致的报错；配置 `image_memory.openapi` 后自动捕获聊天与知识包中的静态图片（PNG / JPEG / WebP / 静态 GIF，自动拦截动图与超限尺寸），完成内容哈希去重、会话出现位置追踪（`external_ref`）、用户随图原话（`user_statement`）与可选视觉模型描述（`model_description`）绑定，并在后续聊天收到带图消息时自动检索同图精确哈希（`exact_hash`）与跨图视觉相似（`visual_similar`）记忆注入 `【图片记忆-内部参考】`。如需在无多模态向量模型时仅使用免向量的同图精确哈希模式，可显式将 `image_memory.require_embedding` 设为 `false`。同一消息跨越多个事件钩子时通过单飞（Single-Flight）共享采集结果，关闭图片转述时全程零临时文件落盘。
+
+### 知识包（`.amembundle`）与在线会话记忆迁移
+
+- **离线知识包（`.amembundle`）**：支持将指定作用域内的记忆段落、关系图谱、结构化事实账本、人物画像与关联图片资产打包为标准 `.amembundle` 归档，在不同环境或作用域间安全校验、导入、预览与卸载（`memory_bundle_admin` / `POST /v1/bundles`）。
+- **在线会话记忆迁移（Schema 31 `ChatMemoryMigration`）**：当群聊迁移换号或会话切换时，可在同一作用域内将旧会话的记忆段落、结构化事实、事件摘要、图片出现/观察记录及可选原始聊天流水原子迁移至目标会话（免重算向量，迁移期间自动通过 `ChatMigrationGate` 挂起会话并发写入）；目标会话已有数据时自动隔离归档至 `migration_archive:<job_id>` 账本，支持在 WebUI「知识包与迁移 -> 在线会话记忆迁移」页签或 `/v1/chat-migrations` 接口一键无损恢复。
 
 ### 总结导入
 
@@ -63,7 +72,7 @@
 
 ### 内嵌 WebUI
 
-基于 AstrBot Plugin Pages 的 Dashboard 内嵌管理界面，提供：图谱浏览与关系编辑、记忆管理与来源追踪、回收站恢复、人物画像管理。接口经 AstrBot Dashboard 鉴权后转发到插件内 runtime。
+基于 AstrBot Plugin Pages 的 Dashboard 内嵌 v2.0 记忆工作台（4 大业务分组、13 个视图），支持顶栏全局作用域切换、跟随宿主/手动三态主题切换与沙箱安全凭据上传下载，覆盖：运行总览、知识图谱、7 模式记忆检索、记忆与结构化事实台账（`FactLedger` + 双池向量维护）、图片记忆画廊（以图搜图/认知修订/队列诊断）、事件摘要（租约安全重建）、人物画像（登记目录/证据链审查纠错）、来源追溯、`.amembundle` 知识包导入导出、纠错与自动调优（自然语言模糊修正/对话反馈审计/检索参数调优）、多模态导入中心、全量运行设置与操作日志。接口经 AstrBot Dashboard 鉴权后转发到插件内统一 runtime。
 
 ### 聊天过滤
 
@@ -86,29 +95,18 @@ Dashboard 内嵌导入视图默认启用。页面可进行如下三种导入：
 - **安全默认**：`auto_execute_enabled=False`（必须经过显式 confirmed 才会执行）、`confirm_threshold=0.85`、`allow_global_scope=False`（禁止跨作用域全局修改）。
 - **管理入口**：管理工具 `memory_fuzzy_modify_admin`（actions：`preview` / `execute` / `get` / `list` / `rollback` / `reconcile`），仅 AstrBot 管理员事件可调用；WebUI 路由 `POST /v1/fuzzy_modify`。
 
-### v1.4.0 升级说明
+### v2.0.0 升级说明（对齐 A_Memorix v2.0 / SCHEMA 31）
 
-- 对齐 A_memorix 最新人物事实语义：未确认事实单独计数与候选读取，画像注入明确标注“未确认，不可当作确定事实”，避免把摘要推断当成稳定画像。
-- Episode 来源重建状态支持批量阻塞判断；已物化 Episode 的来源不会因历史失败任务被误判为不可检索。
-- 新增迁移遗留 Episode 重建任务（schema 19/21）的 dry-run/清理管理动作，默认只预览，执行路径通过线程池避免阻塞 AstrBot 事件循环。
+- **原生 SCHEMA 31 自动升级**：可识别的旧库（包括 v8、schema 9–30 和字段指纹匹配的无版本库）在首次打开时通过 SQLite 在线备份创建完整快照后，在同一事务内升级并校验至 **SCHEMA 31**（含 `chat_scope_transfers` 会话迁移账本与 `person_facts_ledger` 证据视图），失败自动回滚；未知结构及更高版本库拒绝猜测或降级。
+- **单一运行时架构、有界优雅停机与全链路多作用域隔离**：`ScopeRuntimeManager` 与 `ScopeEngineManager`（`MemoryEngineFacade`）完全共享同一套按 scope 隔离的 `AppContext`；后台向量/图谱/SQLite 写盘全面通过 `cancellation_safe_to_thread` 跨取消护航，停机阶段通过 `cancel_and_wait_for_tasks` 有界等待后台写入排空后再释放存储句柄，避免半写损坏与 `.npz` 覆盖。
+- **模块化多语种 Prompt 与轻量模型路由（`fast_model`）**：同步上游分类目录结构 `prompts/{zh-CN,en-US,ja-JP}/{main,instructions}/memory/` 与 `.meta.toml` 元数据，支持按作用域 `custom_prompts` 热更新覆盖；新增可选 `provider.fast_chat_provider_id` 轻量模型路由（未配置时平滑回退主模型）与 `embedding.enable_cache` 内存缓存。
+- **统一管理契约调度**：内置 `AdminContractDispatcher` 统一编排全部管理契约。默认注册 18 个 LLM 工具（含 `memory_fact_admin`、`memory_fuzzy_modify_admin` 等）；开启 `integration.enable_v2_extended_tools=true` 后额外暴露 `memory_bundle_admin`、`memory_correction_admin`、`memory_image_admin` 三个 v2 扩展管理工具（所有 `*_admin` 工具均强制校验 AstrBot 管理员权限与当前会话作用域）。
+- **Dashboard API 扩展**：在保留 `POST /v1/facts`、`POST /v1/person/aliases`、`POST /v1/memory/delete-admin`、`POST /v1/fuzzy_modify` 的基础上，新增 `POST /v1/bundles`、`POST /v1/images`、`POST /v1/correction`、`/v1/chat-migrations`（会话记忆预检/执行/恢复）及统一管理端点 `POST /v1/admin/{component_name}`。
+- **公开 API 规范对齐**：全面遵循 AstrBot `>=4.26,<5` 公开接口（`StarTools.get_data_dir`、`astrbot.api.web`、异步 Provider 调用），移除 `astrbot.core.utils.astrbot_path` 私有路径耦合。
 
-### v1.3.0 升级说明
+历史架构演进与设计背景见 [AstrBot 原生记忆设计](docs/architecture/astrbot-native-memory.md) 与 [A_memorix v22 升级 review](docs/reviews/amemorix-v22.md)。
 
-- `memory_fact_admin` 提供 `get/list/create/update/retract/restore`，操作限定在当前事件的记忆库内，需 AstrBot 管理员权限。`create` 至少提供 `scope_type`（`person` 或 `chat`）、`scope_id`、`fact_key`、`value_text`；`update/retract/restore/get` 使用 `claim_id`。
-- 人物别名由 `memory_profile_admin` 的 `get_aliases/set_aliases/delete_aliases` 管理。`set_aliases` 使用 `person_id` 与完整 `aliases` 字符串数组；人工集合优先于登记信息推导的集合。
-- 聊天记录导入可传 `chat_log=true`、`narrative_window_size`（默认 1600）、`narrative_overlap`（默认 400）。不会切断单条消息；未识别到消息头时回退普通叙事切块并报告 warning。
-- JSON 段落可提供 `person_ids: ["aiocqhttp:用户ID"]`。同内容重导入会合并人物关联。
-- 旧人物事实段落会按原有明确人物 ID 回填成待确认事实，不推断人物身份或事实槽位。旧 `person_registry.memory_points` 原数据保留供管理查看，但不再直接作为自动注入内容。
-- 图谱重命名先提交 metadata 与审计，再更新图和向量。派生索引更新失败会保留待处理记录，在同一作用域下次启动或再次重命名时重试；错误仍未解决时不接受后续重命名。
-- 可识别的旧库（包括 v8、schema 9–22 和字段指纹匹配的无版本库）在首次打开时自动备份并迁移到原生 schema 23；失败整体回滚，未知结构及更高版本不会被自动改写。
-
-Dashboard 的 API 隧道提供 `POST /v1/facts`、`POST /v1/person/aliases`、`POST /v1/memory/delete-admin`，请求结构为 `{"action": "...", "payload": {...}}`。删除返回 `operation_id`，可恢复整次操作；`purge` 才会销毁过期快照。图和向量同步失败保留任务，后台按当前数据重试。
-
-新版使用 AstrBot 4.26 起的公开 Web API。Vue 源码新增事实/别名表单、删除操作恢复和 Plugin Pages 文件上传；**本次未执行前端构建，分发静态页面仍需在发布前重新生成**。上传任务临时文件保留 24 小时供重试，未完成导入不跨插件重启恢复。
-
-本版能力取舍、模块边界及验证限制见 [AstrBot 原生记忆设计](docs/architecture/astrbot-native-memory.md)；前一阶段记录见 [A_memorix v22 升级 review](docs/reviews/amemorix-v22.md)。
-
-#### 本插件基于 A_Dawn 的 A_Memorix 设计理念开发，并针对 AstrBot 做了完整适配。
+#### 本插件基于 A_Dawn 的 A_Memorix v2.0 设计理念开发，并针对 AstrBot 做了完整适配。
 
 ## 工作流
 
@@ -116,22 +114,22 @@ Dashboard 的 API 隧道提供 `POST /v1/facts`、`POST /v1/person/aliases`、`P
 消息到达
   │
   ▼
-① 作用域路由 ── 按 scope.mode 确定记忆归属
+① 作用域路由 ── 按 scope.mode 确定记忆归属（共享单一 ScopeRuntime）
   │
   ▼
 ② 聊天过滤 ── 按白名单/黑名单决定是否处理该会话
   │
   ▼
-③ 消息清洗与内容路由 ── 默认采用 transcript_only：先生成 processed_plain_text 并进入 transcript，再由总结任务提炼长期记忆；可切到 direct/both/auto 获得直写或事实候选直写
+③ 消息与图片单次采集 ── 静态聊天图片去重入库 ImageMemoryRuntime（可选单次 VLM 转述）；文本按 memory_write_mode 进入 transcript 或直写长期记忆
   │
   ▼
-④ 写回提炼 ── 自动/手动总结带状态游标；人物事实写回会在机器人回复后提取用户稳定事实
+④ 写回提炼 ── 自动/手动总结带状态游标；人物事实写回经 FactDeduplicator 去重与二次确认晋升
   │
   ▼
-⑤ 检索注入 ── LLM 请求时按 scope/source 混合检索记忆，支持自动查询路由（语义/时序/混合/聚合）
+⑤ 检索注入 ── LLM 请求时并行注入人物画像、多模态图片记忆参考（同图/相似图）与双池向量+BM25+图谱混合记忆检索
   │
   ▼
-⑥ 后台维护 ── 衰减 / 冻结 / 剪枝 / 画像刷新 / Episode 生成 / 向量持久化
+⑥ 后台维护 ── 衰减 / 冻结 / 剪枝 / 画像刷新 / Episode 生成 / 双池向量与图谱持久化
 ```
 
 ## 快速开始
@@ -159,9 +157,9 @@ https://github.com/exynos967/astrbot_plugin_memorix
 ## 使用方式
 
 - **日常记忆写入/召回**：请求前会自动注入当前聊天相关的长期记忆和人物画像；LLM 也可继续通过 `search_memory`、`get_person_profile` 等工具按需补查，通过 `ingest_summary`、`ingest_text`、`maintain_memory`、`memory_stats` 写入或维护记忆。
-- **管理员记忆维护**：已注册的管理工具 `memory_graph_admin`、`memory_source_admin`、`memory_episode_admin`、`memory_profile_admin`、`memory_fact_admin`、`memory_runtime_admin`、`memory_import_admin`、`memory_tuning_admin`、`memory_v5_admin`、`memory_delete_admin`；这些工具仅 AstrBot 管理员事件可调用。`memory_episode_admin` 支持 `discard_migration_backfill`（默认 dry-run）清理旧迁移遗留队列。
-- **图谱、检索、导入、总结、回收站、画像覆盖等管理操作**：可在 AstrBot Dashboard 的插件详情页打开 `Memorix 控制台`，也可由管理员通过上述管理工具让 LLM 执行。
-- **作用域、检索、生命周期、人物画像、自动总结等策略**：在 AstrBot 插件配置页修改配置项。
+- **管理员记忆维护**：默认已注册的管理工具包括 `memory_graph_admin`、`memory_source_admin`、`memory_episode_admin`、`memory_profile_admin`、`memory_fact_admin`、`memory_runtime_admin`、`memory_import_admin`、`memory_tuning_admin`、`memory_v5_admin`、`memory_delete_admin`、`memory_feedback_admin`、`memory_fuzzy_modify_admin`；开启 `integration.enable_v2_extended_tools=true` 后还会额外注册 `memory_bundle_admin`、`memory_correction_admin`、`memory_image_admin`。所有管理工具仅 AstrBot 管理员事件可调用。
+- **图谱、检索、导入、总结、回收站、知识包、图片记忆、画像覆盖等管理操作**：可在 AstrBot Dashboard 的插件详情页打开 `Memorix 控制台`，也可由管理员通过上述管理工具或 `/v1/admin/{component_name}` 执行。
+- **作用域、检索、生命周期、人物画像、自动总结、多模态图片记忆等策略**：在 AstrBot 插件配置页修改配置项。
 
 ## 作用域模式
 
@@ -178,25 +176,27 @@ https://github.com/exynos967/astrbot_plugin_memorix
 
 ```
 data/plugin_data/astrbot_plugin_memorix/scopes/<scope_key>/
-├── vectors/      # FAISS / Numpy 向量索引
+├── vectors/      # FAISS / Numpy 向量索引（含 paragraph/ 与 graph/ 双池及 dual_ready.json）
 ├── graph/        # SciPy 稀疏矩阵图谱
-└── metadata/     # SQLite 元数据（段落/实体/关系/对话/画像/任务）
+├── images/       # 多模态图片记忆资产文件（ImageMemoryRuntime）
+├── bundles/      # 知识包归档与导入缓存（BundleRuntime）
+└── metadata/     # SQLite 元数据（SCHEMA 29：段落/实体/关系/对话/事实账本/画像/图片/知识包/任务）
 ```
 
 | 存储层 | 实现 | 职责 |
 |---|---|---|
-| 向量存储 | FAISS（降级 Numpy 余弦） | 段落和关系的语义向量索引 |
+| 向量存储 | FAISS（降级 Numpy 余弦） | 段落池与图谱池的语义向量索引 |
 | 图谱存储 | SciPy 稀疏矩阵 | 实体节点 + 关系边权重图 |
-| 元数据存储 | SQLite | 结构化数据与全文检索（FTS5） |
+| 元数据存储 | SQLite（SCHEMA 29） | 结构化数据、事实与图片/知识包账本、全文检索（FTS5） |
 
 ### 数据库 Schema 版本
 
-当前元数据版本为 **SCHEMA 23**。更新插件并重启后，每个 scope 的记忆库在首次打开时自动检查版本，迁移完成后才启动该库的后台任务，不需要先手工执行迁移命令。
+当前元数据版本为 **SCHEMA 29**。更新插件并重启后，每个 scope 的记忆库在首次打开时自动检查版本，迁移完成后才启动该库的后台任务，不需要先手工执行迁移命令。
 
-- **已有旧库**：支持可识别的历史结构，包括 v8、schema 9–22 和字段指纹匹配的无版本数据库。逐列补齐缺失字段，保留段落、关系、事实和 AstrBot 本地数据。
+- **已有旧库**：支持可识别的历史结构，包括 v8、schema 9–28 和字段指纹匹配的无版本数据库。逐列补齐缺失字段并创建 v2.0 新增表（图片记忆、知识包等），完整保留段落、关系、事实和 AstrBot 本地数据。
 - **备份与回滚**：迁移前通过 SQLite Backup API 创建包含 WAL 已提交数据的完整快照，存放在该库相邻的 `metadata/backups/`。全部升级步骤与版本号在一个事务中提交；备份或校验失败则停止，迁移失败回滚，备份路径记录到日志。已有备份不自动删除。
 - **版本保护**：未知结构、当前版本但必需字段缺失、比插件支持版本更新的库会明确报错，不猜测结构、不自动降级。当前完整版本重复打开不会重复迁移或备份。
-- **全新安装**：直接创建 schema 23；空库无需保存迁移备份。
+- **全新安装**：直接创建 **SCHEMA 29**；空库无需保存迁移备份。
 
 离线脚本仍可用于批量预检查或停机后的手动操作，并复用同一套自动迁移逻辑：
 
@@ -205,13 +205,13 @@ uv run --no-project python scripts/migrate_schema_v8_to_v13.py --dry-run
 uv run --no-project python scripts/migrate_schema_v8_to_v13.py
 ```
 
-脚本默认查找 `data/plugin_data/astrbot_plugin_memorix/scopes/*/metadata/metadata.db`。可用 `--plugin-data-dir` 指定插件数据目录，或用 `--db` 选择一个数据库；停止插件后可用 `--db <数据库> --restore <备份>` 恢复。脚本名称保留历史命名，目标始终是当前代码版本。数据库版本升级与下方的双向量池分流是两件独立的事。
+脚本默认查找 `data/plugin_data/astrbot_plugin_memorix/scopes/*/metadata/metadata.db`。可用 `--plugin-data-dir` 指定插件数据目录，或用 `--db` 选择一个数据库；停止插件后可用 `--db <数据库> --restore <备份>` 恢复。脚本名称保留历史命名，目标始终是当前代码版本（SCHEMA 29）。数据库版本升级与下方的双向量池分流是两件独立的事。
 
 实现与验证边界见 [自动迁移说明](docs/architecture/database-migrations.md)。
 
 ### 双向量池架构（dual-pool）
 
-SCHEMA 15 起支持双向量池模式，将 **段落向量** 与 **图谱向量** 分离到独立索引，便于独立扩容、独立检索调参。v1.1.0 起插件主线会把双池 store 真正接到检索器。
+支持双向量池模式，将 **段落向量（`vectors/paragraph`）** 与 **图谱向量（`vectors/graph`）** 分离到独立索引，并在启动时自动识别 `dual_ready.json` 加载与持久化双池数据。
 
 - **默认 `mode=dual`，与上游 A_memorix 对齐**：如果未生成 `dual_ready.json`，运行时会自动降级为 single，不会因配置错配而无法检索。
 - **正式启用双池步骤**：
@@ -219,7 +219,7 @@ SCHEMA 15 起支持双向量池模式，将 **段落向量** 与 **图谱向量*
      ```
      uv run --no-project python scripts/migrate_vectors_to_dual_pools.py --data-dir <scope目录> [--scope <scope_key>] [--dry-run]
      ```
-  2. 迁移成功后，脚本会在 `vectors/` 下写入 `dual_ready.json` manifest，运行时据此判定 dual 是否就绪；
+  2. 迁移成功后，脚本会在 `vectors/` 下写入 `dual_ready.json` manifest，运行时据此自动加载并在写入/维护/退出时同步保存双池索引；
   3. 若 manifest 缺失，运行时自动降级为 single。
 - 迁移脚本幂等，不删除单池原数据，dual 模式可安全回退至 single。
 
@@ -274,12 +274,14 @@ SCHEMA 15 起支持双向量池模式，将 **段落向量** 与 **图谱向量*
 | 配置项 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `provider.chat_provider_id` | string | `""` | 可选指定 AstrBot 聊天 Provider；为空时回退当前会话 provider |
+| `provider.fast_chat_provider_id` | string | `""` | 可选轻量任务 Provider（用于反馈分类、检索改写、聊天时间抽取与画像分类）；为空自动回退主模型 |
 
 ### Embedding
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `embedding.enabled` | bool | `false` | 启用插件内 OpenAI-compatible embedding（关闭则本地回退） |
+| `embedding.enable_cache` | bool | `false` | 启用进程内文本 Embedding LRU 缓存（运行时自检自动绕过缓存） |
 | `embedding.dimension` | int | `1024` | 向量维度 |
 | `embedding.batch_size` | int | `32` | 批量请求大小 |
 | `embedding.max_concurrent` | int | `5` | 最大并发请求数 |
@@ -364,9 +366,27 @@ SCHEMA 15 起支持双向量池模式，将 **段落向量** 与 **图谱向量*
 
 ### WebUI
 
-插件只保留 **AstrBot Dashboard 内嵌页**：AstrBot `>=4.24.2` 可在插件详情页的 `Memorix 控制台` 页面中直接打开，接口经 AstrBot Dashboard 鉴权后转发到当前 Memorix runtime。
+插件只保留 **AstrBot Dashboard 内嵌页**：AstrBot `>=4.26` 可在插件详情页的 `Memorix 控制台` 页面中直接打开，接口经 AstrBot Dashboard 鉴权后转发到当前 Memorix runtime。
 
 图谱页可通过 **群过滤** 下拉选择 scope，显示格式为 `平台:群号`，例如 `aiocqhttp:123456`。
+
+### 多模态图片记忆（image_memory）
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `image_memory.enabled` | bool | `true` | 启用静态图片记忆资产存储、认知绑定与管理 |
+| `image_memory.require_embedding` | bool | `true` | 默认开启：未配置多模态图片嵌入模型时在运行时自动暂停图片记忆（防识图报错且不改写已保存配置）；设为 `false` 可启用免向量同图精确哈希模式 |
+| `image_memory.auto_inject_enabled` | bool | `true` | 在 LLM 请求前自动检索同图/相似图片记忆并注入 `【图片记忆-内部参考】` |
+| `image_memory.max_bytes` | int | `10485760` | 单张图片最大字节数（默认 10 MiB） |
+| `image_memory.max_pixels` | int | `40000000` | 单张图片最大像素数（默认 4000 万像素） |
+| `image_memory.candidate_limit` | int | `8` | 多模态图片相似召回候选上限 |
+| `image_memory.similarity_threshold` | float | `0.72` | 图片余弦相似度过滤阈值 |
+| `image_memory.openapi.enabled` | bool | `false` | 启用 OpenAI 兼容多模态图片向量接口（解锁跨图 `visual_similar` 相似召回） |
+| `image_memory.openapi.base_url` | string | `""` | 多模态图片向量接口地址 |
+| `image_memory.openapi.api_key` | string | `""` | 多模态图片向量接口密钥 |
+| `image_memory.openapi.model` | string | `""` | 多模态图片向量模型名称 |
+| `image_memory.openapi.dimension` | int | `512` | 图片向量默认维度 |
+| `image_memory.openapi.timeout_seconds` | float | `30.0` | 图片向量请求超时时间（秒） |
 
 ### 导入中心（web.import）
 
@@ -378,14 +398,18 @@ SCHEMA 15 起支持双向量池模式，将 **段落向量** 与 **图谱向量*
 | `web.import.max_paste_chars` | int | `200000` | 粘贴导入字符上限 |
 | `web.import.default_file_concurrency` | int | `2` | 默认文件并发（预留） |
 | `web.import.default_chunk_concurrency` | int | `4` | 默认分块并发（预留） |
+| `web.import.llm_retry.max_attempts` | int | `4` | 知识导入阶段单次 LLM 请求的最大尝试总次数（含首次调用） |
 | `web.import.path_aliases.raw` | string | `raw` | 原始目录扫描别名（相对 `storage.data_dir`） |
 | `web.import.path_aliases.plugin_data` | string | `.` | 插件数据目录别名（相对 `storage.data_dir`） |
 
-### 模糊修正（integration.fuzzy_modify）
+### 集成与模糊修正（integration）
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
+| `integration.enable_v2_extended_tools` | bool | `false` | 额外向 LLM 注册 `memory_bundle_admin`、`memory_correction_admin`、`memory_image_admin` 管理工具 |
+| `integration.feedback_correction_enabled` | bool | `false` | 启用后台反馈纠错任务 |
 | `integration.fuzzy_modify.enabled` | bool | `true` | 启用记忆模糊修正功能；默认与上游 A_memorix 对齐 |
+| `integration.fuzzy_modify.candidate_limit` | int | `20` | 生成修改计划时收集的候选记忆上限 |
 | `integration.fuzzy_modify.auto_execute_enabled` | bool | `false` | 是否允许跳过显式确认直接执行；默认必须显式 confirmed |
 | `integration.fuzzy_modify.confirm_threshold` | float | `0.85` | 计划确认阈值，低于该阈值需人工复核 |
 | `integration.fuzzy_modify.max_targets` | int | `5` | 单个计划允许修改的目标上限 |

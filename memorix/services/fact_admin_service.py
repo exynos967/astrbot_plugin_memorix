@@ -4,10 +4,51 @@ import unicodedata
 from typing import Any, Dict, Optional
 
 
+def resolve_canonical_person_id(ctx: Any, raw_id: str) -> str:
+    """当传入标识不匹配已有 person_id 时，尝试通过 PersonProfileService 解析规范 person_id。"""
+    token = str(raw_id or "").strip()
+    if not token:
+        return ""
+    metadata_store = getattr(ctx, "metadata_store", None)
+    if metadata_store is not None:
+        for checker_name in (
+            "get_person_identity",
+            "get_person_registry",
+            "get_latest_person_profile_snapshot",
+            "get_person_profile_override",
+        ):
+            checker = getattr(metadata_store, checker_name, None)
+            if callable(checker) and checker(token) is not None:
+                return token
+        query_fn = getattr(metadata_store, "query", None)
+        if callable(query_fn):
+            if query_fn("SELECT 1 FROM person_profile_alias_overrides WHERE person_id = ? LIMIT 1", (token,)):
+                return token
+            if query_fn("SELECT 1 FROM fact_claims WHERE scope_type = 'person' AND scope_id = ? LIMIT 1", (token,)):
+                return token
+            try:
+                if query_fn("SELECT 1 FROM person_profiles WHERE person_id = ? LIMIT 1", (token,)):
+                    return token
+            except Exception:
+                pass
+    profile_service = getattr(ctx, "person_profile_service", None)
+    resolver = getattr(profile_service, "resolve_person_id", None)
+    if callable(resolver):
+        try:
+            resolved = resolver(token, metadata_store=metadata_store)
+        except TypeError:
+            resolved = resolver(token)
+        resolved_str = str(resolved or "").strip()
+        if resolved_str:
+            return resolved_str
+    return token
+
+
 class FactAdminService:
     """提供基于 metadata 事实账本的结构化管理接口。"""
 
     def __init__(self, ctx: Any):
+        self._ctx = ctx
         self.metadata_store = ctx.metadata_store
         self._cfg = ctx.get_config
 
@@ -89,6 +130,9 @@ class FactAdminService:
         return False
 
     def _create_fact(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        scope_type = str(kwargs.get("scope_type", "person") or "person").strip().lower()
+        if scope_type == "person" and str(kwargs.get("scope_id", "") or "").strip():
+            kwargs = {**kwargs, "scope_id": resolve_canonical_person_id(self._ctx, str(kwargs["scope_id"]))}
         with self.metadata_store.transaction(immediate=True) as conn:
             claim = self._upsert_claim(kwargs=kwargs)
             refresh_queued = self._enqueue_profile_refresh(
@@ -175,9 +219,13 @@ class FactAdminService:
                 claim = self.metadata_store.get_fact_claim(claim_id)
                 return {"success": claim is not None, "claim": claim, "error": "" if claim else "事实 claim 不存在"}
             if act == "list":
+                scope_type = str(kwargs.get("scope_type", "") or "person")
+                scope_id = str(kwargs.get("scope_id", "") or "")
+                if scope_type.strip().lower() == "person" and scope_id.strip():
+                    scope_id = resolve_canonical_person_id(self._ctx, scope_id)
                 claims = self.metadata_store.list_fact_claims(
-                    scope_type=str(kwargs.get("scope_type", "") or "person"),
-                    scope_id=str(kwargs.get("scope_id", "") or ""),
+                    scope_type=scope_type,
+                    scope_id=scope_id,
                     statuses=kwargs.get("statuses"),
                     limit=min(1000, max(1, int(kwargs.get("limit", 200) or 200))),
                 )

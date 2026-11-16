@@ -53,13 +53,25 @@ class _FakeEmbeddingManager:
 
 class _RoleEntityLLM:
     async def complete_json(self, prompt, temperature=0.2, max_tokens=1200):
-        del prompt, temperature, max_tokens
+        del temperature, max_tokens
+        if "判断同一归属范围内的事实是否重复" in str(prompt or ""):
+            return (
+                True,
+                {
+                    "decisions": [
+                        {"fact_id": "f1", "action": "keep", "target_id": None, "candidate_ids": []}
+                    ],
+                    "relation_support": {"0": ["f1"]},
+                },
+                "",
+            )
         return (
             True,
             {
                 "summary": "用户喜欢 RPG。",
                 "entities": ["用户", "RPG"],
                 "relations": [{"subject": "用户", "predicate": "喜欢", "object": "RPG"}],
+                "facts": [{"fact_id": "f1", "text": "用户喜欢 RPG。"}],
             },
             "",
         )

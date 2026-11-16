@@ -1,7 +1,8 @@
 import { defineStore } from "pinia";
-import { ref } from "vue";
+import { ref, watch } from "vue";
 import {
   runAggregate,
+  runAuto,
   runEntity,
   runRelation,
   runSearch,
@@ -10,31 +11,30 @@ import {
   type QueryResult,
 } from "@/services/queryApi";
 import { queryEpisodes } from "@/services/episodeApi";
+import { fetchSourceList } from "@/services/sourceApi";
+import { sourceNameOf } from "@/utils/sourceText";
+import { queryMetaLabel, queryModeLabel } from "@/utils/queryText";
 import { useAppStore } from "@/stores/app";
 import { useGraphStore } from "@/stores/graph";
 import { useLogsStore } from "@/stores/logs";
-import { errText } from "@/utils/error";
 import { useDashboardStore } from "@/stores/dashboard";
-
+import { errText } from "@/utils/error";
 
 /**
- * Query store：统一查询中心。
- *
- * - 修复 H4：runQuery 持单调请求序号，过期请求结果丢弃，避免快速切换模式/连续点查询错位。
- * - 修复 H6：relation 模式 legacy 仅发 {subject,predicate,object} 完全忽略顶部 query-text；
- *   新实现当 subject 为空时回退用 query-text 作 subject，使 query-text 在 relation 模式生效。
- * - scope：/v1/query/* 经 bridge `_scope` 路由，统一传 graph.effectiveScope()。
- * - 查询成功后联动刷新 dashboard status（与 legacy runQuery 末尾 loadDashboardStatus 一致）。
- * - 错误显式进 useAppStore 总线，不静默。
+ * Query store：7 模式统一检索中心（auto / aggregate / search / time / episode / relation / entity）。
+ * - 支持作用域级真实来源缓存补全（getSourceCandidates）。
+ * - 允许 time / episode / aggregate 在设置了人物/来源/时间范围时免关键词筛选查询。
+ * - 监听 graph.effectiveScope()，切换作用域时清除旧作用域残留结果。
  */
 export const useQueryStore = defineStore("query", () => {
-  const mode = ref<QueryMode>("aggregate");
+  const mode = ref<QueryMode>("auto");
   const query = ref("");
   const topk = ref(10);
   const timeFrom = ref("");
   const timeTo = ref("");
   const person = ref("");
   const source = ref("");
+  const strictSource = ref(false);
   const relationSubject = ref("");
   const relationPredicate = ref("");
   const relationObject = ref("");
@@ -50,41 +50,139 @@ export const useQueryStore = defineStore("query", () => {
 
   let seq = 0;
 
+  // 按作用域缓存真实来源列表，避免每次按键重复打后端
+  let cachedSourceScope: string | null = null;
+  let cachedSources: string[] = [];
+  let pendingSourcePromise: Promise<string[]> | null = null;
+
+  function invalidateSourceCache(): void {
+    cachedSourceScope = null;
+    cachedSources = [];
+    pendingSourcePromise = null;
+  }
+
+  async function getSourceCandidates(kw: string): Promise<string[]> {
+    const scope = graph.effectiveScope();
+    let list = cachedSources;
+    if (cachedSourceScope !== scope || cachedSources.length === 0) {
+      if (!pendingSourcePromise || cachedSourceScope !== scope) {
+        cachedSourceScope = scope;
+        pendingSourcePromise = fetchSourceList({}, scope)
+          .then((res) => {
+            const names = Array.from(
+              new Set((res.sources || []).map((it) => sourceNameOf(it)).filter(Boolean)),
+            ).sort((a, b) => a.localeCompare(b, "zh-CN"));
+            if (cachedSourceScope === scope) {
+              cachedSources = names;
+            }
+            return names;
+          })
+          .catch(() => [])
+          .finally(() => {
+            pendingSourcePromise = null;
+          });
+      }
+      list = await pendingSourcePromise;
+    }
+    const needle = kw.trim().toLowerCase();
+    if (!needle) return list.slice(0, 40);
+    return list.filter((s) => s.toLowerCase().includes(needle)).slice(0, 40);
+  }
+
   function setMode(next: QueryMode): void {
+    if (mode.value === next) return;
     mode.value = next;
+    result.value = null;
+    meta.value = "等待查询";
+  }
+
+  function resetFilters(): void {
+    query.value = "";
+    topk.value = 10;
+    timeFrom.value = "";
+    timeTo.value = "";
+    person.value = "";
+    source.value = "";
+    strictSource.value = false;
+    relationSubject.value = "";
+    relationPredicate.value = "";
+    relationObject.value = "";
+    result.value = null;
+    meta.value = "等待查询";
   }
 
   async function runQuery(): Promise<void> {
-    // relation 模式不强制 query-text（可用三元组查询）
-    if (mode.value !== "relation" && !query.value.trim()) {
-      app.pushError("请输入查询内容", "runQuery");
-      return;
-    }
-    seq += 1;
-    const cur = seq;
-    loading.value = true;
-    const scope = graph.effectiveScope();
-    const topK = Number(topk.value) || 10;
+    const q = query.value.trim();
     const tf = timeFrom.value.trim() || null;
     const tt = timeTo.value.trim() || null;
     const pn = person.value.trim() || null;
     const sr = source.value.trim() || null;
+    const sub = relationSubject.value.trim();
+    const pred = relationPredicate.value.trim();
+    const obj = relationObject.value.trim();
+
+    if (mode.value === "auto" || mode.value === "search") {
+      if (!q) {
+        app.pushError("请输入检索内容", "runQuery");
+        return;
+      }
+    } else if (mode.value === "entity") {
+      if (!q) {
+        app.pushError("请输入要查询的实体名称", "runQuery");
+        return;
+      }
+    } else if (mode.value === "relation") {
+      if (!sub && !pred && !obj && !q) {
+        app.pushError("请至少填写主体、谓词、客体或顶部检索词中的一项", "runQuery");
+        return;
+      }
+    } else if (mode.value === "time" || mode.value === "episode" || mode.value === "aggregate") {
+      if (!q && !pn && !sr && !tf && !tt) {
+        app.pushError("请输入检索词，或至少设置人物 / 来源 / 时间范围中的一项筛选条件", "runQuery");
+        return;
+      }
+    }
+
+    seq += 1;
+    const cur = seq;
+    loading.value = true;
+    const scope = graph.effectiveScope();
+    const topK = Math.max(1, Math.min(100, Number(topk.value) || 10));
+
     try {
       let data: QueryResult;
       switch (mode.value) {
+        case "auto":
+          data = await runAuto(
+            {
+              query: q,
+              top_k: topK,
+              source: sr,
+              strict_source: strictSource.value,
+            },
+            scope,
+          );
+          break;
         case "search":
-          data = await runSearch({ query: query.value.trim(), top_k: topK }, scope);
+          data = await runSearch(
+            {
+              query: q,
+              top_k: topK,
+              ...(sr ? { source: sr, strict_source: strictSource.value } : {}),
+            },
+            scope,
+          );
           break;
         case "time":
           data = await runTime(
-            { query: query.value.trim(), top_k: topK, time_from: tf, time_to: tt, person: pn, source: sr },
+            { query: q, top_k: topK, time_from: tf, time_to: tt, person: pn, source: sr },
             scope,
           );
           break;
         case "episode":
           data = (await queryEpisodes(
             {
-              query: query.value.trim(),
+              query: q,
               top_k: topK,
               time_from: tf,
               time_to: tt,
@@ -96,13 +194,12 @@ export const useQueryStore = defineStore("query", () => {
           )) as unknown as QueryResult;
           break;
         case "entity":
-          data = await runEntity({ entity_name: query.value.trim() }, scope);
+          data = await runEntity({ entity_name: q }, scope);
           break;
         case "relation": {
-          // 修 H6：subject 为空时回退用 query-text，使顶部 query-text 在 relation 模式生效
-          const subject = relationSubject.value.trim() || query.value.trim();
+          const effectiveSubject = sub || (!pred && !obj ? q : "");
           data = await runRelation(
-            { subject, predicate: relationPredicate.value.trim(), object: relationObject.value.trim() },
+            { subject: effectiveSubject, predicate: pred, object: obj },
             scope,
           );
           break;
@@ -110,16 +207,33 @@ export const useQueryStore = defineStore("query", () => {
         case "aggregate":
         default:
           data = await runAggregate(
-            { query: query.value.trim(), top_k: topK, time_from: tf, time_to: tt, person: pn, source: sr, mix: true, mix_top_k: topK },
+            {
+              query: q,
+              top_k: topK,
+              time_from: tf,
+              time_to: tt,
+              person: pn,
+              source: sr,
+              mix: true,
+              mix_top_k: topK,
+            },
             scope,
           );
           break;
       }
-      if (cur !== seq) return; // 旧请求丢弃（修 H4 错位）
+      if (cur !== seq) return;
       result.value = data;
-      meta.value = `${mode.value} · ${data.count ?? data.results?.length ?? data.relations?.length ?? "-"} 条结果`;
-      logs.log(`查询[${mode.value}]：${query.value.trim() || relationSubject.value.trim()}`, "info");
-      // 联动刷新 dashboard（与 legacy 一致），失败不阻塞查询展示
+      meta.value = queryMetaLabel(mode.value, data);
+
+      if (mode.value === "aggregate" && Array.isArray(data.errors) && data.errors.length > 0) {
+        const branchText = data.errors
+          .map((e) => `${e.branch || "子路"}: ${e.error || "执行异常"}`)
+          .join("；");
+        app.notify?.(`部分检索分支返回异常（${branchText}）`, "warn", "aggregateQuery");
+      }
+
+      const logTarget = q || sub || pred || obj || sr || pn || `${tf || ""}~${tt || ""}`;
+      logs.log(`检索 [${queryModeLabel(mode.value)}]：${logTarget}`, "info");
       void dashboard.loadDashboardStatus().catch(() => undefined);
     } catch (err) {
       if (cur === seq) {
@@ -132,6 +246,18 @@ export const useQueryStore = defineStore("query", () => {
     }
   }
 
+  watch(
+    () => graph.effectiveScope(),
+    (next, prev) => {
+      if (next === prev) return;
+      seq += 1;
+      loading.value = false;
+      invalidateSourceCache();
+      result.value = null;
+      meta.value = "已切换作用域，请重新执行检索";
+    },
+  );
+
   return {
     mode,
     query,
@@ -140,13 +266,16 @@ export const useQueryStore = defineStore("query", () => {
     timeTo,
     person,
     source,
+    strictSource,
     relationSubject,
     relationPredicate,
     relationObject,
     result,
     meta,
     loading,
+    getSourceCandidates,
     setMode,
+    resetFilters,
     runQuery,
   };
 });

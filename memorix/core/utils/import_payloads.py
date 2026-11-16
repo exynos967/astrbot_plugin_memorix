@@ -1,4 +1,4 @@
-"""Shared import payload normalization helpers."""
+"""导入载荷共用的归一化辅助工具。"""
 
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ def normalize_entity_import_item(item: Any) -> Optional[str]:
     else:
         name = ""
 
-    if not name or is_probable_hash_token(name):
+    if not name:
         return None
     return name
 
@@ -66,8 +66,6 @@ def normalize_relation_import_item(item: Any) -> Optional[Dict[str, str]]:
     predicate = str(item.get("predicate", "") or "").strip()
     obj = str(item.get("object", "") or "").strip()
     if not (subject and predicate and obj):
-        return None
-    if any(is_probable_hash_token(token) for token in (subject, predicate, obj)):
         return None
     return {
         "subject": subject,
@@ -105,14 +103,30 @@ def _normalize_relations(raw_relations: Any) -> List[Dict[str, str]]:
     return out
 
 
-def _normalize_person_ids(value: Any) -> List[str]:
-    if value is None:
+def _normalize_person_ids(raw_person_ids: Any) -> List[str]:
+    if raw_person_ids is None:
         return []
-    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+    if not isinstance(raw_person_ids, list):
         raise ImportPayloadValidationError(
-            "person_ids 必须是字符串数组", code="paragraph_person_ids_invalid", field="person_ids",
+            "段落 person_ids 必须为字符串数组",
+            code="paragraph_person_ids_invalid",
+            field="person_ids",
         )
-    return list(dict.fromkeys(item.strip() for item in value if item.strip()))
+    out: List[str] = []
+    seen = set()
+    for item in raw_person_ids:
+        if not isinstance(item, str):
+            raise ImportPayloadValidationError(
+                "段落 person_ids 必须为字符串数组",
+                code="paragraph_person_ids_invalid",
+                field="person_ids",
+            )
+        person_id = item.strip()
+        if not person_id or person_id in seen:
+            continue
+        seen.add(person_id)
+        out.append(person_id)
+    return out
 
 
 def normalize_paragraph_import_item(
@@ -120,7 +134,7 @@ def normalize_paragraph_import_item(
     *,
     default_source: str,
 ) -> Dict[str, Any]:
-    """Normalize one paragraph import item from text/json payloads."""
+    """归一化来自文本或 JSON 载荷的一条段落导入项。"""
 
     if isinstance(item, str):
         content = str(item or "")
@@ -143,9 +157,9 @@ def normalize_paragraph_import_item(
             "knowledge_type": knowledge_type.value,
             "source": str(default_source or "").strip(),
             "time_meta": None,
+            "person_ids": [],
             "entities": [],
             "relations": [],
-            "person_ids": [],
         }
 
     if not isinstance(item, dict) or "content" not in item:
@@ -196,13 +210,13 @@ def normalize_paragraph_import_item(
         "knowledge_type": knowledge_type.value,
         "source": source,
         "time_meta": normalized_time_meta if normalized_time_meta else None,
+        "person_ids": _normalize_person_ids(item.get("person_ids")),
         "entities": _normalize_entities(item.get("entities")),
         "relations": _normalize_relations(item.get("relations")),
-        "person_ids": _normalize_person_ids(item.get("person_ids")),
     }
 
 
 def normalize_summary_knowledge_type(value: Any) -> KnowledgeType:
-    """Normalize config-driven summary knowledge type."""
+    """归一化由配置指定的摘要知识类型。"""
 
     return resolve_stored_knowledge_type(value, content="")

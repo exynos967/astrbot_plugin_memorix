@@ -2,7 +2,7 @@
 时间解析工具。
 
 约束：
-1. 查询参数（Action/Command/Tool）优先接受结构化绝对时间：
+1. 查询参数（Command/Tool）优先接受结构化绝对时间：
    - YYYY/MM/DD
    - YYYY/MM/DD HH:mm
    同时兼容常见自然语言时间短语（如“昨天”“上周”“最近”）。

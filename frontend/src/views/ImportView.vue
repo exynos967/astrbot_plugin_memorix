@@ -1,9 +1,5 @@
 <script setup lang="ts">
-// Import 组合面：左列导入任务 + 任务状态，右列摘要任务。
-// 从 legacy view-import（index.html 行 2244-2279）迁移为子组件组合。
-// 修复 legacy 缺陷：legacy 无任务轮询且无定时器清理。store 已内建轮询，
-// 本 view 仅在卸载时调 store.stopPolling() 清理定时器，杜绝泄漏。
-// 挂载时不自动启动任务（无遗留任务可恢复）。
+// Import 组合面：左栏「导入任务创建 + 结构化任务监控与分块管理」，右栏「会话摘要任务」。
 import { onMounted, onBeforeUnmount } from "vue";
 import { useTaskStore } from "@/stores/task";
 import ImportTaskPanel from "@/components/import/ImportTaskPanel.vue";
@@ -13,23 +9,21 @@ import SummaryTaskPanel from "@/components/import/SummaryTaskPanel.vue";
 const store = useTaskStore();
 
 onMounted(() => {
-  // 标记视图活跃，允许 createImport/createSummary 在 in-flight 完成后启动轮询。
   store.setViewActive(true);
 });
 
 onBeforeUnmount(() => {
-  // 标记离开 + 清理定时器，杜绝创建 in-flight 完成后泄漏轮询。
   store.setViewActive(false);
 });
 </script>
 
 <template>
   <section class="view-import grid-2">
-    <div>
+    <div class="import-col">
       <ImportTaskPanel />
       <TaskStatusPanel />
     </div>
-    <div>
+    <div class="import-col">
       <SummaryTaskPanel />
     </div>
   </section>
@@ -38,12 +32,17 @@ onBeforeUnmount(() => {
 <style scoped>
 .view-import {
   align-items: start;
+  gap: 14px;
 }
 
-.view-import > div {
+.import-col {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 14px;
   min-width: 0;
+}
+
+.view-import :deep(.band) {
+  margin-top: 0;
 }
 </style>

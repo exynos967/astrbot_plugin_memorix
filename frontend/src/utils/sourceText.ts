@@ -27,9 +27,13 @@ export function paragraphHashShort(hash: string | undefined): string {
 }
 
 export function sourceCountLabel(item: SourceSummaryItem): string {
-  return item.count != null ? `${item.count} 段` : "";
+  return item.count != null ? `${item.count} 条段落` : "";
 }
 
 export function sourceUpdatedLabel(item: SourceSummaryItem): string {
-  return item.last_updated != null ? formatTs(item.last_updated) : "";
+  return item.last_updated != null ? `更新于 ${formatTs(item.last_updated)}` : "";
+}
+
+export function paragraphCreatedLabel(item: SourceParagraphItem): string {
+  return item.created_at != null ? formatTs(item.created_at) : "";
 }

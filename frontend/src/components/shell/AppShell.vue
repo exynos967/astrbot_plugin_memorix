@@ -1,23 +1,28 @@
 <script setup lang="ts">
-// 应用外壳：侧栏 + 顶栏 + 内容区（<RouterView />）。
-// 从 legacy .app/.shell/.workspace 结构（index.html 行 2018-2051）迁移。
+// 应用外壳：无障碍跳链 + 侧栏 + 顶栏 + 主工作区（含路由视图单次入场动效）。
+// 在外壳挂载时统一执行 loadScopes()，保证直达任意路由时均立刻持有 resolvedScope 与可选作用域列表。
+import { onMounted } from "vue";
+import { useScope } from "@/composables/useScope";
 import Sidebar from "./Sidebar.vue";
 import TopBar from "./TopBar.vue";
+
+const { loadScopes } = useScope();
+
+onMounted(() => {
+  void loadScopes();
+});
 </script>
 
 <template>
   <div class="app">
-    <div class="app-title">
-      <strong>Memorix</strong>
-      <span>AstrBot embedded dashboard</span>
-    </div>
+    <a class="skip-link" href="#workspace-main">跳至主内容</a>
     <div class="shell">
       <Sidebar />
       <main class="workspace">
         <TopBar />
-        <div class="view-stack">
-          <RouterView v-slot="{ Component }">
-            <component :is="Component" />
+        <div id="workspace-main" class="view-stack" tabindex="-1">
+          <RouterView v-slot="{ Component, route }">
+            <component :is="Component" :key="route.path" class="view-enter" />
           </RouterView>
         </div>
       </main>
@@ -30,27 +35,6 @@ import TopBar from "./TopBar.vue";
   display: flex;
   flex-direction: column;
   height: 100%;
-}
-
-.app-title {
-  padding: 10px 24px;
-  display: flex;
-  align-items: baseline;
-  gap: 12px;
-  border-bottom: 1px solid var(--hairline);
-  background: var(--shell);
-  backdrop-filter: var(--blur-soft);
-}
-
-.app-title strong {
-  font-size: 13px;
-  letter-spacing: 1px;
-  color: var(--accent-ink);
-}
-
-.app-title span {
-  font-size: 11px;
-  color: var(--muted-2);
 }
 
 .shell {
@@ -72,17 +56,50 @@ import TopBar from "./TopBar.vue";
   min-height: 0;
   display: flex;
   flex-direction: column;
-  overflow: auto;
-  padding: 24px 28px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 20px 24px 28px;
+}
+
+.view-stack:focus {
+  outline: none;
 }
 
 .view-stack--fixed {
   overflow: hidden;
 }
 
-/* 不设 :deep(> *) flex:1 / min-height:0——flex 列子项 min-height:0 会压制
- * 默认 min-height:auto（内容最小高度），子项 flex-shrink:1 配合 → 子项被压缩到
- * 容器高度，view-stack overflow:auto 永远看不到溢出 → 滚动条不出、内容截断。
- * 各 view 自己管理高度：GraphView（.view-graph flex:1 1 0 + min-height:0）
- * 需要撑满画布，其他 view 内容自然撑高，由 view-stack 滚动。 */
+/* 路由挂载单次入场（220ms，完成后不残留 transform 避免破坏后代 fixed 定位） */
+:deep(.view-enter) {
+  animation: viewEnter 220ms var(--ease-enter);
+}
+
+@keyframes viewEnter {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :deep(.view-enter) {
+    animation: none;
+  }
+}
+
+@media (max-width: 860px) {
+  .view-stack {
+    padding: 16px 16px 24px;
+  }
+}
+
+@media (max-width: 480px) {
+  .view-stack {
+    padding: 12px 12px 20px;
+  }
+}
 </style>

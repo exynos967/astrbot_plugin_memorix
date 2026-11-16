@@ -13,30 +13,18 @@ import {
 import type { GraphEdge, GraphNode } from "@/services/graphApi";
 
 /**
- * vis-network 封装 composable：持有 network + DataSet（shallowRef，不 reactive 包装，
- * vis 无响应式原生支持，包装触发无限更新），暴露渲染/缩放/simulation/高亮/布局方法。
- *
- * 集中修复（与计划 Bug 映射表一致）：
- * - C1 loadGraph 白屏：renderGraph try/catch，失败抛出由 store 捕获 + 空状态降级。
- * - C3 once("stabilized") 泄漏：每次 renderGraph 前 off("stabilized")；onBeforeUnmount off 全部事件 + destroy。
- * - C4 simulation 无快照：renderGraph fit 后存节点坐标快照，restoreLayout 回滚。
- * - C6 ensureGraph 静默：initError ref + retryInit，失败不缓存 network。
- * - H1 双 fit 竞态：fitInFlight 互斥，进行中的 fit 完成前不启动新 fit。
- * - H2 autoFitTimer 未清：clearAutoFit 在 setZoom/focus/renderGraph 调用；onBeforeUnmount 清理。
- * - H3 暂停时 stabilize 无效：simulationRunning=false 时跳过 stabilize 直接 fit。
- * - updateLabelsByZoom 性能：RAF 节流合并多次缩放的标签更新。
- *
- * store 只持业务状态，network/DataSet 留本 composable。
+ * vis-network 封装 composable：持有 network + DataSet（shallowRef），
+ * 支持亮暗主题实时切换（监听 html[data-theme]）、点击空白画布重置选中与高亮、
+ * focusNode 联动同步选中态。
  */
 export interface UseVisNetworkOptions {
   onNodeSelect?: (nodeId: string) => void;
   onEdgeSelect?: (edgeId: string) => void;
+  onCanvasClear?: () => void;
 }
 
-/** useVisNetwork 返回类型（供子组件 inject 访问 vis 方法）。 */
 export type VisController = ReturnType<typeof useVisNetwork>;
 
-/** provide/inject key：GraphView 提供唯一 vis 控制器，子组件注入访问 zoom/focus/highlight 等。 */
 export const GRAPH_VIS_KEY: InjectionKey<VisController> = Symbol("graph-vis");
 
 const ZOOM_MIN = 0.35;
@@ -55,10 +43,11 @@ export function useVisNetwork(opts: UseVisNetworkOptions = {}) {
   const ready = shallowRef(false);
   const initError = shallowRef("");
 
-  let fitInFlight = false; // H1 互斥
-  let autoFitTimer: number | null = null; // H2
-  let labelRaf: number | null = null; // updateLabelsByZoom RAF 节流
-  let containerEl: HTMLElement | null = null; // 渲染容器引用，供 applyResponsiveOptions 读宽度
+  let fitInFlight = false;
+  let autoFitTimer: number | null = null;
+  let labelRaf: number | null = null;
+  let containerEl: HTMLElement | null = null;
+  let themeObserver: MutationObserver | null = null;
 
   function shouldAnimate(animated: boolean): boolean {
     return !!animated && !store.lowPerf && !prefersReducedMotion();
@@ -75,7 +64,42 @@ export function useVisNetwork(opts: UseVisNetworkOptions = {}) {
     }
   }
 
-  /** C6：创建 network 实例，失败置 initError 且不缓存。 */
+  /** 响应 html[data-theme] 变更，动态重绘节点/边与高亮配色。 */
+  function refreshThemeColors(): void {
+    const net = network.value;
+    const ns = nodes.value;
+    const es = edges.value;
+    if (!net || !ns || !es) return;
+    applyResponsiveOptions();
+    if (store.highlightedNode) {
+      highlightNeighborhood(store.highlightedNode);
+    } else {
+      const p = palette();
+      if (store.rawNodes.length) {
+        ns.update(store.rawNodes.map((n) => normalizeGraphNode(n, p)));
+      }
+      if (store.rawEdges.length) {
+        es.update(store.rawEdges.map((e) => normalizeGraphEdge(e, p)));
+      }
+      updateLabelsByZoom();
+    }
+    net.redraw();
+  }
+
+  function ensureThemeObserver(): void {
+    if (themeObserver || typeof document === "undefined" || typeof MutationObserver === "undefined") {
+      return;
+    }
+    themeObserver = new MutationObserver(() => {
+      refreshThemeColors();
+    });
+    themeObserver.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["data-theme"],
+    });
+  }
+
+  /** 创建 network 实例，失败置 initError 且不缓存。 */
   function ensureGraph(container: HTMLElement): boolean {
     if (network.value) return true;
     try {
@@ -93,6 +117,17 @@ export function useVisNetwork(opts: UseVisNetworkOptions = {}) {
           opts.onNodeSelect?.(String(params.nodes[0]));
         } else if (params.edges && params.edges.length) {
           opts.onEdgeSelect?.(String(params.edges[0]));
+        } else {
+          // 点击空白画布：清空节点/边选中状态并重置邻域高亮
+          store.selectedNode = "";
+          store.selectedEdgeId = "";
+          resetHighlight();
+          try {
+            net.unselectAll();
+          } catch {
+            /* ignore */
+          }
+          opts.onCanvasClear?.();
         }
       });
       net.on("zoom", (params: { scale: number }) => {
@@ -102,11 +137,11 @@ export function useVisNetwork(opts: UseVisNetworkOptions = {}) {
       network.value = net;
       ready.value = true;
       initError.value = "";
+      ensureThemeObserver();
       return true;
     } catch (err) {
       initError.value = err instanceof Error ? err.message : String(err);
       ready.value = false;
-      // 失败不缓存：清空引用，retryInit 可重建
       network.value = null;
       nodes.value = null;
       edges.value = null;
@@ -118,7 +153,13 @@ export function useVisNetwork(opts: UseVisNetworkOptions = {}) {
     const p = palette();
     return {
       autoResize: true,
-      interaction: { hover: true, tooltipDelay: 120, multiselect: false, zoomView: true, zoomSpeed: 0.6 },
+      interaction: {
+        hover: true,
+        tooltipDelay: 120,
+        multiselect: false,
+        zoomView: true,
+        zoomSpeed: 0.6,
+      },
       physics: {
         enabled: store.simulationRunning,
         solver: "forceAtlas2Based",
@@ -128,13 +169,23 @@ export function useVisNetwork(opts: UseVisNetworkOptions = {}) {
         shape: "dot",
         size: 16,
         borderWidth: 2,
-        color: { background: "#1da7e7", border: "#ffffff", highlight: { background: "#30c5c8", border: "#1f2c3f" } },
-        font: { color: p.nodeFont, size: 13, face: "Segoe UI" },
+        color: {
+          background: p.nodeBg,
+          border: p.nodeBorder,
+          highlight: { background: p.highlightFirstBg, border: p.highlightCenterBorder },
+        },
+        font: { color: p.nodeFont, size: 13, face: p.fontFace },
       },
       edges: {
         arrows: { to: { enabled: true, scaleFactor: 0.55 } },
         color: { color: p.edgeColor, highlight: p.edgeHighlight },
-        font: { color: p.edgeFont, size: 11, strokeWidth: 3, strokeColor: p.edgeStroke },
+        font: {
+          color: p.edgeFont,
+          size: 11,
+          strokeWidth: 3,
+          strokeColor: p.edgeStroke,
+          face: p.fontFace,
+        },
         smooth: { enabled: true, type: "dynamic" },
       },
     };
@@ -157,13 +208,28 @@ export function useVisNetwork(opts: UseVisNetworkOptions = {}) {
       },
       nodes: {
         size: compact ? 11 : 16,
-        font: { color: p.nodeFont, size: compact ? 10 : 13, face: "Segoe UI" },
-        shadow: { enabled: !store.lowPerf, color: "rgba(15, 39, 64, 0.15)", size: 8 },
+        color: {
+          background: p.nodeBg,
+          border: p.nodeBorder,
+          highlight: { background: p.highlightFirstBg, border: p.highlightCenterBorder },
+        },
+        font: { color: p.nodeFont, size: compact ? 10 : 13, face: p.fontFace },
+        shadow: {
+          enabled: !store.lowPerf,
+          color: p.nodeShadow,
+          size: 8,
+        },
       },
       edges: {
         arrows: { to: { enabled: true, scaleFactor: compact ? 0.42 : 0.55 } },
         color: { color: p.edgeColor, highlight: p.edgeHighlight },
-        font: { color: p.edgeFont, size: compact ? 9 : 11, strokeWidth: 3, strokeColor: p.edgeStroke },
+        font: {
+          color: p.edgeFont,
+          size: compact ? 9 : 11,
+          strokeWidth: 3,
+          strokeColor: p.edgeStroke,
+          face: p.fontFace,
+        },
         smooth: store.lowPerf ? false : { enabled: true, type: "dynamic" },
       },
     } as never);
@@ -179,7 +245,6 @@ export function useVisNetwork(opts: UseVisNetworkOptions = {}) {
     return true;
   }
 
-  /** RAF 节流标签更新（修 updateLabelsByZoom 性能）。 */
   function scheduleUpdateLabels(): void {
     if (labelRaf != null) return;
     labelRaf = window.requestAnimationFrame(() => {
@@ -200,14 +265,17 @@ export function useVisNetwork(opts: UseVisNetworkOptions = {}) {
   function fitGraphView(animated = true): void {
     const net = network.value;
     if (!net) return;
-    // H1 互斥：进行中的 fit 完成前不启动新 fit
     if (fitInFlight) return;
     fitInFlight = true;
     window.requestAnimationFrame(() => {
       try {
         syncNetworkSize();
         net.redraw();
-        net.fit({ animation: shouldAnimate(animated) ? { duration: 320, easingFunction: "easeInOutQuad" } : false });
+        net.fit({
+          animation: shouldAnimate(animated)
+            ? { duration: 320, easingFunction: "easeInOutQuad" }
+            : false,
+        });
         const delay = shouldAnimate(animated) ? 360 : 40;
         window.setTimeout(() => {
           store.zoom = clampZoom(net.getScale());
@@ -243,7 +311,9 @@ export function useVisNetwork(opts: UseVisNetworkOptions = {}) {
     net.moveTo({
       position: net.getViewPosition(),
       scale: nextScale,
-      animation: shouldAnimate(animated) ? { duration: 180, easingFunction: "easeInOutQuad" } : false,
+      animation: shouldAnimate(animated)
+        ? { duration: 180, easingFunction: "easeInOutQuad" }
+        : false,
     });
     store.zoom = nextScale;
   }
@@ -252,9 +322,12 @@ export function useVisNetwork(opts: UseVisNetworkOptions = {}) {
     setZoom((store.zoom || 1) + delta, true);
   }
 
+  /** 聚焦指定节点并同步更新详情选中态（清空边选中）。 */
   function focusNode(nodeId: string, scale = 1.4): void {
     const net = network.value;
     if (!net || !nodeId) return;
+    store.selectedNode = nodeId;
+    store.selectedEdgeId = "";
     store.userZoomed = true;
     clearAutoFit();
     net.selectNodes([nodeId]);
@@ -266,18 +339,14 @@ export function useVisNetwork(opts: UseVisNetworkOptions = {}) {
   }
 
   function selectNode(nodeId: string): void {
+    if (!nodeId) return;
+    store.selectedNode = nodeId;
+    store.selectedEdgeId = "";
     network.value?.selectNodes([nodeId]);
   }
 
-  /**
-   * 渲染图谱（C1/C3/H2/H3/C4）。
-   * 流程：ensureGraph → applyResponsiveOptions → clear/add → updateLabels → fit + stabilized once + autoFit → 存快照。
-   * 由 GraphView 在 store.loadGraph 成功后调用，传入容器。
-   */
   function renderGraph(container: HTMLElement): void {
     containerEl = container;
-    // ensureGraph 失败时 throw，让 GraphView.renderWhenReady 的 catch 捕获并写 store.initError，
-    // 走「居中提示 + 重试」分支（原仅 return，错误被吞，UI 陷入无重试入口的空状态）。
     if (!ensureGraph(container)) {
       throw new Error(initError.value || "图谱初始化失败");
     }
@@ -290,7 +359,6 @@ export function useVisNetwork(opts: UseVisNetworkOptions = {}) {
       clearAutoFit();
       applyResponsiveOptions();
       syncNetworkSize();
-      // C3：每次渲染前 off stabilized，避免旧 handler 泄漏
       net.off("stabilized");
       ns.clear();
       es.clear();
@@ -300,8 +368,6 @@ export function useVisNetwork(opts: UseVisNetworkOptions = {}) {
       ns.add(rawNodes.map((n) => normalizeGraphNode(n, p)));
       es.add(rawEdges.map((e) => normalizeGraphEdge(e, p)));
       updateLabelsByZoom();
-      // C4：fit 完成后才存坐标快照（原 saveSnapshot 同步执行存到 stabilize 前中间态）。
-      // 运行时：stabilized 后 fit + 存快照；暂停时：autoFit 兜底 fit 后存。
       if (store.simulationRunning) {
         net.once("stabilized", () => {
           if (!store.userZoomed) fitGraphView(true);
@@ -309,15 +375,12 @@ export function useVisNetwork(opts: UseVisNetworkOptions = {}) {
         });
       }
       fitGraphView(true);
-      // H2：autoFit 定时器，650ms 后若用户未手动缩放再 fit 一次（纠正 stabilize 后位移）
       autoFitTimer = window.setTimeout(() => {
         autoFitTimer = null;
         if (!store.userZoomed) fitGraphView(false);
-        // 暂停时无 stabilized 事件，在此兜底存快照；运行时 stabilized 已存，重复存无害（同坐标）。
         if (!store.simulationRunning) saveSnapshot();
       }, AUTO_FIT_DELAY);
     } catch (err) {
-      // C1：渲染异常向上抛，由 GraphView 捕获进 store.initError
       throw err instanceof Error ? err : new Error(String(err));
     }
   }
@@ -337,13 +400,14 @@ export function useVisNetwork(opts: UseVisNetworkOptions = {}) {
     store.saveLayoutSnapshot(positions);
   }
 
-  /** C4：从快照恢复节点坐标。 */
   function restoreLayout(): void {
     const net = network.value;
     const snapshot = store.layoutSnapshot;
-    if (!net || !snapshot || Object.keys(snapshot).length === 0) return;
+    if (!net || !snapshot || Object.keys(snapshot).length === 0) {
+      fitGraphView(true);
+      return;
+    }
     net.once("beforeDrawing", () => {
-      // vis-network 无批量 move，逐个 moveNode（节点数有限可接受）
       Object.entries(snapshot).forEach(([id, pos]) => {
         try {
           net.moveNode(id, pos.x, pos.y);
@@ -373,6 +437,7 @@ export function useVisNetwork(opts: UseVisNetworkOptions = {}) {
     applyResponsiveOptions();
   }
 
+  /** 亮暗双主题自适应邻域高亮（读取 html[data-theme="dark"] 调色板）。 */
   function highlightNeighborhood(nodeId: string): void {
     const net = network.value;
     const ns = nodes.value;
@@ -394,42 +459,74 @@ export function useVisNetwork(opts: UseVisNetworkOptions = {}) {
           ...base,
           label: node.label || node.id,
           size: 23,
-          color: { background: "#0f5fc8", border: "#ffffff" },
-          font: { color: "#0f1111", size: 14, face: "Segoe UI" },
+          color: { background: p.highlightCenterBg, border: p.highlightCenterBorder },
+          font: { color: p.highlightCenterFont, size: 14, face: p.fontFace },
         };
       }
       if (isFirst) {
         return {
           ...base,
           label: node.label || node.id,
-          color: { background: "#54b7ff", border: "#ffffff" },
-          font: { color: "#1b2736", size: 13, face: "Segoe UI" },
+          color: { background: p.highlightFirstBg, border: p.highlightFirstBorder },
+          font: { color: p.highlightFirstFont, size: 13, face: p.fontFace },
         };
       }
       if (isSecond) {
         return {
           ...base,
-          color: { background: "#dcecff", border: "#ffffff" },
-          font: { color: "#73859a", size: 11, face: "Segoe UI" },
+          color: { background: p.highlightSecondBg, border: p.highlightSecondBorder },
+          font: { color: p.highlightSecondFont, size: 11, face: p.fontFace },
         };
       }
       return {
         ...base,
         label: " ",
-        color: { background: "#eef2f4", border: "#ffffff" },
-        font: { color: "#b5bec7", size: 10, face: "Segoe UI" },
+        color: { background: p.dimNodeBg, border: p.dimNodeBorder },
+        font: { color: p.dimNodeFont, size: 10, face: p.fontFace },
       };
     });
     const edgeUpdates = store.rawEdges.map((edge) => {
       const base = normalizeGraphEdge(edge, p) as Record<string, unknown>;
       const touchesCenter = edge.from === nodeId || edge.to === nodeId;
       const withinFirst = first.has(edge.from) && first.has(edge.to);
-      if (touchesCenter) return { ...base, color: { color: "#0f5fc8", highlight: "#0f5fc8" }, width: 3 };
-      if (withinFirst) return { ...base, color: { color: "#77bdf6", highlight: "#2388ff" }, width: 1.8 };
+      if (touchesCenter) {
+        return {
+          ...base,
+          color: { color: p.highlightCenterBg, highlight: p.edgeHighlight },
+          width: 3,
+          font: {
+            color: p.highlightFirstFont,
+            size: 11,
+            strokeWidth: 3,
+            strokeColor: p.edgeStroke,
+            face: p.fontFace,
+          },
+        };
+      }
+      if (withinFirst) {
+        return {
+          ...base,
+          color: { color: p.highlightFirstBg, highlight: p.edgeHighlight },
+          width: 1.8,
+          font: {
+            color: p.edgeFont,
+            size: 10,
+            strokeWidth: 3,
+            strokeColor: p.edgeStroke,
+            face: p.fontFace,
+          },
+        };
+      }
       return {
         ...base,
-        color: { color: "rgba(190, 201, 212, 0.35)" },
-        font: { color: "#c5cdd5", size: 10, strokeWidth: 3, strokeColor: "#ffffff" },
+        color: { color: p.dimEdgeColor },
+        font: {
+          color: p.dimEdgeFont,
+          size: 10,
+          strokeWidth: 3,
+          strokeColor: p.edgeStroke,
+          face: p.fontFace,
+        },
       };
     });
     store.highlightedNode = nodeId;
@@ -449,15 +546,17 @@ export function useVisNetwork(opts: UseVisNetworkOptions = {}) {
     updateLabelsByZoom();
   }
 
-  /** C6：重试初始化。 */
   function retryInit(container: HTMLElement): void {
     destroy();
     renderGraph(container);
   }
 
-  /** C3：清理所有事件 + 销毁 network。 */
   function destroy(): void {
     clearAutoFit();
+    if (themeObserver) {
+      themeObserver.disconnect();
+      themeObserver = null;
+    }
     if (labelRaf != null) {
       window.cancelAnimationFrame(labelRaf);
       labelRaf = null;

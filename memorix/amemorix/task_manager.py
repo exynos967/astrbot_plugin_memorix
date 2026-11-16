@@ -61,11 +61,11 @@ class TaskManager:
         logger.info("TaskManager started with %s workers", len(self._workers))
 
     async def stop(self) -> None:
+        from ..core.utils.async_work import cancel_and_wait_for_tasks
+
         self._stopping = True
-        for task in self._workers:
-            task.cancel()
         if self._workers:
-            await asyncio.gather(*self._workers, return_exceptions=True)
+            await cancel_and_wait_for_tasks(self._workers, operation="TaskManager.stop")
         self._workers.clear()
         logger.info("TaskManager stopped")
 
@@ -190,7 +190,8 @@ class TaskManager:
         context_length: Optional[int] = None,
     ) -> Dict[str, Any]:
         async with self._bulk_summary_lock:
-            return await self._perform_bulk_summary_import(limit=limit, context_length=context_length)
+            with self.ctx.scope_shims():
+                return await self._perform_bulk_summary_import(limit=limit, context_length=context_length)
 
     async def _perform_bulk_summary_import(
         self,
@@ -286,28 +287,28 @@ class TaskManager:
             task_id = ""
             try:
                 task_id, payload = await self.import_queue.get()
-                existing = self.ctx.metadata_store.get_async_task(task_id)
-                if existing and existing.get("cancel_requested"):
+                with self.ctx.scope_shims():
+                    existing = self.ctx.metadata_store.get_async_task(task_id)
+                    if existing and existing.get("cancel_requested"):
+                        self.ctx.metadata_store.update_async_task(
+                            task_id=task_id,
+                            status=TASK_STATUS_CANCELED,
+                            finished_at=datetime.datetime.now().timestamp(),
+                        )
+                        continue
+
+                    now = datetime.datetime.now().timestamp()
+                    self.ctx.metadata_store.update_async_task(task_id=task_id, status=TASK_STATUS_RUNNING, started_at=now)
+                    mode = str(payload.get("mode", "text"))
+                    body = payload.get("payload")
+                    options = payload.get("options") if isinstance(payload.get("options"), dict) else {}
+                    result = await self.import_service.run_import(mode=mode, payload=body, options=options)
                     self.ctx.metadata_store.update_async_task(
                         task_id=task_id,
-                        status=TASK_STATUS_CANCELED,
+                        status=TASK_STATUS_SUCCEEDED,
+                        result=result,
                         finished_at=datetime.datetime.now().timestamp(),
                     )
-                    self.import_queue.task_done()
-                    continue
-
-                now = datetime.datetime.now().timestamp()
-                self.ctx.metadata_store.update_async_task(task_id=task_id, status=TASK_STATUS_RUNNING, started_at=now)
-                mode = str(payload.get("mode", "text"))
-                body = payload.get("payload")
-                options = payload.get("options") if isinstance(payload.get("options"), dict) else {}
-                result = await self.import_service.run_import(mode=mode, payload=body, options=options)
-                self.ctx.metadata_store.update_async_task(
-                    task_id=task_id,
-                    status=TASK_STATUS_SUCCEEDED,
-                    result=result,
-                    finished_at=datetime.datetime.now().timestamp(),
-                )
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -326,54 +327,58 @@ class TaskManager:
     async def _summary_worker(self, worker_idx: int) -> None:
         while not self._stopping:
             task_id = ""
+            payload: Dict[str, Any] = {}
             try:
                 task_id, payload = await self.summary_queue.get()
-                existing = self.ctx.metadata_store.get_async_task(task_id)
-                if existing and existing.get("cancel_requested"):
+                with self.ctx.scope_shims():
+                    existing = self.ctx.metadata_store.get_async_task(task_id)
+                    if existing and existing.get("cancel_requested"):
+                        self.ctx.metadata_store.update_async_task(
+                            task_id=task_id,
+                            status=TASK_STATUS_CANCELED,
+                            finished_at=datetime.datetime.now().timestamp(),
+                        )
+                        continue
+
                     self.ctx.metadata_store.update_async_task(
                         task_id=task_id,
-                        status=TASK_STATUS_CANCELED,
+                        status=TASK_STATUS_RUNNING,
+                        started_at=datetime.datetime.now().timestamp(),
+                    )
+                    from ..core.utils.chat_migration_gate import get_chat_migration_gate
+
+                    session_id = str(payload.get("session_id", "")).strip() or uuid.uuid4().hex
+                    messages = payload.get("messages")
+                    if not isinstance(messages, list):
+                        messages = []
+                    source = str(payload.get("source", f"summary:{session_id}"))
+                    context_length = int(payload.get("context_length", self.ctx.get_config("summarization.context_length", 50)))
+                    async with get_chat_migration_gate().activity(session_id):
+                        result = await self.summary_service.import_from_transcript(
+                            session_id=session_id,
+                            messages=messages,
+                            source=source,
+                            context_length=context_length,
+                        )
+                    status = TASK_STATUS_SUCCEEDED if result.get("success") else TASK_STATUS_FAILED
+                    if status == TASK_STATUS_SUCCEEDED:
+                        self.ctx.metadata_store.mark_transcript_summary_complete(
+                            session_id=session_id,
+                            last_message_created_at=payload.get("last_message_created_at"),
+                            task_id=task_id,
+                            metadata={
+                                "source": source,
+                                "auto_import": bool(payload.get("auto_import")),
+                                "context_length": context_length,
+                            },
+                        )
+                    self.ctx.metadata_store.update_async_task(
+                        task_id=task_id,
+                        status=status,
+                        result=result,
+                        error_message="" if result.get("success") else str(result.get("message", "")),
                         finished_at=datetime.datetime.now().timestamp(),
                     )
-                    self.summary_queue.task_done()
-                    continue
-
-                self.ctx.metadata_store.update_async_task(
-                    task_id=task_id,
-                    status=TASK_STATUS_RUNNING,
-                    started_at=datetime.datetime.now().timestamp(),
-                )
-                session_id = str(payload.get("session_id", "")).strip() or uuid.uuid4().hex
-                messages = payload.get("messages")
-                if not isinstance(messages, list):
-                    messages = []
-                source = str(payload.get("source", f"summary:{session_id}"))
-                context_length = int(payload.get("context_length", self.ctx.get_config("summarization.context_length", 50)))
-                result = await self.summary_service.import_from_transcript(
-                    session_id=session_id,
-                    messages=messages,
-                    source=source,
-                    context_length=context_length,
-                )
-                status = TASK_STATUS_SUCCEEDED if result.get("success") else TASK_STATUS_FAILED
-                if status == TASK_STATUS_SUCCEEDED:
-                    self.ctx.metadata_store.mark_transcript_summary_complete(
-                        session_id=session_id,
-                        last_message_created_at=payload.get("last_message_created_at"),
-                        task_id=task_id,
-                        metadata={
-                            "source": source,
-                            "auto_import": bool(payload.get("auto_import")),
-                            "context_length": context_length,
-                        },
-                    )
-                self.ctx.metadata_store.update_async_task(
-                    task_id=task_id,
-                    status=status,
-                    result=result,
-                    error_message="" if result.get("success") else str(result.get("message", "")),
-                    finished_at=datetime.datetime.now().timestamp(),
-                )
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -412,40 +417,43 @@ class TaskManager:
                 if not bool(self.ctx.get_config("memory.enabled", True)):
                     continue
 
-                half_life = float(self.ctx.get_config("memory.half_life_hours", 24.0))
-                if half_life > 0:
-                    factor = 0.5 ** (interval_h / half_life)
-                    self.ctx.graph_store.decay(factor)
+                with self.ctx.scope_shims():
+                    half_life = float(self.ctx.get_config("memory.half_life_hours", 24.0))
+                    if half_life > 0:
+                        factor = 0.5 ** (interval_h / half_life)
+                        self.ctx.graph_store.decay(factor)
 
-                prune_threshold = float(self.ctx.get_config("memory.prune_threshold", 0.1))
-                low_edges = self.ctx.graph_store.get_low_weight_edges(prune_threshold)
-                hashes_to_freeze: List[str] = []
-                edges_to_deactivate = []
-                for src, tgt in low_edges:
-                    edge_hashes = list(self.ctx.graph_store.get_relation_hashes_for_edge(src, tgt))
-                    if not edge_hashes:
-                        continue
-                    status = self.ctx.metadata_store.get_relation_status_batch(edge_hashes)
-                    protected = any(
-                        (v.get("is_pinned") or v.get("is_permanent") or ((v.get("protected_until") or 0) > datetime.datetime.now().timestamp()))
-                        for v in status.values()
-                    )
-                    if not protected:
-                        hashes_to_freeze.extend(edge_hashes)
-                        edges_to_deactivate.append((src, tgt))
+                    prune_threshold = float(self.ctx.get_config("memory.prune_threshold", 0.1))
+                    low_edges = self.ctx.graph_store.get_low_weight_edges(prune_threshold)
+                    hashes_to_freeze: List[str] = []
+                    edges_to_deactivate = []
+                    for src, tgt in low_edges:
+                        edge_hashes = list(self.ctx.graph_store.get_relation_hashes_for_edge(src, tgt))
+                        if not edge_hashes:
+                            continue
+                        status = self.ctx.metadata_store.get_relation_status_batch(edge_hashes)
+                        protected = any(
+                            (v.get("is_pinned") or v.get("is_permanent") or ((v.get("protected_until") or 0) > datetime.datetime.now().timestamp()))
+                            for v in status.values()
+                        )
+                        if not protected:
+                            hashes_to_freeze.extend(edge_hashes)
+                            edges_to_deactivate.append((src, tgt))
 
-                if hashes_to_freeze:
-                    self.ctx.metadata_store.mark_relations_inactive(hashes_to_freeze)
-                    self.ctx.graph_store.deactivate_edges(edges_to_deactivate)
+                    if hashes_to_freeze:
+                        self.ctx.metadata_store.mark_relations_inactive(hashes_to_freeze)
+                        self.ctx.graph_store.deactivate_edges(edges_to_deactivate)
 
-                freeze_hours = float(self.ctx.get_config("memory.freeze_duration_hours", 24.0))
-                cutoff = datetime.datetime.now().timestamp() - max(1.0, freeze_hours * 3600.0)
-                expired = self.ctx.metadata_store.get_prune_candidates(cutoff)
-                if expired:
-                    from .services.delete_service import DeleteService
+                    freeze_hours = float(self.ctx.get_config("memory.freeze_duration_hours", 24.0))
+                    cutoff = datetime.datetime.now().timestamp() - max(1.0, freeze_hours * 3600.0)
+                    expired = self.ctx.metadata_store.get_prune_candidates(cutoff)
+                    if expired:
+                        from .services.delete_service import DeleteService
 
-                    await DeleteService(self.ctx).execute("relation", expired, reason="freeze_expired", requested_by="maintenance")
-                await asyncio.to_thread(self.ctx.graph_store.save)
+                        await DeleteService(self.ctx).execute("relation", expired, reason="freeze_expired", requested_by="maintenance")
+                    from ..core.utils.async_work import cancellation_safe_to_thread
+
+                    await cancellation_safe_to_thread(self.ctx.graph_store.save)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -462,24 +470,25 @@ class TaskManager:
                 if service is None or not hasattr(service, "backfill_missing_vectors"):
                     continue
 
-                batch_size = int(self.ctx.get_config("retrieval.paragraph_vectorization.backfill_batch_size", 50))
-                scan_multiplier = int(
-                    self.ctx.get_config("retrieval.paragraph_vectorization.backfill_scan_multiplier", 20)
-                )
-                result = await service.backfill_missing_vectors(
-                    batch_size=max(1, batch_size),
-                    scan_limit=max(1, batch_size) * max(1, scan_multiplier),
-                )
-                if (
-                    int(result.get("written", 0) or 0) > 0
-                    or int(result.get("already_exists", 0) or 0) > 0
-                    or result.get("failed")
-                ):
-                    logger.info("paragraph vector backfill result: %s", result)
-                    try:
-                        await asyncio.to_thread(self.ctx.vector_store.save)
-                    except Exception as exc:
-                        logger.warning("Paragraph vector backfill save failed: %s", exc)
+                with self.ctx.scope_shims():
+                    batch_size = int(self.ctx.get_config("retrieval.paragraph_vectorization.backfill_batch_size", 50))
+                    scan_multiplier = int(
+                        self.ctx.get_config("retrieval.paragraph_vectorization.backfill_scan_multiplier", 20)
+                    )
+                    result = await service.backfill_missing_vectors(
+                        batch_size=max(1, batch_size),
+                        scan_limit=max(1, batch_size) * max(1, scan_multiplier),
+                    )
+                    if (
+                        int(result.get("written", 0) or 0) > 0
+                        or int(result.get("already_exists", 0) or 0) > 0
+                        or result.get("failed")
+                    ):
+                        logger.info("paragraph vector backfill result: %s", result)
+                        try:
+                            await self.ctx.save_all()
+                        except Exception as exc:
+                            logger.warning("Paragraph vector backfill save failed: %s", exc)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -493,25 +502,26 @@ class TaskManager:
                 if not bool(self.ctx.get_config("person_profile.enabled", True)):
                     continue
 
-                active_window_h = float(self.ctx.get_config("person_profile.active_window_hours", 72.0))
-                active_after = datetime.datetime.now().timestamp() - max(1.0, active_window_h * 3600.0)
-                limit = int(self.ctx.get_config("person_profile.max_refresh_per_cycle", 50))
-                top_k = int(self.ctx.get_config("person_profile.top_k_evidence", 12))
+                with self.ctx.scope_shims():
+                    active_window_h = float(self.ctx.get_config("person_profile.active_window_hours", 72.0))
+                    active_after = datetime.datetime.now().timestamp() - max(1.0, active_window_h * 3600.0)
+                    limit = int(self.ctx.get_config("person_profile.max_refresh_per_cycle", 50))
+                    top_k = int(self.ctx.get_config("person_profile.top_k_evidence", 12))
 
-                pids = self.ctx.metadata_store.get_active_person_ids(
-                    active_after=active_after,
-                    limit=limit,
-                )
-                for pid in pids:
-                    try:
-                        await self.person_service.query(
-                            person_id=pid,
-                            top_k=top_k,
-                            force_refresh=False,
-                            source_note="task:person_profile_refresh",
-                        )
-                    except Exception:
-                        continue
+                    pids = self.ctx.metadata_store.get_active_person_ids(
+                        active_after=active_after,
+                        limit=limit,
+                    )
+                    for pid in pids:
+                        try:
+                            await self.person_service.query(
+                                person_id=pid,
+                                top_k=top_k,
+                                force_refresh=False,
+                                source_note="task:person_profile_refresh",
+                            )
+                        except Exception:
+                            continue
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -527,11 +537,12 @@ class TaskManager:
                 if not bool(self.ctx.get_config("episode.generation_enabled", True)):
                     continue
 
-                batch_size = int(self.ctx.get_config("episode.generation_batch_size", 20))
-                max_retry = int(self.ctx.get_config("episode.max_retry", 3))
-                await self.ctx.episode_service.process_rebuild_batch(
-                    limit=max(1, batch_size), max_retry=max(0, max_retry),
-                )
+                with self.ctx.scope_shims():
+                    batch_size = int(self.ctx.get_config("episode.generation_batch_size", 20))
+                    max_retry = int(self.ctx.get_config("episode.max_retry", 3))
+                    await self.ctx.episode_service.process_rebuild_batch(
+                        limit=max(1, batch_size), max_retry=max(1, max_retry),
+                    )
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -543,9 +554,10 @@ class TaskManager:
         service = MemoryProjectionService(self.ctx)
         while not self._stopping:
             try:
-                result = await service.reconcile()
-                if result["pending"]:
-                    logger.info("Memory index reconciliation pending=%s", result["pending"])
+                with self.ctx.scope_shims():
+                    result = await service.reconcile()
+                    if result["pending"]:
+                        logger.info("Memory index reconciliation pending=%s", result["pending"])
             except asyncio.CancelledError:
                 break
             except Exception as exc:

@@ -1,34 +1,69 @@
 <script setup lang="ts">
-// Memory 组合面：记忆状态 + 关系操作 + 回收站。
-// 从 legacy view-memory（index.html 行 2331-2352）迁移为子组件组合。
-// 挂载时加载 status + recycle（与 legacy setView("memory") 触发的 loadMemoryStatus+loadRecycle 一致）。
-import { onMounted } from "vue";
+// Memory 综合治理视图：记忆衰减状态 + 关系保护/置顶 + 双池向量维护 + 结构化事实台账 + 回收站 + 可恢复删除审计。
+import { nextTick, onMounted, ref, watch } from "vue";
+import { useRoute } from "vue-router";
 import MemoryStatusPanel from "@/components/memory/MemoryStatusPanel.vue";
 import MemoryActionsPanel from "@/components/memory/MemoryActionsPanel.vue";
+import VectorMaintenancePanel from "@/components/memory/VectorMaintenancePanel.vue";
+import FactLedgerPanel from "@/components/memory/FactLedgerPanel.vue";
 import RecyclePanel from "@/components/memory/RecyclePanel.vue";
 import DeleteOperationsPanel from "@/components/memory/DeleteOperationsPanel.vue";
 import { useMemoryStore } from "@/stores/memory";
+import { useScope } from "@/composables/useScope";
 import type { MemoryAction } from "@/services/memoryApi";
 
+const route = useRoute();
 const memory = useMemoryStore();
+const { loadScopes } = useScope();
+const vectorAnchorRef = ref<HTMLElement | null>(null);
 
-async function onRun(action: MemoryAction, id: string): Promise<void> {
-  await memory.runAction(action, id);
+function scrollToSectionIfRequested(): void {
+  if (route.query.section !== "vectors") return;
+  void nextTick(() => {
+    const prefersReduced =
+      typeof window !== "undefined" &&
+      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    vectorAnchorRef.value?.scrollIntoView({
+      behavior: prefersReduced ? "auto" : "smooth",
+      block: "start",
+    });
+  });
+}
+
+watch(
+  () => route.query.section,
+  () => {
+    scrollToSectionIfRequested();
+  },
+);
+
+async function onRun(action: MemoryAction, id: string, hours = 24): Promise<void> {
+  await memory.runAction(action, id, hours);
 }
 
 async function onRestore(hash: string, type: string): Promise<void> {
   await memory.restore(hash, type);
 }
 
-onMounted(() => {
-  void Promise.allSettled([memory.loadStatus(), memory.loadRecycle()]);
+onMounted(async () => {
+  scrollToSectionIfRequested();
+  await loadScopes();
+  await Promise.allSettled([
+    memory.loadStatus(),
+    memory.loadRecycle(),
+    memory.loadVectorStatus(),
+  ]);
 });
 </script>
 
 <template>
   <section class="view-memory">
     <div class="grid-2">
-      <MemoryStatusPanel :status="memory.status" />
+      <MemoryStatusPanel
+        :status="memory.status"
+        :loading="memory.loadingStatus"
+        @refresh="memory.loadStatus()"
+      />
       <MemoryActionsPanel
         :result="memory.lastAction"
         :result-id="memory.lastActionId"
@@ -37,11 +72,21 @@ onMounted(() => {
         @run="onRun"
       />
     </div>
-    <div class="toolbar" style="margin-top: 12px">
-      <button class="btn" :disabled="memory.loadingStatus" @click="memory.loadStatus()">刷新状态</button>
-      <button class="btn" :disabled="memory.loadingRecycle" @click="memory.loadRecycle()">刷新回收站</button>
+
+    <div ref="vectorAnchorRef">
+      <VectorMaintenancePanel />
     </div>
-    <RecyclePanel :items="memory.recycle" :busy="memory.actionBusy" @restore="onRestore" />
+
+    <FactLedgerPanel />
+
+    <RecyclePanel
+      :items="memory.recycle"
+      :busy="memory.actionBusy"
+      :loading="memory.loadingRecycle"
+      @restore="onRestore"
+      @refresh="memory.loadRecycle()"
+    />
+
     <DeleteOperationsPanel />
   </section>
 </template>
@@ -50,6 +95,10 @@ onMounted(() => {
 .view-memory {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 16px;
+}
+
+.view-memory > :deep(.band) {
+  margin-top: 0;
 }
 </style>

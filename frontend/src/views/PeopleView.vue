@@ -1,7 +1,7 @@
 <script setup lang="ts">
-// People 组合面：左列查询 + 画像，右列人工覆盖。
-// 从 legacy view-people（index.html 行 2281-2314）迁移为子组件组合。
-// "候选列表"已移除——下拉候选与右侧列表重复，直接在输入框下拉选人触发查询。
+// People 组合面：左栏可折叠「人物目录」+ 右栏「画像查询与证据链 + 人工画像覆盖 + 别名与事实账本」。
+import { onMounted, ref } from "vue";
+import PersonListPanel from "@/components/people/PersonListPanel.vue";
 import PersonQueryPanel from "@/components/people/PersonQueryPanel.vue";
 import PersonProfilePanel from "@/components/people/PersonProfilePanel.vue";
 import PersonOverridePanel from "@/components/people/PersonOverridePanel.vue";
@@ -9,32 +9,70 @@ import PersonMemoryPanel from "@/components/people/PersonMemoryPanel.vue";
 import { usePeopleStore } from "@/stores/people";
 
 const store = usePeopleStore();
+const showDirectory = ref(true);
+
+onMounted(() => {
+  void store.loadRegistry(1, store.registryKeyword);
+});
 </script>
 
 <template>
-  <section class="view-people">
-    <!-- 人物画像：查询 toolbar + 结果显示合并为一个 band -->
-    <div class="band" style="margin-top: 0">
-      <div class="panel-title"><h2>人物画像</h2></div>
-      <PersonQueryPanel />
-      <div class="profile-result">
-        <PersonProfilePanel :profile="store.profile" />
-      </div>
-    </div>
+  <section class="view-people" :class="{ 'with-sidebar': showDirectory }">
+    <PersonListPanel v-if="showDirectory" />
 
-    <PersonOverridePanel />
-    <PersonMemoryPanel />
+    <div class="people-main-col">
+      <div class="band">
+        <div class="panel-title">
+          <div>
+            <h2>人物画像查询</h2>
+            <span class="section-label">聚合长期记忆、知识关系与结构化事实生成人物画像</span>
+          </div>
+          <button
+            class="btn sm"
+            type="button"
+            :aria-expanded="showDirectory"
+            @click="showDirectory = !showDirectory"
+          >
+            {{ showDirectory ? "收起人物目录" : `展开人物目录（${store.registryTotal || store.candidates.length}）` }}
+          </button>
+        </div>
+        <PersonQueryPanel />
+        <div class="profile-result">
+          <PersonProfilePanel :profile="store.profile" />
+        </div>
+      </div>
+
+      <PersonOverridePanel />
+      <PersonMemoryPanel />
+    </div>
   </section>
 </template>
 
 <style scoped>
 .view-people {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
 }
 
-/* 画像结果与上方 toolbar 间距 */
+@media (min-width: 1024px) {
+  .view-people.with-sidebar {
+    grid-template-columns: 310px minmax(0, 1fr);
+  }
+}
+
+.people-main-col {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+}
+
+.view-people :deep(.band) {
+  margin-top: 0;
+}
+
 .profile-result {
   margin-top: 14px;
 }

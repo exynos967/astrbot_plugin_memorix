@@ -1,7 +1,9 @@
+<script lang="ts">
+let candidateInputUid = 0;
+</script>
+
 <script setup lang="ts">
-// 通用候选输入框：把 useCandidateMenu 接线封装为 v-model 组件，消除多输入框重复代码（DRY）。
-// 用法：<CandidateInput v-model="store.field" :source="fn" :debounce-ms="180" placeholder="…" label="…" />
-// source：根据 keyword 返回候选（同步或异步），与 useCandidateMenu.source 同义。
+// 通用候选输入框：绑定显式 label[for] 无障碍语义，并实时将 el.value 传入 cm.onInput(val) 消除单字符滞后。
 import { computed, ref } from "vue";
 import { useCandidateMenu } from "@/composables/useCandidateMenu";
 import type { CandidateItem } from "@/stores/candidate";
@@ -12,7 +14,7 @@ const props = defineProps<{
   debounceMs?: number;
   placeholder?: string;
   label?: string;
-  /** 容器 flex 权重（与 legacy .field style="flex:N" 对齐）。 */
+  /** 容器 flex 权重。 */
   flex?: number | string;
 }>();
 
@@ -21,9 +23,9 @@ const emit = defineEmits<{
   (e: "choose", item: CandidateItem): void;
 }>();
 
+const inputId = `memorix-candidate-input-${++candidateInputUid}`;
 const inputRef = ref<HTMLInputElement | null>(null);
 
-// computed get/set 作 useCandidateMenu 的 model Ref：choose 时写回 → emit 到父级。
 const model = computed<string>({
   get: () => props.modelValue,
   set: (v) => emit("update:modelValue", v),
@@ -32,7 +34,7 @@ const model = computed<string>({
 const cm = useCandidateMenu({
   inputRef,
   model,
-  source: props.source,
+  source: (kw) => props.source(kw),
   debounceMs: props.debounceMs,
   onChoose: (item) => emit("choose", item),
 });
@@ -40,18 +42,26 @@ const cm = useCandidateMenu({
 const fieldStyle = computed(() =>
   props.flex != null ? { flex: typeof props.flex === "number" ? String(props.flex) : props.flex } : undefined,
 );
+
+function handleInput(e: Event): void {
+  const val = (e.target as HTMLInputElement).value;
+  emit("update:modelValue", val);
+  cm.onInput(val);
+}
 </script>
 
 <template>
   <div class="field" :style="fieldStyle">
-    <label v-if="label">{{ label }}</label>
+    <label v-if="label" :for="inputId">{{ label }}</label>
     <input
+      :id="inputId"
       ref="inputRef"
       :value="modelValue"
       class="input"
       :placeholder="placeholder"
+      :aria-label="label || placeholder || '候选输入'"
       autocomplete="off"
-      @input="(e) => { emit('update:modelValue', (e.target as HTMLInputElement).value); cm.onInput(); }"
+      @input="handleInput"
       @focus="cm.open()"
     />
   </div>

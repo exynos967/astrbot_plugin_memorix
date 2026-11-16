@@ -35,6 +35,8 @@ class ScopeRouter:
                 platform, message_type, session_id = parsed
                 sender = session_id or sender
                 group = session_id if message_type == "GroupMessage" else ""
+            else:
+                group = ""
 
         if mode not in {"umo", "user_global", "group_global", "platform_global"}:
             mode = "group_global"
@@ -55,13 +57,26 @@ class ScopeRouter:
 
     @staticmethod
     def _sanitize(raw: str) -> str:
-        text = str(raw or "default").strip()
+        text = re.sub(r"[\x00-\x1f\x7f]+", "_", str(raw or "default")).strip()
         text = text.replace("/", "_").replace("\\", "_")
         text = re.sub(r"\s+", "_", text)
         text = _SCOPE_PATTERN.sub("_", text)
         text = text.strip("._")
-        if ".." in text:
+        while ".." in text:
             text = text.replace("..", "_")
+        text = text.strip("._")
         if text in {"", ".", ".."}:
             return "default"
-        return text or "default"
+        parts = text.split(":")
+        reserved = {
+            "CON", "PRN", "AUX", "NUL",
+            *(f"COM{i}" for i in range(1, 10)),
+            *(f"LPT{i}" for i in range(1, 10)),
+        }
+        sanitized_parts = [
+            f"safe_{part}" if part.split(".", 1)[0].upper() in reserved else part
+            for part in parts
+        ]
+        result = ":".join(sanitized_parts)
+        return result or "default"
+

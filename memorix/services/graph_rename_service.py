@@ -10,11 +10,78 @@ from ..core.utils.hash import compute_hash
 class GraphRenameService:
     def __init__(self, ctx: Any):
         self.ctx = ctx
-        self.metadata_store = ctx.metadata_store
+        self.metadata_store = getattr(ctx, "metadata_store", None)
+
+    def _ensure_table(self, conn: Optional[Any] = None) -> None:
+        """幂等确保 graph_pending_renames 表存在。"""
+        target = conn or getattr(self.metadata_store, "_conn", None)
+        if target is None:
+            return
+        target.execute(
+            """
+            CREATE TABLE IF NOT EXISTS graph_pending_renames (
+                operation_id TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL
+            )
+            """
+        )
+        if conn is None:
+            try:
+                target.commit()
+            except Exception:
+                pass
+
+    def record_pending_rename(
+        self,
+        operation_id: str,
+        payload: Dict[str, Any],
+        *,
+        conn: Optional[Any] = None,
+    ) -> None:
+        """安全记录待投影重命名操作。"""
+        self._ensure_table(conn)
+        target = conn or getattr(self.metadata_store, "_conn", None)
+        if target is None:
+            return
+        target.execute(
+            """
+            INSERT OR REPLACE INTO graph_pending_renames (operation_id, payload_json)
+            VALUES (?, ?)
+            """,
+            (str(operation_id), json.dumps(payload, ensure_ascii=False)),
+        )
+        if conn is None:
+            try:
+                target.commit()
+            except Exception:
+                pass
+
+    def complete_pending_rename(
+        self,
+        operation_id: str,
+        *,
+        conn: Optional[Any] = None,
+    ) -> None:
+        """安全清理已完成投影的重命名操作。"""
+        self._ensure_table(conn)
+        target = conn or getattr(self.metadata_store, "_conn", None)
+        if target is None:
+            return
+        target.execute(
+            "DELETE FROM graph_pending_renames WHERE operation_id = ?",
+            (str(operation_id),),
+        )
+        if conn is None:
+            try:
+                target.commit()
+            except Exception:
+                pass
 
     async def rename(self, old_name: str, new_name: str) -> Dict[str, Any]:
         await self.reconcile()
-        if self.metadata_store._conn.execute("SELECT 1 FROM graph_pending_renames LIMIT 1").fetchone():
+        self._ensure_table()
+        conn = getattr(self.metadata_store, "_conn", None)
+        if conn and conn.execute("SELECT 1 FROM graph_pending_renames LIMIT 1").fetchone():
             return {"success": False, "error": "已有重命名的索引更新未完成，请修复 embedding/存储错误后重试"}
         result = self._rename_node(old_name, new_name)
         if not result.get("success") or not result.get("renamed"):
@@ -22,7 +89,11 @@ class GraphRenameService:
         return await self._project(result)
 
     async def reconcile(self) -> None:
-        rows = self.metadata_store._conn.execute("SELECT payload_json FROM graph_pending_renames ORDER BY rowid").fetchall()
+        self._ensure_table()
+        conn = getattr(self.metadata_store, "_conn", None)
+        if conn is None:
+            return
+        rows = conn.execute("SELECT payload_json FROM graph_pending_renames ORDER BY rowid").fetchall()
         for row in rows:
             await self._project(json.loads(row[0]))
 
@@ -68,10 +139,15 @@ class GraphRenameService:
             result["projection"] = {"status": "ready"}
             result["vector_projection"] = {"status": "pending" if vector_errors else "ready", "failed_hashes": vector_errors}
             if not vector_errors:
-                self.metadata_store._conn.execute(
-                    "DELETE FROM graph_pending_renames WHERE operation_id = ?", (result["operation"]["operation_id"],),
-                )
-                self.metadata_store._conn.commit()
+                op_id = result.get("operation", {}).get("operation_id")
+                if op_id:
+                    self.complete_pending_rename(op_id)
+                else:
+                    self._ensure_table()
+                    self.metadata_store._conn.execute(
+                        "DELETE FROM graph_pending_renames WHERE operation_id = ?", (result["operation"]["operation_id"],),
+                    )
+                    self.metadata_store._conn.commit()
         except Exception as error:
             result["projection"] = {"status": "failed", "error": str(error)}
         return result
@@ -86,6 +162,7 @@ class GraphRenameService:
         record_operation: bool = True,
     ) -> Dict[str, Any]:
         assert self.metadata_store
+        self._ensure_table()
         source = str(old_name or "").strip()
         target = str(new_name or "").strip()
         if not source or not target:
@@ -310,12 +387,15 @@ class GraphRenameService:
                         result=authoritative_result,
                         conn=conn,
                     )
-                    conn.execute(
-                        "INSERT INTO graph_pending_renames VALUES (?, ?)",
-                        (operation["operation_id"], json.dumps({
-                            **authoritative_result, "operation": operation,
-                            "old_entity_hash": old_entity_hash, "old_relation_hashes": old_relation_hashes,
-                        }, ensure_ascii=False)),
+                    self.record_pending_rename(
+                        operation["operation_id"],
+                        {
+                            **authoritative_result,
+                            "operation": operation,
+                            "old_entity_hash": old_entity_hash,
+                            "old_relation_hashes": old_relation_hashes,
+                        },
+                        conn=conn,
                     )
         except Exception as exc:
             return {"success": False, "error": f"rename failed: {exc}"}

@@ -1,14 +1,8 @@
 <script setup lang="ts">
-// 运行时自检横幅：显示自检结果摘要 + 刷新按钮。
-// 从 legacy notice + runtime-banner（index.html 行 2068-2071, 3186-3203）迁移。
-// 纯展示 + 事件上抛（emit refresh），自检数据/动作在 useDashboardStore。
-
+// 运行时异常提示横幅：当 Embedding / 向量库自检未通过时提示原因并支持一键重新自检。
 defineProps<{
-  /** 自检结果文案（runtimeMessageText 派生）。 */
   message: string;
-  /** runtime-chip 标签（runtimeLabel 第一项）。 */
   chipLabel: string;
-  /** runtime-chip 语气（runtimeLabel 第二项 → tag ok/warn/bad）。 */
   chipTone: "ok" | "warn" | "bad";
 }>();
 
@@ -16,8 +10,24 @@ const emit = defineEmits<{ refresh: [] }>();
 </script>
 
 <template>
-  <div class="notice" style="margin-top: 16px">
-    <strong>{{ message }}</strong>
-    <button class="btn icon" title="刷新自检" @click="emit('refresh')">↻</button>
+  <div class="notice warn runtime-banner">
+    <div class="banner-body">
+      <span class="tag" :class="chipTone">{{ chipLabel }}</span>
+      <strong>{{ message }}</strong>
+    </div>
+    <button class="btn" type="button" @click="emit('refresh')">
+      重新自检
+    </button>
   </div>
 </template>
+
+<style scoped>
+.banner-body {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+</style>

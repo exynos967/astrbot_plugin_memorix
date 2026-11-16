@@ -7,6 +7,7 @@ context while avoiding binary/raw CQ payloads.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -19,7 +20,7 @@ from typing import Any, Optional
 from astrbot.api import logger
 
 try:  # pragma: no cover - exercised with real AstrBot runtime
-    from astrbot.core.message.components import (
+    from astrbot.api.message_components import (
         At,
         AtAll,
         Face,
@@ -34,64 +35,124 @@ try:  # pragma: no cover - exercised with real AstrBot runtime
         Reply,
         Video,
     )
-    from astrbot.core.provider.provider import Provider
-    from astrbot.core.utils.media_utils import compress_image
-    from astrbot.core.utils.quoted_message.chain_parser import OneBotPayloadParser, ReplyChainParser
-    from astrbot.core.utils.quoted_message.extractor import extract_quoted_message_images, extract_quoted_message_text
-    from astrbot.core.utils.quoted_message.image_resolver import ImageResolver
-    from astrbot.core.utils.quoted_message.onebot_client import OneBotClient
-    from astrbot.core.utils.quoted_message.settings import SETTINGS
-except ModuleNotFoundError:  # pragma: no cover - unit-test stubs may not expose full AstrBot core
+    from astrbot.api.provider import Provider
+except ImportError:  # pragma: no cover - unit-test stubs may not expose full AstrBot core
     class _MissingComponent:
         pass
 
     At = AtAll = Face = File = Forward = Image = Json = Node = Nodes = Plain = Record = Reply = Video = _MissingComponent
     Provider = _MissingComponent
 
-    async def compress_image(url_or_path: str, *args: Any, **kwargs: Any) -> str:
-        del args, kwargs
+
+async def _compress_image(url_or_path: str, *args: Any, **kwargs: Any) -> str:
+    del args, kwargs
+    try:
+        from astrbot.core.utils.media_utils import compress_image as real_compress
+        return await real_compress(url_or_path)
+    except Exception:
         return url_or_path
 
-    class _Settings:
-        def with_overrides(self, _overrides: dict[str, Any] | None = None) -> "_Settings":
-            return self
 
-    SETTINGS = _Settings()
+compress_image = _compress_image
 
-    class ReplyChainParser:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            del args, kwargs
 
-        def extract_text_from_reply_component(self, _reply: Any) -> str | None:
-            return None
+class _Settings:
+    def with_overrides(self, _overrides: dict[str, Any] | None = None) -> "_Settings":
+        return self
 
-    class OneBotPayloadParser:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            del args, kwargs
 
-        def parse_get_forward_payload(self, _payload: dict[str, Any]) -> dict[str, Any]:
-            return {"text": None, "image_refs": [], "forward_ids": []}
+def _resolve_quoted_settings() -> Any:
+    try:
+        from astrbot.core.utils.quoted_message.settings import SETTINGS as real_settings
+        return real_settings
+    except Exception:
+        return _Settings()
 
-    class OneBotClient:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            del args, kwargs
 
-        async def get_forward_msg(self, _forward_id: str | int) -> dict[str, Any] | None:
-            return None
+SETTINGS = _resolve_quoted_settings()
 
-    class ImageResolver:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            del args, kwargs
 
-        async def resolve_for_llm(self, image_refs: list[str]) -> list[str]:
-            return image_refs
+class ReplyChainParser:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        try:
+            from astrbot.core.utils.quoted_message.chain_parser import ReplyChainParser as RealParser
+            self._real = RealParser(*args, **kwargs)
+        except Exception:
+            self._real = None
 
-    async def extract_quoted_message_text(*args: Any, **kwargs: Any) -> str | None:
-        del args, kwargs
+    def extract_text_from_reply_component(self, reply: Any) -> str | None:
+        if self._real is not None and hasattr(self._real, "extract_text_from_reply_component"):
+            try:
+                return self._real.extract_text_from_reply_component(reply)
+            except Exception:
+                pass
         return None
 
-    async def extract_quoted_message_images(*args: Any, **kwargs: Any) -> list[str]:
-        del args, kwargs
+
+class OneBotPayloadParser:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        try:
+            from astrbot.core.utils.quoted_message.chain_parser import OneBotPayloadParser as RealParser
+            self._real = RealParser(*args, **kwargs)
+        except Exception:
+            self._real = None
+
+    def parse_get_forward_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self._real is not None and hasattr(self._real, "parse_get_forward_payload"):
+            try:
+                return self._real.parse_get_forward_payload(payload)
+            except Exception:
+                pass
+        return {"text": None, "image_refs": [], "forward_ids": []}
+
+
+class OneBotClient:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        try:
+            from astrbot.core.utils.quoted_message.onebot_client import OneBotClient as RealClient
+            self._real = RealClient(*args, **kwargs)
+        except Exception:
+            self._real = None
+
+    async def get_forward_msg(self, forward_id: str | int) -> dict[str, Any] | None:
+        if self._real is not None and hasattr(self._real, "get_forward_msg"):
+            try:
+                return await self._real.get_forward_msg(forward_id)
+            except Exception:
+                pass
+        return None
+
+
+class ImageResolver:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        try:
+            from astrbot.core.utils.quoted_message.image_resolver import ImageResolver as RealResolver
+            self._real = RealResolver(*args, **kwargs)
+        except Exception:
+            self._real = None
+
+    async def resolve_for_llm(self, image_refs: list[str]) -> list[str]:
+        if self._real is not None and hasattr(self._real, "resolve_for_llm"):
+            try:
+                return await self._real.resolve_for_llm(image_refs)
+            except Exception:
+                pass
+        return image_refs
+
+
+async def extract_quoted_message_text(*args: Any, **kwargs: Any) -> str | None:
+    try:
+        from astrbot.core.utils.quoted_message.extractor import extract_quoted_message_text as real_fn
+        return await real_fn(*args, **kwargs)
+    except Exception:
+        return None
+
+
+async def extract_quoted_message_images(*args: Any, **kwargs: Any) -> list[str]:
+    try:
+        from astrbot.core.utils.quoted_message.extractor import extract_quoted_message_images as real_fn
+        return await real_fn(*args, **kwargs)
+    except Exception:
         return []
 
 
@@ -194,6 +255,16 @@ class AstrBotMessageFormatter:
                 parts.append(text)
         return parts
 
+    @staticmethod
+    def _is_image_component(comp: Any) -> bool:
+        if isinstance(comp, Image):
+            return True
+        raw_type = getattr(comp, "type", "")
+        comp_type = str(getattr(raw_type, "value", raw_type) or "").strip().lower()
+        if comp_type == "image":
+            return True
+        return type(comp).__name__.lower() in {"image", "imagecomponent", "mockimage"}
+
     async def _format_component(self, comp: Any, *, depth: int = 0) -> str:
         if isinstance(comp, Plain):
             return str(comp.text or "").strip()
@@ -207,7 +278,7 @@ class AstrBotMessageFormatter:
             return f"@{name or qq}" if (name or qq) else "@某人"
         if isinstance(comp, Face):
             return f"[表情:{getattr(comp, 'id', '')}]"
-        if isinstance(comp, Image):
+        if self._is_image_component(comp):
             self.image_count += 1
             caption = await self._caption_image_component(comp)
             return f"[图片：{caption}]" if caption else "[图片]"
@@ -334,11 +405,22 @@ class AstrBotMessageFormatter:
             if provider_id:
                 provider = self.context.get_provider_by_id(provider_id)
             if provider is None:
-                current_id = await self.context.get_current_chat_provider_id(self.event.unified_msg_origin)
-                provider = self.context.get_provider_by_id(current_id)
+                get_current = getattr(self.context, "get_current_chat_provider_id", None)
+                if callable(get_current):
+                    current_id = await get_current(self.event.unified_msg_origin)
+                    if current_id:
+                        provider = self.context.get_provider_by_id(current_id)
+            if provider is None:
+                get_using_async = getattr(self.context, "get_using_provider_async", None)
+                if callable(get_using_async):
+                    provider = await get_using_async(self.event.unified_msg_origin)
+            if provider is None:
+                get_using_sync = getattr(self.context, "get_using_provider", None)
+                if callable(get_using_sync):
+                    provider = get_using_sync(self.event.unified_msg_origin)
         except Exception:
             return None
-        return provider if isinstance(provider, Provider) else None
+        return provider if _is_valid_vision_provider(provider) else None
 
 
 async def format_astrbot_event_message(
@@ -417,25 +499,175 @@ def _cleanup_image_cache(cache_dir: str) -> None:
         pass
 
 
-async def copy_images_to_safe_dir(event: Any) -> list[str]:
-    """Copy Image component files to a pipeline-safe cache directory."""
-    safe_paths: list[str] = []
+@dataclass(slots=True)
+class CapturedChatImage:
+    component_path: str
+    safe_path: str = ""
+    image_bytes: bytes | None = None
+    content_hash: str = ""
+
+
+def _read_bounded_file_bytes(path: str, max_bytes: int) -> bytes | None:
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        size = os.path.getsize(path)
+        if size <= 0 or size > max_bytes:
+            return None
+        with open(path, "rb") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+async def _read_image_component_bytes(comp: Any, *, max_bytes: int) -> bytes | None:
+    """在不创建临时缓存文件的前提下读取图片组件字节。"""
+    converter = getattr(comp, "convert_to_file_path", None)
+    if callable(converter):
+        try:
+            resolved = await converter()
+            if resolved:
+                data = _read_bounded_file_bytes(str(resolved), max_bytes)
+                if data:
+                    return data
+        except Exception:
+            pass
+
+    for attr in ("path", "file", "url"):
+        raw = str(getattr(comp, attr, "") or "").strip()
+        if not raw:
+            continue
+        if raw.startswith("base64://"):
+            import base64 as _b64
+
+            payload = raw.removeprefix("base64://").strip()
+            if payload:
+                try:
+                    decoded = _b64.b64decode(payload)
+                    if 0 < len(decoded) <= max_bytes:
+                        return decoded
+                except Exception:
+                    pass
+            continue
+        local_candidate = raw
+        if local_candidate.startswith("file:///"):
+            local_candidate = local_candidate[8:] if os.name == "nt" else local_candidate[7:]
+        elif local_candidate.startswith("file://"):
+            local_candidate = local_candidate[7:]
+        data = _read_bounded_file_bytes(local_candidate, max_bytes)
+        if data:
+            return data
+    return None
+
+
+async def _resolve_image_component_source(comp: Any, cache_dir: str) -> tuple[str, bool]:
+    """解析图片组件的本地可读文件路径；返回 (path, is_ephemeral_generated)。"""
+    converter = getattr(comp, "convert_to_file_path", None)
+    if callable(converter):
+        try:
+            resolved = await converter()
+            if resolved and os.path.isfile(str(resolved)):
+                return str(resolved), False
+        except Exception:
+            pass
+
+    for attr in ("path", "file", "url"):
+        raw = str(getattr(comp, attr, "") or "").strip()
+        if not raw:
+            continue
+        if raw.startswith("base64://"):
+            import base64 as _b64
+
+            payload = raw.removeprefix("base64://").strip()
+            if payload:
+                tmp_dst = os.path.join(cache_dir, f"{uuid.uuid4().hex}.bin")
+                with open(tmp_dst, "wb") as fh:
+                    fh.write(_b64.b64decode(payload))
+                return tmp_dst, True
+            continue
+        local_candidate = raw
+        if local_candidate.startswith("file:///"):
+            local_candidate = local_candidate[8:] if os.name == "nt" else local_candidate[7:]
+        elif local_candidate.startswith("file://"):
+            local_candidate = local_candidate[7:]
+        if os.path.isfile(local_candidate):
+            return local_candidate, False
+    return "", False
+
+
+async def capture_event_images_to_safe_dir(
+    event: Any,
+    *,
+    copy_to_cache: bool = True,
+    max_bytes: int = 10 * 1024 * 1024,
+) -> list[CapturedChatImage]:
+    """按持久消息树稳定组件路径捕获聊天图片（可按需跳过落盘临时缓存）。"""
+    from ..core.image.component_paths import iter_message_image_components
+
+    captured: list[CapturedChatImage] = []
+    chain = _coerce_event_chain(event)
+    if not chain:
+        return captured
+    bounded_max = max(1024, int(max_bytes or (10 * 1024 * 1024)))
+    if not copy_to_cache:
+        for comp_path, comp in iter_message_image_components(chain, include_emoji=False):
+            try:
+                data = await _read_image_component_bytes(comp, max_bytes=bounded_max)
+                if not data:
+                    continue
+                captured.append(
+                    CapturedChatImage(
+                        component_path=comp_path,
+                        safe_path="",
+                        image_bytes=data,
+                        content_hash=hashlib.sha256(data).hexdigest(),
+                    )
+                )
+            except Exception:
+                logger.debug("[memorix] read image bytes failed", exc_info=True)
+        return captured
+
     cache_dir = os.path.join(tempfile.gettempdir(), "astrbot_memorix_img_cache")
     os.makedirs(cache_dir, exist_ok=True)
     _cleanup_image_cache(cache_dir)
-    for comp in _coerce_event_chain(event):
-        if not isinstance(comp, Image):
-            continue
+    for comp_path, comp in iter_message_image_components(chain, include_emoji=False):
         try:
-            src = await comp.convert_to_file_path()
+            src, already_in_cache = await _resolve_image_component_source(comp, cache_dir)
             if not src:
                 continue
-            dst = os.path.join(cache_dir, f"{uuid.uuid4().hex}.jpg")
-            shutil.copy2(src, dst)
-            safe_paths.append(dst)
+            if already_in_cache:
+                dst = src
+            else:
+                ext = os.path.splitext(src)[1].lower()
+                if ext not in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}:
+                    ext = ".jpg"
+                dst = os.path.join(cache_dir, f"{uuid.uuid4().hex}{ext}")
+                shutil.copy2(src, dst)
+            data = _read_bounded_file_bytes(dst, bounded_max)
+            captured.append(
+                CapturedChatImage(
+                    component_path=comp_path,
+                    safe_path=dst,
+                    image_bytes=data,
+                    content_hash=hashlib.sha256(data).hexdigest() if data else "",
+                )
+            )
         except Exception:
             logger.debug("[memorix] copy image to cache failed", exc_info=True)
-    return safe_paths
+    return captured
+
+
+async def copy_images_to_safe_dir(event: Any) -> list[str]:
+    """Copy Image component files to a pipeline-safe cache directory."""
+    return [item.safe_path for item in await capture_event_images_to_safe_dir(event, copy_to_cache=True) if item.safe_path]
+
+
+def _is_valid_vision_provider(provider: Any) -> bool:
+    if provider is None:
+        return False
+    if isinstance(provider, Provider):
+        return True
+    return Provider.__name__ == "_MissingComponent" and callable(getattr(provider, "text_chat", None))
 
 
 async def resolve_vision_provider(context: Any, config: dict[str, Any], event: Any) -> Provider | None:
@@ -445,19 +677,30 @@ async def resolve_vision_provider(context: Any, config: dict[str, Any], event: A
     ingest_cfg = config.get("ingest", {}) if isinstance(config.get("ingest"), dict) else {}
     caption_cfg = ingest_cfg.get("image_caption", {}) if isinstance(ingest_cfg.get("image_caption"), dict) else {}
     provider_id = str(caption_cfg.get("provider_id", "") or "").strip()
-    provider: Provider | None = None
+    provider: Any = None
     try:
         if provider_id:
             provider = context.get_provider_by_id(provider_id)
         if provider is None:
-            current_id = await context.get_current_chat_provider_id(event.unified_msg_origin)
-            provider = context.get_provider_by_id(current_id)
+            get_current = getattr(context, "get_current_chat_provider_id", None)
+            if callable(get_current):
+                current_id = await get_current(event.unified_msg_origin)
+                if current_id:
+                    provider = context.get_provider_by_id(current_id)
+        if provider is None:
+            get_using_async = getattr(context, "get_using_provider_async", None)
+            if callable(get_using_async):
+                provider = await get_using_async(event.unified_msg_origin)
+        if provider is None:
+            get_using_sync = getattr(context, "get_using_provider", None)
+            if callable(get_using_sync):
+                provider = get_using_sync(event.unified_msg_origin)
     except Exception:
         return None
-    return provider if isinstance(provider, Provider) else None
+    return provider if _is_valid_vision_provider(provider) else None
 
 
-def _remove_quiet(path: str) -> None:
+def _remove_quiet(path: str | None) -> None:
     if path:
         try:
             os.remove(path)
@@ -465,31 +708,32 @@ def _remove_quiet(path: str) -> None:
             pass
 
 
-async def enrich_text_with_captions(
+async def enrich_text_with_captions_detailed(
     text: str,
     safe_paths: list[str],
     context: Any,
     config: dict[str, Any],
     event: Any,
-) -> str:
-    """Replace [图片] placeholders with vision API captions in background task."""
+) -> tuple[str, list[str]]:
+    """Replace [图片] placeholders with vision API captions and return (enriched_text, per_image_captions)."""
+    captions: list[str] = ["" for _ in safe_paths]
     if not safe_paths:
-        return text
+        return text, captions
     opts = message_format_options_from_config(config)
     if not opts.include_image_caption:
         for p in safe_paths:
             _remove_quiet(p)
-        return text
+        return text, captions
     provider = await resolve_vision_provider(context, config, event)
     if provider is None:
         for p in safe_paths:
             _remove_quiet(p)
-        return text
+        return text, captions
     max_count = max(0, int(opts.image_caption_max_count))
     captioned = 0
     current = text
     remaining_paths: list[str] = []
-    for image_path in safe_paths:
+    for idx, image_path in enumerate(safe_paths):
         if max_count > 0 and captioned >= max_count:
             remaining_paths.append(image_path)
             continue
@@ -504,9 +748,11 @@ async def enrich_text_with_captions(
             )
             caption = str(getattr(resp, "completion_text", "") or "").strip()
             if caption:
-                filtered = "".join(c for c in caption if ord(c) >= 0x20 or c in "\n\r\t")
-                current = current.replace("[图片]", f"[图片：{filtered}]", 1)
-                captioned += 1
+                filtered = "".join(c for c in caption if ord(c) >= 0x20 or c in "\n\r\t").strip()
+                if filtered:
+                    captions[idx] = filtered
+                    current = current.replace("[图片]", f"[图片：{filtered}]", 1)
+                    captioned += 1
         except Exception:
             logger.debug("[memorix] background image caption failed", exc_info=True)
         finally:
@@ -514,4 +760,17 @@ async def enrich_text_with_captions(
             _remove_quiet(image_path)
     for p in remaining_paths:
         _remove_quiet(p)
-    return current
+    return current, captions
+
+
+async def enrich_text_with_captions(
+    text: str,
+    safe_paths: list[str],
+    context: Any,
+    config: dict[str, Any],
+    event: Any,
+) -> str:
+    """Replace [图片] placeholders with vision API captions in background task."""
+    enriched, _ = await enrich_text_with_captions_detailed(text, safe_paths, context, config, event)
+    return enriched
+

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+import json
+from typing import Any, Dict, List, Optional
 
 from ...core.utils.aggregate_query_service import AggregateQueryService
 from ...core.utils.search_execution_service import (
@@ -16,9 +17,73 @@ from ..context import AppContext
 logger = get_logger("A_Memorix.QueryService")
 
 
+def _is_migration_archived_item(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    src = str(item.get("source") or "").strip()
+    if src.startswith("migration_archive:"):
+        return True
+    meta = item.get("metadata")
+    if isinstance(meta, str) and meta.strip():
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = None
+    if isinstance(meta, dict):
+        if str(meta.get("source") or "").strip().startswith("migration_archive:"):
+            return True
+        if str(meta.get("scope_type") or "").strip().lower() == "archive":
+            return True
+    return False
+
+
 class QueryService:
     def __init__(self, ctx: AppContext):
         self.ctx = ctx
+
+    def _filter_archived_results(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not items:
+            return []
+        pre_filtered = [item for item in items if not _is_migration_archived_item(item)]
+        if not pre_filtered:
+            return []
+
+        metadata_store = getattr(self.ctx, "metadata_store", None)
+        if metadata_store is None:
+            return pre_filtered
+
+        para_hashes = [
+            str(item.get("hash") or "").strip()
+            for item in pre_filtered
+            if isinstance(item, dict)
+            and str(item.get("type") or "paragraph").strip().lower() == "paragraph"
+            and str(item.get("hash") or "").strip()
+        ]
+        archived_hashes: set[str] = set()
+        if para_hashes:
+            batch_getter = getattr(metadata_store, "get_paragraphs_by_hashes", None)
+            single_getter = getattr(metadata_store, "get_paragraph", None)
+            if callable(batch_getter):
+                rows_by_hash = batch_getter(para_hashes) or {}
+                for h, db_row in rows_by_hash.items():
+                    if _is_migration_archived_item(db_row):
+                        archived_hashes.add(str(h or "").strip())
+            elif callable(single_getter):
+                for h in dict.fromkeys(para_hashes):
+                    db_row = single_getter(h)
+                    if _is_migration_archived_item(db_row):
+                        archived_hashes.add(h)
+
+        if not archived_hashes:
+            return pre_filtered
+        return [
+            item
+            for item in pre_filtered
+            if not (
+                str(item.get("type") or "paragraph").strip().lower() == "paragraph"
+                and str(item.get("hash") or "").strip() in archived_hashes
+            )
+        ]
 
     def _plugin_config(self) -> Dict[str, Any]:
         cfg = dict(self.ctx.config)
@@ -72,13 +137,16 @@ class QueryService:
         )
         if not result.success:
             raise ValueError(result.error)
+        serialized_results = self._filter_archived_results(
+            SearchExecutionService.to_serializable_results(result.results)
+        )
         payload = {
             "query_type": result.query_type,
             "query": result.query,
             "top_k": result.top_k,
-            "count": result.count,
+            "count": len(serialized_results),
             "elapsed_ms": result.elapsed_ms,
-            "results": SearchExecutionService.to_serializable_results(result.results),
+            "results": serialized_results,
         }
         if result.chat_filtered:
             payload["filtered"] = True
@@ -216,7 +284,9 @@ class QueryService:
         if not self.ctx.graph_store.has_node(target):
             raise ValueError(f"entity not found: {target}")
         neighbors = self.ctx.graph_store.get_neighbors(target)
-        paragraphs = self.ctx.metadata_store.get_paragraphs_by_entity(target)
+        paragraphs = [
+            item for item in self.ctx.metadata_store.get_paragraphs_by_entity(target) if not _is_migration_archived_item(item)
+        ]
         relations = self.ctx.metadata_store.get_relations(subject=target) + self.ctx.metadata_store.get_relations(object=target)
         return {
             "entity_name": target,
@@ -273,15 +343,19 @@ class QueryService:
             }
 
         ts_from, ts_to = parse_query_time_range(time_from, time_to) if (time_from or time_to) else (None, None)
-        results = await self.ctx.episode_retrieval_service.query(
-            query=query,
-            top_k=safe_top_k,
-            time_from=ts_from,
-            time_to=ts_to,
-            person=person,
-            source=source,
-            include_paragraphs=include_paragraphs,
-        )
+        results = [
+            item
+            for item in await self.ctx.episode_retrieval_service.query(
+                query=query,
+                top_k=safe_top_k,
+                time_from=ts_from,
+                time_to=ts_to,
+                person=person,
+                source=source,
+                include_paragraphs=include_paragraphs,
+            )
+            if not _is_migration_archived_item(item)
+        ]
         return {
             "query_type": "episode",
             "query": query,

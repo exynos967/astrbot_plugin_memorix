@@ -23,11 +23,11 @@ import json
 import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
-from ..common.logging import get_logger
 from ...core.storage import detect_knowledge_type
 from ...core.utils.hash import compute_hash, normalize_text
 from ...core.utils.metadata import coerce_metadata_dict
 from ...core.utils.model_routing import generate_text
+from ..common.logging import get_logger
 
 logger = get_logger("A_Memorix.FuzzyModifyService")
 
@@ -1195,7 +1195,15 @@ class FuzzyModifyService:
         except Exception as exc:
             logger.warning(f"记忆检索候选失败: {exc}")
             return []
-        results = payload.get("results") if isinstance(payload, dict) else None
+        results = None
+        if isinstance(payload, dict):
+            results = payload.get("results")
+            if not isinstance(results, list):
+                branches = payload.get("branches")
+                if isinstance(branches, dict) and isinstance(branches.get("search"), dict):
+                    results = branches["search"].get("results")
+            if not isinstance(results, list):
+                results = payload.get("mixed_results")
         if not isinstance(results, list):
             return []
         hits: List[Dict[str, Any]] = []

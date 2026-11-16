@@ -1,78 +1,173 @@
-/* 设计 token：从 legacy vanilla index.html 提取，保持视觉一致。
-   light 为默认（:root），dark 覆盖关键变量。
-   effects（glass/lite）在 base.css 中按 html[data-effects] 切换背景层。 */
+/* Memorix 设计系统语义 Token（Developer Console 规范）：
+ * - 90-95% 中性建筑感实色表面 + 12-15% 墨水色 1px 细线，摒弃厚重毛玻璃与彩色悬浮光斑
+ * - 单一克制主强调色（Cobalt）+ WCAG AA (>= 4.5:1) 语义状态色，零紫罗兰/品红渐变
+ * - 统一圆角阶梯、间距标尺与微交互动效曲线
+ */
 :root {
   color-scheme: light;
-  --page-bg: #eef6ff;
-  --page-bg-2: #f8fbff;
+
+  /* 基础背景与层级表面 */
+  --page-bg: #f6f8fa;
+  --page-bg-2: #f1f5f9;
+  --shell: #ffffff;
+  --nav: #f8fafc;
+  --surface: #ffffff;
+  --surface-strong: #ffffff;
+  --surface-soft: #f1f5f9;
+  --panel-bg: #ffffff;
+  --bg-panel: #ffffff;
+  --card-bg: #f8fafc;
+  --bg-elevated: #ffffff;
+  --bg-overlay: rgba(15, 23, 42, 0.45);
+  --control-bg: #ffffff;
+  --control-bg-focus: #ffffff;
+
+  /* 文本墨水层级（WCAG AA/AAA） */
   --ink: #0f172a;
-  --text: #102035;
-  --muted: #536579;
-  --muted-2: #7d8da0;
-  --hairline: rgba(107, 139, 176, 0.22);
-  --hairline-strong: rgba(59, 130, 246, 0.34);
-  --shell: rgba(255, 255, 255, 0.52);
-  --surface: rgba(255, 255, 255, 0.64);
-  --surface-strong: rgba(255, 255, 255, 0.82);
-  --surface-soft: rgba(248, 252, 255, 0.58);
-  --nav: rgba(255, 255, 255, 0.54);
-  --nav-soft: rgba(30, 64, 175, 0.1);
-  --glass-highlight: rgba(255, 255, 255, 0.88);
+  --text: #1e293b;
+  --muted: #475569;
+  --muted-2: #64748b;
+
+  /* 1px 结构细线（12%-15% 墨水对比度） */
+  --hairline: rgba(15, 23, 42, 0.09);
+  --border-color: rgba(15, 23, 42, 0.13);
+  --border-hover: rgba(15, 23, 42, 0.24);
+  --hairline-strong: rgba(37, 99, 235, 0.36);
+
+  --nav-soft: rgba(15, 23, 42, 0.05);
+  --glass-highlight: rgba(15, 23, 42, 0.05);
+
+  /* 单一主强调色（全屏占比 < 3%，仅主动作、焦点环、当前激活态） */
   --accent: #2563eb;
   --accent-strong: #1d4ed8;
-  --accent-ink: #0b2d63;
-  --accent-soft: rgba(37, 99, 235, 0.11);
-  --blue: #2563eb;
-  --blue-soft: rgba(37, 99, 235, 0.11);
-  --teal: #0891b2;
-  --teal-soft: rgba(8, 145, 178, 0.12);
-  --pink: #be5ac8;
-  --pink-soft: rgba(190, 90, 200, 0.12);
-  --amber: #b7791f;
-  --amber-soft: rgba(245, 158, 11, 0.16);
+  --accent-ink: #1e40af;
+  --accent-soft: rgba(37, 99, 235, 0.08);
+  --primary-fill: #2563eb;
+  --primary-fill-hover: #1d4ed8;
+  --on-primary: #ffffff;
+
+  /* 语义状态色（亮底对比度均 >= 4.5:1，零紫罗兰/品红色相） */
+  --blue: #1d4ed8;
+  --blue-soft: rgba(37, 99, 235, 0.09);
+  --teal: #0f766e;
+  --teal-soft: rgba(15, 118, 110, 0.09);
+  --slate: #475569;
+  --slate-soft: rgba(71, 85, 105, 0.09);
+  /* 历史兼容别名：安全重映射至青灰技术色，严禁品红/紫罗兰 */
+  --pink: #0f766e;
+  --pink-soft: rgba(15, 118, 110, 0.09);
+  --amber: #b45309;
+  --amber-soft: rgba(180, 83, 9, 0.1);
   --red: #dc2626;
-  --red-soft: rgba(220, 38, 38, 0.12);
+  --red-soft: rgba(220, 38, 38, 0.09);
   --green: #047857;
-  --green-soft: rgba(5, 150, 105, 0.12);
-  --shadow: 0 30px 80px rgba(31, 85, 149, 0.16);
-  --shadow-sm: 0 14px 36px rgba(31, 85, 149, 0.1);
-  --shadow-xs: 0 8px 20px rgba(31, 85, 149, 0.07);
-  --blur: blur(24px) saturate(150%);
-  --blur-soft: blur(16px) saturate(140%);
-  --radius-xl: 28px;
-  --radius-lg: 20px;
-  --radius-md: 14px;
-  --control-h: 44px;
+  --green-soft: rgba(4, 120, 87, 0.09);
+
+  /* 克制软件阴影（仅浮层、菜单、悬停微抬升使用） */
+  --shadow: 0 16px 40px rgba(15, 23, 42, 0.12), 0 2px 6px rgba(15, 23, 42, 0.06);
+  --shadow-sm: 0 6px 18px rgba(15, 23, 42, 0.08), 0 1px 3px rgba(15, 23, 42, 0.04);
+  --shadow-xs: 0 1px 2px rgba(15, 23, 42, 0.04);
+  --shadow-lift: 0 6px 16px rgba(15, 23, 42, 0.07);
+
+  /* 关闭全局毛玻璃模糊，保留变量名供旧选择器无损读取 */
+  --blur: none;
+  --blur-soft: none;
+
+  /* 开发者工具圆角与控件尺寸标尺 */
+  --radius-xl: 16px;
+  --radius-lg: 12px;
+  --radius-md: 8px;
+  --radius-sm: 6px;
+  --control-h: 38px;
+
+  /* 间距标尺 */
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 24px;
+  --s-6: 32px;
+  --s-7: 48px;
+
+  /* 触感微交互动效标尺（motion.md） */
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --ease-enter: cubic-bezier(0.22, 1, 0.36, 1);
+  --m-in: 150ms;
+  --m-out: 120ms;
+  --m-press: 90ms;
+  --m-card-in: 180ms;
+  --m-panel: 200ms;
 }
 
 html[data-theme="dark"] {
   color-scheme: dark;
-  --page-bg: #07111f;
-  --page-bg-2: #101827;
-  --ink: #f6f9ff;
-  --text: #dbe7f7;
-  --muted: #94a8bf;
-  --muted-2: #71839a;
-  --hairline: rgba(148, 163, 184, 0.24);
-  --hairline-strong: rgba(96, 165, 250, 0.42);
-  --shell: rgba(8, 17, 31, 0.7);
-  --surface: rgba(15, 23, 42, 0.66);
-  --surface-strong: rgba(30, 41, 59, 0.78);
-  --surface-soft: rgba(15, 23, 42, 0.58);
-  --nav: rgba(15, 23, 42, 0.66);
-  --nav-soft: rgba(96, 165, 250, 0.12);
-  --glass-highlight: rgba(148, 163, 184, 0.34);
-  --accent: #60a5fa;
-  --accent-strong: #93c5fd;
-  --accent-ink: #dbeafe;
-  --accent-soft: rgba(96, 165, 250, 0.16);
-  --blue-soft: rgba(96, 165, 250, 0.16);
-  --teal-soft: rgba(45, 212, 191, 0.14);
-  --pink-soft: rgba(216, 180, 254, 0.14);
-  --amber-soft: rgba(245, 158, 11, 0.18);
-  --red-soft: rgba(248, 113, 113, 0.16);
-  --green-soft: rgba(52, 211, 153, 0.16);
-  --shadow: 0 30px 80px rgba(0, 0, 0, 0.42);
-  --shadow-sm: 0 14px 36px rgba(0, 0, 0, 0.32);
-  --shadow-xs: 0 10px 26px rgba(0, 0, 0, 0.24);
+
+  --page-bg: #0b0f17;
+  --page-bg-2: #111622;
+  --shell: #0e131d;
+  --nav: #0e131d;
+  --surface: #111622;
+  --surface-strong: #161d2c;
+  --surface-soft: #0d121c;
+  --panel-bg: #111622;
+  --bg-panel: #111622;
+  --card-bg: #161d2c;
+  --bg-elevated: #161d2c;
+  --bg-overlay: rgba(4, 7, 13, 0.72);
+  --control-bg: #0e131d;
+  --control-bg-focus: #161d2c;
+
+  --ink: #f1f5f9;
+  --text: #e2e8f0;
+  --muted: #94a3b8;
+  --muted-2: #7c8ea6;
+
+  --hairline: rgba(226, 232, 240, 0.09);
+  --border-color: rgba(226, 232, 240, 0.13);
+  --border-hover: rgba(226, 232, 240, 0.25);
+  --hairline-strong: rgba(59, 130, 246, 0.44);
+
+  --nav-soft: rgba(226, 232, 240, 0.06);
+  --glass-highlight: rgba(226, 232, 240, 0.06);
+
+  --accent: #3b82f6;
+  --accent-strong: #60a5fa;
+  --accent-ink: #93c5fd;
+  --accent-soft: rgba(59, 130, 246, 0.14);
+  --primary-fill: #2563eb;
+  --primary-fill-hover: #3b82f6;
+  --on-primary: #ffffff;
+
+  /* 暗色模式下语义墨水色（深色表面对比度均 >= 4.5:1） */
+  --blue: #60a5fa;
+  --blue-soft: rgba(59, 130, 246, 0.15);
+  --teal: #2dd4bf;
+  --teal-soft: rgba(45, 212, 191, 0.13);
+  --slate: #cbd5e1;
+  --slate-soft: rgba(148, 163, 184, 0.14);
+  --pink: #2dd4bf;
+  --pink-soft: rgba(45, 212, 191, 0.13);
+  --amber: #fbbf24;
+  --amber-soft: rgba(251, 191, 36, 0.14);
+  --red: #f87171;
+  --red-soft: rgba(248, 113, 113, 0.14);
+  --green: #34d399;
+  --green-soft: rgba(52, 211, 153, 0.14);
+
+  --shadow: 0 20px 48px rgba(0, 0, 0, 0.48), 0 2px 8px rgba(0, 0, 0, 0.32);
+  --shadow-sm: 0 8px 22px rgba(0, 0, 0, 0.36);
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.24);
+  --shadow-lift: 0 8px 20px rgba(0, 0, 0, 0.34);
+}
+
+html[data-effects="lite"] {
+  --blur: none;
+  --blur-soft: none;
+  --shadow-lift: none;
+}
+
+@media (max-width: 768px) {
+  :root {
+    --control-h: 40px;
+  }
 }

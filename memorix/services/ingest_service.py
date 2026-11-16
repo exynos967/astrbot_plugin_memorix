@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, Optional
 
+from ..amemorix.context import activate_context_shims
 from ..app_context import ScopeRuntimeManager
 from ..core.storage import detect_knowledge_type
 from ..core.utils.hash import compute_hash, normalize_text
@@ -86,6 +87,42 @@ class IngestService:
             warnings.append(f"vector_write_failed: {exc}")
             return False
 
+    @staticmethod
+    def _lookup_active_external_ref(ctx: Any, external_token: str) -> Optional[Dict[str, Any]]:
+        if not external_token:
+            return None
+        get_ref = getattr(ctx.metadata_store, "get_external_memory_ref", None)
+        get_para = getattr(ctx.metadata_store, "get_paragraph", None)
+        if not callable(get_ref) or not callable(get_para):
+            return None
+        ref = get_ref(external_token)
+        if not isinstance(ref, dict) or not ref.get("paragraph_hash"):
+            return None
+        para = get_para(str(ref["paragraph_hash"]))
+        if not isinstance(para, dict) or para.get("is_deleted"):
+            return None
+        return {"paragraph_hash": str(ref["paragraph_hash"]), "paragraph": para}
+
+    @staticmethod
+    def _record_external_ref(
+        ctx: Any,
+        *,
+        external_token: str,
+        paragraph_hash: str,
+        source_type: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not external_token or not paragraph_hash:
+            return
+        upsert_ref = getattr(ctx.metadata_store, "upsert_external_memory_ref", None)
+        if callable(upsert_ref):
+            upsert_ref(
+                external_id=external_token,
+                paragraph_hash=paragraph_hash,
+                source_type=source_type,
+                metadata=metadata,
+            )
+
     async def _write_direct_memory(
         self,
         *,
@@ -115,11 +152,25 @@ class IngestService:
             person_ids.append(f"{platform}:{user_id}" if platform else user_id)
         participants = [sender_name] if normalized_role == "user" and sender_name else []
         source_type = "chat_message"
-        external_id = str(message_id or "").strip()
-        if not external_id:
-            external_id = compute_hash(f"{source_type}:{session_id}:{role}:{timestamp}:{content}")
-
+        raw_msg_id = str(message_id or "").strip()
+        external_id = (
+            f"chat_message:{session_id}:{normalized_role}:{raw_msg_id}"
+            if raw_msg_id
+            else compute_hash(f"{source_type}:{session_id}:{role}:{timestamp}:{content}")
+        )
         memory_source = str(source or "").strip() or self._build_source(source_type, session_id, person_ids)
+
+        existing = self._lookup_active_external_ref(ctx, external_id)
+        if existing is not None:
+            return {
+                "success": True,
+                "stored_ids": [],
+                "skipped_ids": [existing["paragraph_hash"]],
+                "source": str(existing["paragraph"].get("source") or memory_source),
+                "vector_written": False,
+                "warnings": [],
+            }
+
         metadata = {
             "external_id": external_id,
             "source_type": source_type,
@@ -134,7 +185,7 @@ class IngestService:
             "group_name": str(group_name or "").strip(),
             "platform": str(platform or "").strip(),
             "unified_msg_origin": str(unified_msg_origin or "").strip(),
-            "message_id": str(message_id or "").strip(),
+            "message_id": raw_msg_id,
             "transcript_source": source,
         }
         metadata = {
@@ -149,6 +200,13 @@ class IngestService:
             metadata=metadata,
             knowledge_type=detect_knowledge_type(content).value,
             time_meta=time_meta or ({"event_time": timestamp} if timestamp else None),
+        )
+        self._record_external_ref(
+            ctx,
+            external_token=external_id,
+            paragraph_hash=paragraph_hash,
+            source_type=source_type,
+            metadata={"chat_id": str(session_id or "").strip(), "source": memory_source},
         )
 
         warnings: list[str] = []
@@ -169,8 +227,12 @@ class IngestService:
 
         ctx.metadata_store.enqueue_episode_pending(paragraph_hash, source=memory_source)
         try:
-            ctx.vector_store.save()
-            ctx.graph_store.save()
+            save_all = getattr(ctx, "save_all", None)
+            if callable(save_all):
+                await save_all()
+            else:
+                ctx.vector_store.save()
+                ctx.graph_store.save()
             sparse_index = getattr(ctx, "sparse_index", None)
             if sparse_index is not None and getattr(sparse_index.config, "enabled", False):
                 sparse_index.ensure_loaded()
@@ -213,120 +275,121 @@ class IngestService:
 
         runtime = await self.runtime_manager.get_runtime(scope_key)
         ctx = runtime.context
-        session = str(session_id or "").strip() or f"scope:{scope_key}"
-        if respect_filter and hasattr(ctx, "is_chat_enabled"):
-            check_user_id = str(filter_user_id or user_id or "").strip()
-            if not ctx.is_chat_enabled(stream_id=session, group_id=group_id, user_id=check_user_id):
+        with activate_context_shims(ctx):
+            session = str(session_id or "").strip() or f"scope:{scope_key}"
+            if respect_filter and hasattr(ctx, "is_chat_enabled"):
+                check_user_id = str(filter_user_id or user_id or "").strip()
+                if not ctx.is_chat_enabled(stream_id=session, group_id=group_id, user_id=check_user_id):
+                    return {
+                        "success": True,
+                        "skipped": True,
+                        "reason": "chat_filtered",
+                        "result": {
+                            "mode": "filtered",
+                            "transcript": {"session_id": session, "stored": False},
+                        },
+                    }
+            route = self.content_router.route_message(
+                role=role,
+                text=text,
+                metadata={
+                    "scope_key": scope_key,
+                    "session_id": session,
+                    "user_id": str(user_id or "").strip(),
+                    "group_id": str(group_id or "").strip(),
+                    "group_name": str(group_name or "").strip(),
+                    "platform": str(platform or "").strip(),
+                },
+            )
+            if not route.store_transcript and not route.write_direct:
                 return {
                     "success": True,
                     "skipped": True,
-                    "reason": "chat_filtered",
+                    "reason": route.reason,
                     "result": {
-                        "mode": "filtered",
-                        "transcript": {"session_id": session, "stored": False},
+                        "mode": route.route,
+                        "route": {
+                            "store_transcript": route.store_transcript,
+                            "write_direct": route.write_direct,
+                            "fact_candidate": route.fact_candidate,
+                            "reason": route.reason,
+                        },
                     },
                 }
-        route = self.content_router.route_message(
-            role=role,
-            text=text,
-            metadata={
-                "scope_key": scope_key,
-                "session_id": session,
-                "user_id": str(user_id or "").strip(),
+
+            ctx.metadata_store.upsert_transcript_session(
+                session_id=session,
+                source=source,
+                metadata={
+                    "scope_key": scope_key,
+                    "user_id": str(user_id or "").strip(),
+                    "group_id": str(group_id or "").strip(),
+                    "group_name": str(group_name or "").strip(),
+                    "platform": str(platform or "").strip(),
+                    "unified_msg_origin": str(unified_msg_origin or "").strip(),
+                },
+            )
+            msg_record = {"role": str(role or "user"), "content": text}
+            ts_val = float(timestamp) if timestamp else None
+            if ts_val:
+                msg_record["timestamp"] = ts_val
+            msg_meta = {
+                "sender_name": str(sender_name or "").strip(),
+                "sender_id": str(user_id or "").strip(),
                 "group_id": str(group_id or "").strip(),
                 "group_name": str(group_name or "").strip(),
                 "platform": str(platform or "").strip(),
-            },
-        )
-        if not route.store_transcript and not route.write_direct:
+                "session_id": session,
+                "unified_msg_origin": str(unified_msg_origin or "").strip(),
+                "message_id": str(message_id or "").strip(),
+                "role_origin": str(role_origin or role or "").strip(),
+            }
+            filtered_meta = {key: value for key, value in msg_meta.items() if value}
+            if filtered_meta:
+                msg_record.update(filtered_meta)
+            transcript_stored = False
+            if route.store_transcript:
+                ctx.metadata_store.append_transcript_messages(
+                    session_id=session,
+                    messages=[msg_record],
+                )
+                transcript_stored = True
+
+            direct_result: Optional[Dict[str, Any]] = None
+            if route.write_direct:
+                direct_result = await self._write_direct_memory(
+                    ctx=ctx,
+                    session_id=session,
+                    role=role,
+                    text=text,
+                    source=source,
+                    user_id=user_id,
+                    group_id=group_id,
+                    group_name=group_name,
+                    platform=platform,
+                    unified_msg_origin=unified_msg_origin,
+                    sender_name=sender_name,
+                    message_id=message_id,
+                    role_origin=role_origin,
+                    timestamp=float(timestamp) if timestamp else time.time(),
+                    time_meta=time_meta,
+                )
+
             return {
                 "success": True,
-                "skipped": True,
-                "reason": route.reason,
+                "skipped": False,
                 "result": {
-                    "mode": route.route,
+                    "mode": "direct" if direct_result is not None else "transcript_only",
                     "route": {
                         "store_transcript": route.store_transcript,
                         "write_direct": route.write_direct,
                         "fact_candidate": route.fact_candidate,
                         "reason": route.reason,
                     },
+                    "transcript": {"session_id": session, "stored": transcript_stored},
+                    "direct": direct_result,
                 },
             }
-
-        ctx.metadata_store.upsert_transcript_session(
-            session_id=session,
-            source=source,
-            metadata={
-                "scope_key": scope_key,
-                "user_id": str(user_id or "").strip(),
-                "group_id": str(group_id or "").strip(),
-                "group_name": str(group_name or "").strip(),
-                "platform": str(platform or "").strip(),
-                "unified_msg_origin": str(unified_msg_origin or "").strip(),
-            },
-        )
-        msg_record = {"role": str(role or "user"), "content": text}
-        ts_val = float(timestamp) if timestamp else None
-        if ts_val:
-            msg_record["timestamp"] = ts_val
-        msg_meta = {
-            "sender_name": str(sender_name or "").strip(),
-            "sender_id": str(user_id or "").strip(),
-            "group_id": str(group_id or "").strip(),
-            "group_name": str(group_name or "").strip(),
-            "platform": str(platform or "").strip(),
-            "session_id": session,
-            "unified_msg_origin": str(unified_msg_origin or "").strip(),
-            "message_id": str(message_id or "").strip(),
-            "role_origin": str(role_origin or role or "").strip(),
-        }
-        filtered_meta = {key: value for key, value in msg_meta.items() if value}
-        if filtered_meta:
-            msg_record.update(filtered_meta)
-        transcript_stored = False
-        if route.store_transcript:
-            ctx.metadata_store.append_transcript_messages(
-                session_id=session,
-                messages=[msg_record],
-            )
-            transcript_stored = True
-
-        direct_result: Optional[Dict[str, Any]] = None
-        if route.write_direct:
-            direct_result = await self._write_direct_memory(
-                ctx=ctx,
-                session_id=session,
-                role=role,
-                text=text,
-                source=source,
-                user_id=user_id,
-                group_id=group_id,
-                group_name=group_name,
-                platform=platform,
-                unified_msg_origin=unified_msg_origin,
-                sender_name=sender_name,
-                message_id=message_id,
-                role_origin=role_origin,
-                timestamp=float(timestamp) if timestamp else time.time(),
-                time_meta=time_meta,
-            )
-
-        return {
-            "success": True,
-            "skipped": False,
-            "result": {
-                "mode": "direct" if direct_result is not None else "transcript_only",
-                "route": {
-                    "store_transcript": route.store_transcript,
-                    "write_direct": route.write_direct,
-                    "fact_candidate": route.fact_candidate,
-                    "reason": route.reason,
-                },
-                "transcript": {"session_id": session, "stored": transcript_stored},
-                "direct": direct_result,
-            },
-        }
 
     @staticmethod
     def _as_list(raw: Any) -> list[str]:
@@ -370,97 +433,120 @@ class IngestService:
 
         runtime = await self.runtime_manager.get_runtime(scope_key)
         ctx = runtime.context
-        if respect_filter and hasattr(ctx, "is_chat_enabled") and not ctx.is_chat_enabled(stream_id, group_id, user_id):
-            return {"success": True, "stored_ids": [], "skipped_ids": [external_token], "detail": "chat_filtered"}
+        with activate_context_shims(ctx):
+            if respect_filter and hasattr(ctx, "is_chat_enabled") and not ctx.is_chat_enabled(stream_id, group_id, user_id):
+                return {"success": True, "stored_ids": [], "skipped_ids": [external_token], "detail": "chat_filtered"}
 
-        person_tokens = self._as_list(person_ids)
-        participant_tokens = self._as_list(participants)
-        tag_tokens = self._as_list(tags)
-        entity_tokens = list(dict.fromkeys([*self._as_list(entities), *person_tokens, *participant_tokens]))
-        relation_rows = [dict(item) for item in (relations or []) if isinstance(item, dict)]
-        source = self._build_source(source_kind, stream_id, person_tokens)
-        paragraph_meta = dict(metadata or {})
-        paragraph_meta.update(
-            {
-                "external_id": external_token,
-                "source_type": source_kind,
-                "chat_id": stream_id,
-                "person_ids": person_tokens,
-                "participants": participant_tokens,
-                "tags": tag_tokens,
+            person_tokens = self._as_list(person_ids)
+            source = self._build_source(source_kind, stream_id, person_tokens)
+            existing = self._lookup_active_external_ref(ctx, external_token)
+            if existing is not None:
+                return {
+                    "success": True,
+                    "stored_ids": [],
+                    "skipped_ids": [existing["paragraph_hash"]],
+                    "source": str(existing["paragraph"].get("source") or source),
+                    "vector_written": False,
+                    "warnings": [],
+                }
+
+            participant_tokens = self._as_list(participants)
+            tag_tokens = self._as_list(tags)
+            entity_tokens = list(dict.fromkeys([*self._as_list(entities), *person_tokens, *participant_tokens]))
+            relation_rows = [dict(item) for item in (relations or []) if isinstance(item, dict)]
+            paragraph_meta = dict(metadata or {})
+            paragraph_meta.update(
+                {
+                    "external_id": external_token,
+                    "source_type": source_kind,
+                    "chat_id": stream_id,
+                    "person_ids": person_tokens,
+                    "participants": participant_tokens,
+                    "tags": tag_tokens,
+                }
+            )
+            paragraph_meta = {key: value for key, value in paragraph_meta.items() if value not in (None, "", [])}
+            time_meta: Dict[str, Any] = {}
+            if timestamp is not None:
+                time_meta["event_time"] = timestamp
+            if time_start is not None:
+                time_meta["event_time_start"] = time_start
+            if time_end is not None:
+                time_meta["event_time_end"] = time_end
+
+            paragraph_hash = ctx.metadata_store.add_paragraph(
+                content=content,
+                source=source,
+                metadata=paragraph_meta,
+                knowledge_type=detect_knowledge_type(content).value,
+                time_meta=time_meta or None,
+            )
+            self._record_external_ref(
+                ctx,
+                external_token=external_token,
+                paragraph_hash=paragraph_hash,
+                source_type=source_kind,
+                metadata={"chat_id": stream_id, "source": source},
+            )
+
+            warnings: list[str] = []
+            vector_written = await self._ensure_paragraph_vector(
+                ctx=ctx,
+                paragraph_hash=paragraph_hash,
+                content=content,
+                warnings=warnings,
+            )
+
+            for name in entity_tokens:
+                ctx.metadata_store.add_entity(name=name, source_paragraph=paragraph_hash)
+
+            relation_hashes: list[str] = []
+            write_relation_vectors = bool(ctx.get_config("retrieval.relation_vectorization.enabled", False))
+            relation_service = getattr(ctx, "relation_write_service", None)
+            if relation_service is not None:
+                for row in relation_rows:
+                    subject = str(row.get("subject", "") or "").strip()
+                    predicate = str(row.get("predicate", "") or "").strip()
+                    obj = str(row.get("object", "") or row.get("obj", "") or "").strip()
+                    if not (subject and predicate and obj):
+                        continue
+                    try:
+                        result = await relation_service.upsert_relation_with_vector(
+                            subject=subject,
+                            predicate=predicate,
+                            obj=obj,
+                            confidence=float(row.get("confidence", 1.0) or 1.0),
+                            source_paragraph=paragraph_hash,
+                            metadata=row.get("metadata") if isinstance(row.get("metadata"), dict) else paragraph_meta,
+                            write_vector=write_relation_vectors,
+                        )
+                        ctx.metadata_store.link_paragraph_relation(paragraph_hash, result.hash_value)
+                        relation_hashes.append(result.hash_value)
+                    except Exception as exc:
+                        warnings.append(f"relation_write_failed: {exc}")
+
+            ctx.metadata_store.enqueue_episode_pending(paragraph_hash, source=source)
+            try:
+                save_all = getattr(ctx, "save_all", None)
+                if callable(save_all):
+                    await save_all()
+                else:
+                    ctx.vector_store.save()
+                    ctx.graph_store.save()
+                sparse_index = getattr(ctx, "sparse_index", None)
+                if sparse_index is not None and getattr(sparse_index.config, "enabled", False):
+                    sparse_index.ensure_loaded()
+            except Exception as exc:
+                warnings.append(f"persist_failed: {exc}")
+
+            return {
+                "success": True,
+                "stored_ids": [paragraph_hash, *relation_hashes],
+                "skipped_ids": [],
+                "source": source,
+                "vector_written": vector_written,
+                "warnings": warnings,
             }
-        )
-        paragraph_meta = {key: value for key, value in paragraph_meta.items() if value not in (None, "", [])}
-        time_meta: Dict[str, Any] = {}
-        if timestamp is not None:
-            time_meta["event_time"] = timestamp
-        if time_start is not None:
-            time_meta["event_time_start"] = time_start
-        if time_end is not None:
-            time_meta["event_time_end"] = time_end
-
-        paragraph_hash = ctx.metadata_store.add_paragraph(
-            content=content,
-            source=source,
-            metadata=paragraph_meta,
-            knowledge_type=detect_knowledge_type(content).value,
-            time_meta=time_meta or None,
-        )
-
-        warnings: list[str] = []
-        vector_written = await self._ensure_paragraph_vector(
-            ctx=ctx,
-            paragraph_hash=paragraph_hash,
-            content=content,
-            warnings=warnings,
-        )
-
-        for name in entity_tokens:
-            ctx.metadata_store.add_entity(name=name, source_paragraph=paragraph_hash)
-
-        relation_hashes: list[str] = []
-        write_relation_vectors = bool(ctx.get_config("retrieval.relation_vectorization.enabled", False))
-        relation_service = getattr(ctx, "relation_write_service", None)
-        if relation_service is not None:
-            for row in relation_rows:
-                subject = str(row.get("subject", "") or "").strip()
-                predicate = str(row.get("predicate", "") or "").strip()
-                obj = str(row.get("object", "") or row.get("obj", "") or "").strip()
-                if not (subject and predicate and obj):
-                    continue
-                try:
-                    result = await relation_service.upsert_relation_with_vector(
-                        subject=subject,
-                        predicate=predicate,
-                        obj=obj,
-                        confidence=float(row.get("confidence", 1.0) or 1.0),
-                        source_paragraph=paragraph_hash,
-                        metadata=row.get("metadata") if isinstance(row.get("metadata"), dict) else paragraph_meta,
-                        write_vector=write_relation_vectors,
-                    )
-                    ctx.metadata_store.link_paragraph_relation(paragraph_hash, result.hash_value)
-                    relation_hashes.append(result.hash_value)
-                except Exception as exc:
-                    warnings.append(f"relation_write_failed: {exc}")
-
-        ctx.metadata_store.enqueue_episode_pending(paragraph_hash, source=source)
-        try:
-            ctx.vector_store.save()
-            ctx.graph_store.save()
-            sparse_index = getattr(ctx, "sparse_index", None)
-            if sparse_index is not None and getattr(sparse_index.config, "enabled", False):
-                sparse_index.ensure_loaded()
-        except Exception as exc:
-            warnings.append(f"persist_failed: {exc}")
-
-        return {
-            "success": True,
-            "stored_ids": [paragraph_hash, *relation_hashes],
-            "skipped_ids": [],
-            "source": source,
-            "vector_written": vector_written,
-            "warnings": warnings,
-        }
 
     async def ingest_summary(
         self,

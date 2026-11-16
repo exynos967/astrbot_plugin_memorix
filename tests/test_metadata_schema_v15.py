@@ -7,8 +7,8 @@ from astrbot_plugin_memorix.memorix.core.storage.metadata_store import (
 
 
 def test_schema_version_is_current() -> None:
-    """当前模块级版本号使用 AstrBot 原生 schema 23。"""
-    assert SCHEMA_VERSION == 23
+    """当前模块级版本号使用 A_memorix 权威 schema 31。"""
+    assert SCHEMA_VERSION == 31
 
 
 def test_fuzzy_modify_plans_table_and_indexes_exist(tmp_path) -> None:
@@ -127,6 +127,6 @@ def test_schema_21_upstream_tables_and_plugin_pending_queue(tmp_path) -> None:
         }
         assert {"expires_at", "deletion_reason"} <= paragraph_columns
         version = store._conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
-        assert int(version) == 21
+        assert int(version) == SCHEMA_VERSION
     finally:
         store.close()

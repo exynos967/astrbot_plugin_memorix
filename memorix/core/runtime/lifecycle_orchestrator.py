@@ -1,4 +1,4 @@
-"""Lifecycle bootstrap/teardown helpers extracted from plugin.py."""
+"""从 plugin.py 拆出的生命周期启动与清理辅助逻辑。"""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from typing import Any, Callable, Coroutine, cast
 
-from ...amemorix.common.logging import get_logger
+from src.common.logger import get_logger
 
 from ...paths import default_data_dir, resolve_repo_path
 from ..embedding import create_embedding_api_adapter
@@ -19,6 +19,7 @@ from ..storage import (
     SparseMatrixFormat,
     VectorStore,
 )
+from ..storage.format_migration import run_startup_format_migration
 from ..utils.runtime_self_check import ensure_runtime_self_check
 from ..utils.relation_write_service import RelationWriteService
 
@@ -39,8 +40,7 @@ def _dual_vector_ready(data_dir: Path, *, expected_dimension: int) -> bool:
     manifest_dimension = int(payload.get("dimension", 0) or 0)
     if manifest_dimension not in {0, int(expected_dimension)}:
         logger.warning(
-            "双池 ready manifest 维度不匹配: "
-            f"manifest={manifest_dimension}, expected={int(expected_dimension)}"
+            f"双池 ready manifest 维度不匹配: manifest={manifest_dimension}, expected={int(expected_dimension)}"
         )
         return False
     return (data_dir / "vectors" / "paragraph").exists() and (data_dir / "vectors" / "graph").exists()
@@ -93,7 +93,7 @@ async def ensure_initialized(plugin: Any) -> None:
 
 
 def start_background_tasks(plugin: Any) -> None:
-    """Start background tasks idempotently."""
+    """以幂等方式启动后台任务。"""
     if not hasattr(plugin, "_episode_generation_task"):
         plugin._episode_generation_task = None
 
@@ -104,17 +104,26 @@ def start_background_tasks(plugin: Any) -> None:
     ):
         plugin._scheduled_import_task = asyncio.create_task(plugin._scheduled_import_loop())
 
-    if (
-        plugin.get_config("advanced.enable_auto_save", True)
-        and (plugin._auto_save_task is None or plugin._auto_save_task.done())
+    if plugin.get_config("advanced.enable_auto_save", True) and (
+        plugin._auto_save_task is None or plugin._auto_save_task.done()
     ):
         plugin._auto_save_task = asyncio.create_task(plugin._auto_save_loop())
 
-    if (
-        plugin.get_config("person_profile.enabled", True)
-        and (plugin._person_profile_refresh_task is None or plugin._person_profile_refresh_task.done())
+    if plugin.get_config("person_profile.enabled", True) and (
+        plugin._person_profile_refresh_task is None or plugin._person_profile_refresh_task.done()
     ):
         plugin._person_profile_refresh_task = asyncio.create_task(plugin._person_profile_refresh_loop())
+
+    if not hasattr(plugin, "_person_profile_refresh_queue_task"):
+        plugin._person_profile_refresh_queue_task = None
+
+    profile_queue_loop = getattr(plugin, "_person_profile_refresh_queue_loop", None)
+    if (
+        callable(profile_queue_loop)
+        and plugin.get_config("person_profile.enabled", True)
+        and (plugin._person_profile_refresh_queue_task is None or plugin._person_profile_refresh_queue_task.done())
+    ):
+        plugin._person_profile_refresh_queue_task = asyncio.create_task(profile_queue_loop())
 
     if plugin._memory_maintenance_task is None or plugin._memory_maintenance_task.done():
         plugin._memory_maintenance_task = asyncio.create_task(plugin._memory_maintenance_loop())
@@ -126,8 +135,10 @@ def start_background_tasks(plugin: Any) -> None:
     else:
         rv_enabled = False
         rv_backfill = False
-    if rv_enabled and rv_backfill and (
-        plugin._relation_vector_backfill_task is None or plugin._relation_vector_backfill_task.done()
+    if (
+        rv_enabled
+        and rv_backfill
+        and (plugin._relation_vector_backfill_task is None or plugin._relation_vector_backfill_task.done())
     ):
         plugin._relation_vector_backfill_task = asyncio.create_task(plugin._relation_vector_backfill_loop())
 
@@ -144,11 +155,12 @@ def start_background_tasks(plugin: Any) -> None:
 
 
 async def cancel_background_tasks(plugin: Any) -> None:
-    """Cancel all background tasks and wait for cleanup."""
+    """取消全部后台任务并等待清理完成。"""
     tasks = [
         ("scheduled_import", plugin._scheduled_import_task),
         ("auto_save", plugin._auto_save_task),
         ("person_profile_refresh", plugin._person_profile_refresh_task),
+        ("person_profile_refresh_queue", getattr(plugin, "_person_profile_refresh_queue_task", None)),
         ("memory_maintenance", plugin._memory_maintenance_task),
         ("relation_vector_backfill", plugin._relation_vector_backfill_task),
         ("episode_generation", getattr(plugin, "_episode_generation_task", None)),
@@ -170,24 +182,28 @@ async def cancel_background_tasks(plugin: Any) -> None:
     plugin._scheduled_import_task = None
     plugin._auto_save_task = None
     plugin._person_profile_refresh_task = None
+    plugin._person_profile_refresh_queue_task = None
     plugin._memory_maintenance_task = None
     plugin._relation_vector_backfill_task = None
     plugin._episode_generation_task = None
 
 
 async def initialize_storage_async(plugin: Any) -> None:
-    """Initialize storage components asynchronously."""
+    """异步初始化存储组件。"""
     data_dir_str = plugin.get_config("storage.data_dir", "./data")
     data_dir = resolve_repo_path(data_dir_str, fallback=default_data_dir())
 
     logger.info(f"A_Memorix 数据存储路径: {data_dir}")
     data_dir.mkdir(parents=True, exist_ok=True)
+    await asyncio.to_thread(run_startup_format_migration, data_dir)
 
     plugin.embedding_manager = create_embedding_api_adapter(
+        enable_cache=plugin.get_config("embedding.enable_cache", False),
         batch_size=plugin.get_config("embedding.batch_size", 32),
         max_concurrent=plugin.get_config("embedding.max_concurrent", 5),
         default_dimension=plugin.get_config("embedding.dimension", 1024),
-        model_name="auto",
+        model_name=plugin.get_config("embedding.model_name", "auto"),
+        dimension_request_mode=plugin.get_config("embedding.dimension_request_mode", "explicit"),
         retry_config=plugin.get_config("embedding.retry", {}),
     )
     logger.info("嵌入 API 适配器初始化完成")
@@ -209,21 +225,22 @@ async def initialize_storage_async(plugin: Any) -> None:
         quantization_type=quantization_type,
         data_dir=data_dir / "vectors",
     )
+    plugin.vector_store.min_train_threshold = plugin.get_config("embedding.min_train_threshold", 40)
     plugin.paragraph_vector_store = VectorStore(
         dimension=detected_dimension,
         quantization_type=quantization_type,
         data_dir=data_dir / "vectors" / "paragraph",
     )
+    plugin.paragraph_vector_store.min_train_threshold = plugin.get_config("embedding.min_train_threshold", 40)
     plugin.graph_vector_store = VectorStore(
         dimension=detected_dimension,
         quantization_type=quantization_type,
         data_dir=data_dir / "vectors" / "graph",
     )
+    plugin.graph_vector_store.min_train_threshold = plugin.get_config("embedding.min_train_threshold", 40)
     vector_pools_cfg = plugin.get_config("retrieval.vector_pools", {}) or {}
     vector_pool_mode = (
-        str(vector_pools_cfg.get("mode", "dual") if isinstance(vector_pools_cfg, dict) else "dual")
-        .strip()
-        .lower()
+        str(vector_pools_cfg.get("mode", "dual") if isinstance(vector_pools_cfg, dict) else "dual").strip().lower()
     )
     dual_vector_ready = vector_pool_mode == "dual" and _dual_vector_ready(
         data_dir,
@@ -233,14 +250,18 @@ async def initialize_storage_async(plugin: Any) -> None:
         logger.warning("双池配置已开启，但 ready manifest 不可用，当前按单池检索与写入运行")
     _set_runtime_vector_pools_ready(plugin, dual_vector_ready)
     logger.info(
-        "向量存储初始化完成（"
-        f"维度: {detected_dimension}, "
-        f"训练阈值: {plugin.vector_store.min_train_threshold}）"
+        f"向量存储初始化完成（维度: {detected_dimension}, 训练阈值: {plugin.vector_store.min_train_threshold}）"
     )
 
-    # 稀疏矩阵格式固定 CSR（原 graph.sparse_matrix_format 未暴露、默认即 csr，固化）。
+    matrix_format_str = plugin.get_config("graph.sparse_matrix_format", "csr")
+    matrix_format_map = {
+        "csr": SparseMatrixFormat.CSR,
+        "csc": SparseMatrixFormat.CSC,
+    }
+    matrix_format = matrix_format_map.get(matrix_format_str, SparseMatrixFormat.CSR)
+
     plugin.graph_store = GraphStore(
-        matrix_format=SparseMatrixFormat.CSR,
+        matrix_format=matrix_format,
         data_dir=data_dir / "graph",
     )
     logger.debug("图存储初始化完成")
@@ -294,10 +315,7 @@ async def initialize_storage_async(plugin: Any) -> None:
                 f"duration_ms={float(warmup_summary.get('duration_ms', 0.0)):.2f}"
             )
         else:
-            logger.warning(
-                "稀疏索引预热失败，后续检索将按需重试: "
-                f"{warmup_summary.get('error', 'unknown')}"
-            )
+            logger.warning(f"稀疏索引预热失败，后续检索将按需重试: {warmup_summary.get('error', 'unknown')}")
 
     if plugin.vector_store.has_data():
         try:
@@ -328,10 +346,7 @@ async def initialize_storage_async(plugin: Any) -> None:
                 f"duration_ms={float(warmup_summary.get('duration_ms', 0.0)):.2f}"
             )
         else:
-            logger.warning(
-                "向量索引预热失败，继续启用 sparse 降级路径: "
-                f"{warmup_summary.get('error', 'unknown')}"
-            )
+            logger.warning(f"向量索引预热失败，继续启用 sparse 降级路径: {warmup_summary.get('error', 'unknown')}")
     except Exception as e:
         logger.warning(f"向量索引预热异常，继续启用 sparse 降级路径: {e}")
     if dual_vector_ready:

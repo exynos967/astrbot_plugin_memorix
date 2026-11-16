@@ -19,7 +19,13 @@ logger = get_logger("A_Memorix.Settings")
 DEFAULT_CONFIG: Dict[str, Any] = {
     "cors": {"allow_origins": []},
     "storage": {"data_dir": "./data"},
+    "provider": {
+        "chat_provider_id": "",
+        "fast_chat_provider_id": "",
+    },
     "embedding": {
+        "enabled": False,
+        "enable_cache": False,
         "dimension": 1024,
         "quantization_type": "int8",
         "batch_size": 32,
@@ -30,6 +36,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "api_key": "",
             "model": "",
             "timeout_seconds": 30,
+            "max_retries": 3,
+        },
+        "openapi": {
+            "base_url": "",
+            "api_key": "",
+            "model": "",
+            "timeout_seconds": 30.0,
             "max_retries": 3,
         },
     },
@@ -69,6 +82,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "candidate_multiplier": 8,
             "default_top_k": 10,
             "max_scan": 1000,
+        },
+        "auto_route": {
+            "enabled": True,
+            "enable_time_intent": True,
         },
         "aggregate": {
             "rrf_k": 60,
@@ -188,6 +205,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "context_length": 50,
         "include_personality": True,
         "default_knowledge_type": "narrative",
+        "auto_import": {
+            "enabled": True,
+            "after_reply_only": True,
+            "min_new_messages": 12,
+            "cooldown_minutes": 30,
+        },
     },
     "person_profile": {
         "enabled": True,
@@ -240,7 +263,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         },
     },
     "person_fact_writeback": {
-        "enabled": False,
+        "enabled": True,
         "queue_maxsize": 256,
         "min_user_text_chars": 4,
         "max_facts_per_turn": 5,
@@ -263,7 +286,47 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "queue_maxsize": 1024,
         "summary_poll_interval_seconds": 1,
     },
+    "web": {
+        "import": {
+            "max_queue_size": 20,
+            "max_files_per_task": 200,
+            "max_file_size_mb": 20,
+            "max_paste_chars": 200000,
+            "default_file_concurrency": 2,
+            "default_chunk_concurrency": 4,
+            "llm_retry": {
+                "max_attempts": 4,
+                "min_wait_seconds": 1.0,
+                "max_wait_seconds": 8.0,
+            },
+            "path_aliases": {
+                "raw": "raw",
+                "plugin_data": ".",
+            },
+        },
+    },
+    "image_memory": {
+        "enabled": True,
+        "require_embedding": True,
+        "auto_inject_enabled": True,
+        "max_bytes": 10 * 1024 * 1024,
+        "max_pixels": 40_000_000,
+        "candidate_limit": 8,
+        "similarity_threshold": 0.72,
+        "task_name": "image_embedding",
+        "preprocess_version": "identity_v1",
+        "probe_retry_seconds": 60.0,
+        "openapi": {
+            "enabled": False,
+            "base_url": "",
+            "api_key": "",
+            "model": "",
+            "dimension": 512,
+            "timeout_seconds": 30.0,
+        },
+    },
     "integration": {
+        "enable_v2_extended_tools": False,
         "feedback_correction_enabled": False,
         "feedback_correction_window_hours": 12.0,
         "feedback_correction_check_interval_minutes": 30,

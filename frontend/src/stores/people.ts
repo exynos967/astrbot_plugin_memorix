@@ -5,34 +5,42 @@ import {
   fetchPersonRegistry,
   queryPerson as queryPersonApi,
   savePersonOverride as savePersonOverrideApi,
+  upsertPersonRegistry,
   type PersonProfile,
   type PersonRegistryItem,
+  type PersonRegistryUpsertRequest,
 } from "@/services/personApi";
+import { personDisplayName } from "@/utils/personText";
 import { useGraphStore } from "@/stores/graph";
 import { useAppStore } from "@/stores/app";
 import { useLogsStore } from "@/stores/logs";
 import { errText } from "@/utils/error";
 
-
 /**
- * People store：人物候选 + 画像查询 + 人工覆盖。
+ * People store：已登记人物目录 + 画像查询/强制重算 + 登记更新 + 人工覆盖。
  *
- * 候选、画像和人工覆盖统一使用当前记忆作用域。
- *
- * 修复 H4（详情快速切换错位）：queryPerson / loadCandidates 各持单调请求序号，
- * await 后若序号已变（用户在返回前又发起新请求）则丢弃旧结果，避免旧画像/旧候选
- * 覆盖新结果导致错位。错误显式进 useAppStore 总线（不静默吞错）。
+ * 关键修复：
+ * 1. 查询未命中（success === false 或 person_id 为空）时绝不将原始搜索词写入 overrideId，杜绝脏主键覆盖。
+ * 2. 清除人工覆盖后立即以 force_refresh=true 重新拉取真实自动画像，消除残留人工覆盖状态。
+ * 3. 请求序号守卫（H4）与记忆作用域切换重置闭环。
  */
 export const usePeopleStore = defineStore("people", () => {
   const candidates = ref<PersonRegistryItem[]>([]);
+  const registryTotal = ref(0);
+  const registryPage = ref(1);
+  const registryPageSize = ref(20);
+  const registryKeyword = ref("");
+
   const profile = ref<PersonProfile | null>(null);
   const keyword = ref("");
   const topk = ref(12);
   const overrideId = ref("");
   const overrideText = ref("");
+
   const loadingCandidates = ref(false);
   const querying = ref(false);
   const busy = ref(false);
+  const upserting = ref(false);
 
   const app = useAppStore();
   const graph = useGraphStore();
@@ -40,13 +48,10 @@ export const usePeopleStore = defineStore("people", () => {
 
   let candidateSeq = 0;
   let querySeq = 0;
-  // 候选菜单（PersonQueryPanel/PersonOverridePanel）独立的只读序号，避免与右栏候选列表的 candidateSeq 互相 invalidate。
   let suggestSeq = 0;
 
   /**
-   * 候选菜单只读建议：拉 registry 返回候选项，**不写共享 candidates 状态**、不进 candidateSeq。
-   * 原候选菜单 source 复用 loadCandidates 会污染右栏 PersonListPanel 列表 + 两侧序号互相丢弃，
-   * 此处独立路径隔离。仍持序号守卫丢弃过期请求。
+   * 候选下拉只读建议：不污染右侧已登记人物目录状态与分页。
    */
   async function suggestPersons(kw = ""): Promise<PersonRegistryItem[]> {
     const seq = ++suggestSeq;
@@ -55,25 +60,38 @@ export const usePeopleStore = defineStore("people", () => {
       if (seq !== suggestSeq) return [];
       return data.items || [];
     } catch {
-      if (seq === suggestSeq) return [];
       return [];
     }
   }
 
-  /** 拉取候选 registry 写入右栏候选列表（"候选列表"按钮 + onMounted 用）。 */
-  async function loadCandidates(kw = ""): Promise<PersonRegistryItem[]> {
+  /**
+   * 拉取已登记人物目录（支持关键词检索与分页）。
+   */
+  async function loadRegistry(page = 1, kw = registryKeyword.value): Promise<PersonRegistryItem[]> {
     candidateSeq += 1;
     const seq = candidateSeq;
+    const safePage = Math.max(1, Math.floor(Number(page) || 1));
+    const trimmedKw = kw.trim();
+    registryKeyword.value = trimmedKw;
     loadingCandidates.value = true;
     try {
-      const data = await fetchPersonRegistry(kw, 1, 30, graph.effectiveScope());
-      if (seq !== candidateSeq) return []; // 旧请求丢弃（修 H4）
-      candidates.value = data.items || [];
-      return candidates.value;
+      const data = await fetchPersonRegistry(
+        trimmedKw,
+        safePage,
+        registryPageSize.value,
+        graph.effectiveScope(),
+      );
+      if (seq !== candidateSeq) return [];
+      const items = data.items || [];
+      candidates.value = items;
+      registryPage.value = data.page || safePage;
+      registryTotal.value = typeof data.total === "number" ? data.total : items.length;
+      return items;
     } catch (err) {
       if (seq === candidateSeq) {
-        app.pushError(errText(err), "loadPersonSuggestions");
+        app.pushError(errText(err), "人物目录");
         candidates.value = [];
+        registryTotal.value = 0;
       }
       return [];
     } finally {
@@ -81,38 +99,106 @@ export const usePeopleStore = defineStore("people", () => {
     }
   }
 
-  /** "候选列表"按钮：按当前关键词刷新候选。 */
-  async function refreshCandidates(): Promise<void> {
-    await loadCandidates(keyword.value.trim());
+  /** 兼容旧调用入口。 */
+  async function loadCandidates(kw = ""): Promise<PersonRegistryItem[]> {
+    return loadRegistry(1, kw);
   }
 
-  /** 查询画像（H4：序号守卫丢弃过期结果）。 */
-  async function query(): Promise<boolean> {
+  async function refreshCandidates(): Promise<void> {
+    await loadRegistry(registryPage.value, registryKeyword.value);
+  }
+
+  /**
+   * 查询人物画像（支持 forceRefresh 强制重算与 explicitPersonId 精确指定）。
+   */
+  async function query(forceRefresh = false, explicitPersonId = ""): Promise<boolean> {
+    const pid = explicitPersonId.trim();
     const kw = keyword.value.trim();
-    if (!kw) {
-      app.pushError("请填写人物关键词", "queryPerson");
+    if (!pid && !kw) {
+      app.pushError("请填写人物关键词或从目录选择人物", "人物画像");
       return false;
     }
+
     querySeq += 1;
     const seq = querySeq;
     querying.value = true;
     try {
-      const data = await queryPersonApi({
-        person_keyword: kw,
-        top_k: Number(topk.value) || 12,
-        force_refresh: false,
-      }, graph.effectiveScope());
-      if (seq !== querySeq) return false; // 旧请求丢弃（修 H4 错位）
+      const data = await queryPersonApi(
+        {
+          ...(pid ? { person_id: pid } : {}),
+          ...(kw ? { person_keyword: kw } : {}),
+          top_k: Math.max(1, Math.min(50, Number(topk.value) || 12)),
+          force_refresh: Boolean(forceRefresh),
+        },
+        graph.effectiveScope(),
+      );
+      if (seq !== querySeq) return false;
+
+      const resolvedId = String(data?.person_id || "").trim();
+      if (data?.success === false || !resolvedId) {
+        // 严禁在未命中时用原始关键词污染 overrideId
+        app.pushError(data?.error || `未找到与「${pid || kw}」匹配的人物画像`, "人物画像");
+        return false;
+      }
+
       profile.value = data;
-      overrideId.value = data.person_id || overrideId.value || kw;
+      overrideId.value = resolvedId;
       overrideText.value = data.manual_override_text || data.override_text || "";
-      logs.log(`人物画像查询：${data.person_name || kw}`, "info");
+      if (!kw && data.person_name) {
+        keyword.value = data.person_name;
+      }
+      logs.log(
+        `${forceRefresh ? "强制重算人物画像" : "人物画像查询"}：${data.person_name || resolvedId}`,
+        "info",
+        "人物画像",
+      );
+      if (forceRefresh) {
+        app.pushSuccess(`已强制重算「${data.person_name || resolvedId}」的画像`, "人物画像");
+      }
       return true;
     } catch (err) {
-      if (seq === querySeq) app.pushError(errText(err), "queryPerson");
+      if (seq === querySeq) app.pushError(errText(err), "人物画像");
       return false;
     } finally {
       if (seq === querySeq) querying.value = false;
+    }
+  }
+
+  /** 从已登记目录点击选中某个人物并立即加载画像。 */
+  async function selectPerson(payload: { personId: string; keyword?: string }): Promise<boolean> {
+    const pid = payload.personId.trim();
+    if (!pid) return false;
+    overrideId.value = pid;
+    keyword.value = (payload.keyword || pid).trim();
+    return query(false, pid);
+  }
+
+  /** 登记或更新人物目录记录（POST /v1/person/registry/upsert）。 */
+  async function upsertPerson(req: PersonRegistryUpsertRequest): Promise<boolean> {
+    const pid = String(req.person_id || "").trim();
+    if (!pid) {
+      app.pushError("请填写规范的 Person ID", "登记人物");
+      return false;
+    }
+    upserting.value = true;
+    try {
+      const scope = graph.effectiveScope();
+      const res = await upsertPersonRegistry({ ...req, person_id: pid }, scope);
+      if (scope !== graph.effectiveScope()) return true;
+
+      const item = res.item;
+      const display = item ? personDisplayName(item) : req.person_name || pid;
+      overrideId.value = pid;
+      keyword.value = display || pid;
+      app.pushSuccess(`人物「${display || pid}」已登记/更新`, "登记人物");
+      await loadRegistry(registryPage.value, registryKeyword.value);
+      await query(true, pid);
+      return true;
+    } catch (err) {
+      app.pushError(errText(err), "登记人物");
+      return false;
+    } finally {
+      upserting.value = false;
     }
   }
 
@@ -120,7 +206,7 @@ export const usePeopleStore = defineStore("people", () => {
     const id = overrideId.value.trim();
     const text = overrideText.value.trim();
     if (!id || !text) {
-      app.pushError("请填写 person id 和覆盖文本", "savePersonOverride");
+      app.pushError("请先选定有效的 Person ID 并填写覆盖文本", "人工覆盖");
       return false;
     }
     busy.value = true;
@@ -128,11 +214,16 @@ export const usePeopleStore = defineStore("people", () => {
       const scope = graph.effectiveScope();
       const data = await savePersonOverrideApi(id, text, "webui", scope);
       if (scope !== graph.effectiveScope() || id !== overrideId.value.trim()) return true;
-      if (data.profile) profile.value = data.profile;
-      logs.log("人工覆盖已保存", "info");
+      if (data.profile) {
+        profile.value = data.profile;
+      } else {
+        await query(true, id);
+      }
+      app.pushSuccess(`已保存「${id}」的人工画像覆盖`, "人工覆盖");
+      void loadRegistry(registryPage.value, registryKeyword.value);
       return true;
     } catch (err) {
-      app.pushError(errText(err), "savePersonOverride");
+      app.pushError(errText(err), "人工覆盖");
       return false;
     } finally {
       busy.value = false;
@@ -142,7 +233,7 @@ export const usePeopleStore = defineStore("people", () => {
   async function clearOverride(): Promise<boolean> {
     const id = overrideId.value.trim();
     if (!id) {
-      app.pushError("请填写 person id", "clearPersonOverride");
+      app.pushError("请先填写或选择有效的 Person ID", "人工覆盖");
       return false;
     }
     busy.value = true;
@@ -150,34 +241,56 @@ export const usePeopleStore = defineStore("people", () => {
       const scope = graph.effectiveScope();
       await clearPersonOverrideApi(id, scope);
       if (scope !== graph.effectiveScope() || id !== overrideId.value.trim()) return true;
+
       overrideText.value = "";
-      if (profile.value) {
+      if (profile.value && profile.value.person_id === id) {
         profile.value = {
           ...profile.value,
           has_manual_override: false,
           manual_override_text: "",
           override_text: "",
+          profile_source: "auto_snapshot",
+          profile_text: profile.value.auto_profile_text || "",
         };
       }
-      logs.log("人工覆盖已清除", "info");
+
+      app.pushSuccess(`已清除「${id}」的人工覆盖，正在重算自动画像`, "人工覆盖");
+      // 立即强制重算自动画像，确保 profile_text 与 profile_source 反映真实自动生成结果
+      await query(true, id);
+      void loadRegistry(registryPage.value, registryKeyword.value);
       return true;
     } catch (err) {
-      app.pushError(errText(err), "clearPersonOverride");
+      app.pushError(errText(err), "人工覆盖");
       return false;
     } finally {
       busy.value = false;
     }
   }
 
-  watch(() => graph.effectiveScope(), () => {
-    candidateSeq++; querySeq++; suggestSeq++;
-    candidates.value = []; profile.value = null;
-    overrideId.value = ""; overrideText.value = "";
-    querying.value = false; loadingCandidates.value = false;
-  });
+  watch(
+    () => graph.effectiveScope(),
+    () => {
+      candidateSeq += 1;
+      querySeq += 1;
+      suggestSeq += 1;
+      candidates.value = [];
+      registryTotal.value = 0;
+      registryPage.value = 1;
+      profile.value = null;
+      overrideId.value = "";
+      overrideText.value = "";
+      querying.value = false;
+      loadingCandidates.value = false;
+      void loadRegistry(1, registryKeyword.value);
+    },
+  );
 
   return {
     candidates,
+    registryTotal,
+    registryPage,
+    registryPageSize,
+    registryKeyword,
     profile,
     keyword,
     topk,
@@ -186,10 +299,14 @@ export const usePeopleStore = defineStore("people", () => {
     loadingCandidates,
     querying,
     busy,
+    upserting,
+    loadRegistry,
     loadCandidates,
     suggestPersons,
     refreshCandidates,
     query,
+    selectPerson,
+    upsertPerson,
     saveOverride,
     clearOverride,
   };

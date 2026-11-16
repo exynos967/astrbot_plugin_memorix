@@ -25,6 +25,8 @@ def _unpack(row):
 
 class MemoryOperationsMixin:
     def enqueue_memory_projection(self, item_type, item_hash):
+        if hasattr(self, "_ensure_projection_schema"):
+            self._ensure_projection_schema()
         if item_type not in TABLES:
             raise ValueError("invalid memory type")
         self._conn.execute(
@@ -294,6 +296,8 @@ class MemoryOperationsMixin:
             return result
 
     def memory_deletion_owner(self, item_type, item_hash):
+        if hasattr(self, "_ensure_projection_schema"):
+            self._ensure_projection_schema()
         row = self._conn.execute(
             "SELECT operation_id FROM memory_deletion_owners WHERE item_type = ? AND item_hash = ?",
             (item_type, item_hash),
@@ -301,6 +305,8 @@ class MemoryOperationsMixin:
         return row[0] if row else None
 
     def purge_memory_operations(self, cutoff, limit=1000):
+        if hasattr(self, "_ensure_projection_schema"):
+            self._ensure_projection_schema()
         purged = []
         with self.transaction(immediate=True) as conn:
             rows = conn.execute(

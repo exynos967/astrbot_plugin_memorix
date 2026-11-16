@@ -15,17 +15,14 @@ export interface UseCandidateMenuOptions {
 }
 
 /**
- * 候选菜单 composable：把一个输入框接入全局候选菜单。
- *
- * - open()：focus 时调用，attach 菜单 + 立即拉取候选项。
- * - onInput()：input 事件时调用，按 debounceMs 刷新候选项。
- * - onBeforeUnmount：清定时器 + 若菜单仍属本输入框则 detach。
- *
- * 修复 H8 的滚动隔离在 CandidateMenu.vue 层完成；本 composable 仅负责数据供给。
+ * 候选菜单 composable：
+ * - onInput(val?) 直接接收实时 DOM 输入值，消除 v-model prop 异步回传导致的 1 键滞后
+ * - 维护请求序列号 reqSeq + try/catch 保护，杜绝异步竞态乱序与未捕获 Promise 拒绝
  */
 export function useCandidateMenu(opts: UseCandidateMenuOptions) {
   const store = useCandidateStore();
   let timer: number | null = null;
+  let reqSeq = 0;
 
   function clearTimer(): void {
     if (timer != null) {
@@ -41,14 +38,21 @@ export function useCandidateMenu(opts: UseCandidateMenuOptions) {
     };
   }
 
-  async function refresh(): Promise<void> {
+  async function refresh(explicitKeyword?: string): Promise<void> {
     const el = opts.inputRef.value;
     if (!el) return;
-    const kw = opts.model.value;
-    const list = await opts.source(kw);
-    // 仅在菜单仍由本输入框持有时刷新（避免异步竞态写错菜单）
-    if (store.inputEl === el && store.visible) {
-      store.setItems(list);
+    const kw = explicitKeyword !== undefined ? explicitKeyword : (el.value ?? opts.model.value ?? "");
+    const seq = ++reqSeq;
+    try {
+      const list = await opts.source(kw);
+      if (seq !== reqSeq) return;
+      if (store.inputEl === el && store.visible) {
+        store.setItems(list);
+      }
+    } catch {
+      if (seq === reqSeq && store.inputEl === el && store.visible) {
+        store.setItems([]);
+      }
     }
   }
 
@@ -57,25 +61,34 @@ export function useCandidateMenu(opts: UseCandidateMenuOptions) {
     const el = opts.inputRef.value;
     if (!el) return;
     store.attach(el, [], makeChooseHandler());
-    void refresh();
+    void refresh(el.value ?? opts.model.value ?? "");
   }
 
-  function onInput(): void {
+  function onInput(val?: string | Event): void {
     clearTimer();
     const el = opts.inputRef.value;
     if (!el) return;
+    let freshVal: string;
+    if (typeof val === "string") {
+      freshVal = val;
+    } else if (val && typeof val === "object" && "target" in val && val.target) {
+      freshVal = (val.target as HTMLInputElement).value ?? el.value ?? "";
+    } else {
+      freshVal = el.value ?? opts.model.value ?? "";
+    }
     if (!store.visible || store.inputEl !== el) {
       store.attach(el, [], makeChooseHandler());
     }
     if (opts.debounceMs && opts.debounceMs > 0) {
-      timer = window.setTimeout(() => void refresh(), opts.debounceMs);
+      timer = window.setTimeout(() => void refresh(freshVal), opts.debounceMs);
     } else {
-      void refresh();
+      void refresh(freshVal);
     }
   }
 
   onBeforeUnmount(() => {
     clearTimer();
+    reqSeq += 1;
     if (store.inputEl === opts.inputRef.value) store.detach();
   });
 

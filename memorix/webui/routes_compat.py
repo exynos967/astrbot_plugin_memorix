@@ -2,13 +2,14 @@
 import asyncio
 import json
 from datetime import datetime
-from fastapi import FastAPI, HTTPException, Body, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict, Any, List, Optional
 from pydantic import BaseModel
 
 from astrbot.api import logger
 from ..core.utils.hash import compute_hash
+from ..core.utils.memory_lifecycle_policy import RelationLifecyclePolicy
 from ..amemorix.settings import mask_sensitive
 from ..services.graph_mutation_service import GraphMutationService
 from ..amemorix.services import DeleteService, MemoryService
@@ -46,10 +47,13 @@ class RuntimeConfigPatch(BaseModel):
     updates: Dict[str, Any] = {}
     persist: bool = False
 
-class SourceListRequest(BaseModel):
+class SourceListFilter(BaseModel):
     node_id: Optional[str] = None
     edge_source: Optional[str] = None
     edge_target: Optional[str] = None
+    source: Optional[str] = None
+
+SourceListRequest = SourceListFilter
 
 class SourceDeleteRequest(BaseModel):
     paragraph_hash: str
@@ -155,6 +159,27 @@ class MemorixServer:
                     return list(hashes)
             rels = self.plugin.metadata_store.get_relations(subject=source, object=target)
             return [str(item.get("hash", "")) for item in rels if item.get("hash")]
+
+        def _reinforce_relation_hashes(hashes: List[str]) -> None:
+            if not hashes or not self.plugin.metadata_store:
+                return
+            freeze_threshold = float(self.plugin.get_config("memory.prune_threshold", 0.1))
+            policy = RelationLifecyclePolicy(
+                half_life_hours=float(self.plugin.get_config("memory.half_life_hours", 24.0)),
+                freeze_threshold=freeze_threshold,
+                revive_threshold=float(self.plugin.get_config("memory.revive_threshold", freeze_threshold * 1.5)),
+                access_alpha=float(self.plugin.get_config("memory.access_reinforcement_alpha", 0.05)),
+                access_cooldown_seconds=(
+                    float(self.plugin.get_config("memory.access_reinforcement_cooldown_minutes", 60.0)) * 60.0
+                ),
+                reinforce_alpha=float(self.plugin.get_config("memory.explicit_reinforcement_alpha", 0.5)),
+                weaken_alpha=float(self.plugin.get_config("memory.weaken_alpha", 0.5)),
+            )
+            now_ts = datetime.now().timestamp()
+            try:
+                self.plugin.metadata_store.reinforce_relations(hashes, policy=policy, now=now_ts)
+            except TypeError:
+                self.plugin.metadata_store.reinforce_relations(hashes)
 
         def _save_available_stores() -> None:
             for store_name in ("vector_store", "graph_store"):
@@ -469,13 +494,6 @@ class MemorixServer:
                        # 安全的做法：如果可用则使用 GraphStore 规范化，然后哈希。
                        # 或者直接尝试按原样对 ID 进行哈希，假设它就是名称。
                        
-                       # 更好的做法：尽可能使用实用程序。
-                       from ..core.utils.hash import compute_hash
-                       
-                       # GraphStore 节点名称保留了大小写，但为了键值进行了规范化。
-                       # MetadataStore 的删除基于规范化哈希。
-                       # 所以我们应该对规范化名称进行哈希。
-                       
                        # 如果不容易获取规范化器，则将其转换为小写。
                        canon_name = nid.strip().lower() 
                        h = compute_hash(canon_name)
@@ -503,8 +521,7 @@ class MemorixServer:
             # --- V5: 注入记忆状态 (批量) ---
             if self.plugin.metadata_store:
                 try:
-                    import datetime
-                    now = datetime.datetime.now().timestamp()
+                    now = datetime.now().timestamp()
                     
                     # 元数据查询收集器
                     # 我们需要查询所有边的关系状态。
@@ -606,9 +623,15 @@ class MemorixServer:
             return {**result, "deleted_relations": (result.get("deleted", {}).get("relation", 0) if isinstance(result.get("deleted"), dict) else result.get("deleted", 0))}
 
         @self.app.post("/api/node")
+        @self.app.post("/api/node/create")
         async def create_node(data: NodeCreate):
-            result = await GraphMutationService(self.plugin).execute("create_node", node_id=data.node_id)
-            return {**result, "node_id": data.node_id}
+            label = str(data.label).strip() if data.label is not None else ""
+            extra_kwargs: Dict[str, Any] = {"metadata": {"label": label}} if label else {}
+            result = await GraphMutationService(self.plugin).execute("create_node", node_id=data.node_id, **extra_kwargs)
+            payload = {**result, "node_id": data.node_id}
+            if label:
+                payload["label"] = label
+            return payload
 
         @self.app.post("/api/edge")
         async def create_edge(data: EdgeCreate):
@@ -623,19 +646,27 @@ class MemorixServer:
             return {**result, "old_id": data.old_id, "new_id": data.new_id}
 
         @self.app.post("/api/source/list")
-        async def list_sources(data: SourceListRequest):
+        async def list_sources(data: SourceListFilter):
             """获取来源段落列表"""
             if self.plugin.metadata_store is None:
                  raise HTTPException(status_code=503, detail="Metadata store not initialized")
             
             paragraphs = []
             seen_hashes = set()
+            source_filter = str(data.source or "").strip()
             
             try:
                 # 0. 如果无任何参数，则返回文件列表 (Summary Mode)
-                if not data.node_id and not data.edge_source and not data.edge_target:
+                if not data.node_id and not data.edge_source and not data.edge_target and not source_filter:
                     sources = self.plugin.metadata_store.get_all_sources()
                     return {"mode": "summary", "sources": sources}
+                # 0.5 如果是查特定来源 (By Source)
+                if source_filter:
+                    source_paras = self.plugin.metadata_store.get_paragraphs_by_source(source_filter)
+                    for p in source_paras:
+                        if p["hash"] not in seen_hashes:
+                            paragraphs.append(p)
+                            seen_hashes.add(p["hash"])
                 # 1. 如果是查节点来源 (By Entity)
                 if data.node_id:
                     # 注意: WebUI 传来的 node_id 通常是实体名称 (Node Name)
@@ -696,13 +727,30 @@ class MemorixServer:
         # --- V5 记忆管理端点 ---
         
         class MemoryProtectRequest(BaseModel):
-            id: str # 边 ID "s_t"
+            id: str = "" # 边 ID "s_t"
+            source: Optional[str] = None
+            target: Optional[str] = None
             type: str = "ttl" # "pin" (置顶) 或 "ttl" (时间限制)
             hours: Optional[float] = None
             duration: Optional[float] = 0.0 # TTL 的小时数
             
         class MemoryActionRequest(BaseModel):
-            id: str # 边 ID "s_t"
+            id: str = "" # 边 ID "s_t"
+            source: Optional[str] = None
+            target: Optional[str] = None
+
+        def _resolve_edge_endpoints(data: Any) -> tuple[str, str]:
+            explicit_s = str(getattr(data, "source", None) or "").strip()
+            explicit_t = str(getattr(data, "target", None) or "").strip()
+            if explicit_s and explicit_t:
+                return explicit_s, explicit_t
+            raw_id = str(getattr(data, "id", None) or "")
+            if "_" not in raw_id:
+                raise HTTPException(400, "Invalid ID format")
+            s, t = raw_id.split("_", 1)
+            if not s or not t:
+                raise HTTPException(400, "Invalid ID format")
+            return s, t
             
         class MemoryRestoreRequest(BaseModel):
             hash: str
@@ -743,8 +791,7 @@ class MemorixServer:
         @self.app.post("/api/memory/reinforce")
         async def reinforce_memory(data: MemoryActionRequest):
             """强化记忆 (Reset decay)"""
-            if "_" not in data.id: raise HTTPException(400, "Invalid ID format")
-            s, t = data.id.split("_", 1) 
+            s, t = _resolve_edge_endpoints(data)
             
             if not self.plugin.graph_store: raise HTTPException(503, "Graph store missing")
             
@@ -756,7 +803,7 @@ class MemorixServer:
                 if s_idx is not None and t_idx is not None:
                      hashes = gst._edge_hash_map.get((s_idx, t_idx), set())
                      if hashes:
-                         self.plugin.metadata_store.reinforce_relations(list(hashes))
+                         _reinforce_relation_hashes(list(hashes))
                 
                 # 稍微提升权重
                 self.plugin.graph_store.update_edge_weight(s, t, 0.1) 
@@ -770,8 +817,7 @@ class MemorixServer:
         @self.app.post("/api/memory/freeze")
         async def freeze_memory(data: MemoryActionRequest):
             """手动冷冻记忆"""
-            if "_" not in data.id: raise HTTPException(400, "Invalid ID format")
-            s, t = data.id.split("_", 1)
+            s, t = _resolve_edge_endpoints(data)
             
             if not self.plugin.graph_store: raise HTTPException(503, "Graph store missing")
 
@@ -798,8 +844,7 @@ class MemorixServer:
         @self.app.post("/api/memory/protect")
         async def protect_memory(data: MemoryProtectRequest):
             """设置保护 (Pin/TTL)"""
-            if "_" not in data.id: raise HTTPException(400, "Invalid ID format")
-            s, t = data.id.split("_", 1)
+            s, t = _resolve_edge_endpoints(data)
             
             if not self.plugin.graph_store: raise HTTPException(503, "Graph store missing")
 
@@ -856,13 +901,11 @@ class MemorixServer:
             """按 WebUI 边 ID 强化关系；兼容只知道 source_target 的图谱详情按钮。"""
             if not self.plugin.metadata_store:
                 raise HTTPException(status_code=503, detail="Metadata store missing")
-            if "_" not in data.id:
-                raise HTTPException(400, "Invalid ID format")
-            s, t = data.id.split("_", 1)
+            s, t = _resolve_edge_endpoints(data)
             hashes = _edge_relation_hashes(s, t)
             if not hashes:
                 return {"success": False, "message": "未找到关系", "count": 0}
-            self.plugin.metadata_store.reinforce_relations(hashes)
+            _reinforce_relation_hashes(hashes)
             if self.plugin.graph_store:
                 self.plugin.graph_store.update_edge_weight(s, t, 1.0)
                 self.plugin.graph_store.save()
@@ -874,9 +917,7 @@ class MemorixServer:
             """按 WebUI 边 ID 保护关系，接受旧 WebUI 的 hours 参数。"""
             if not self.plugin.metadata_store:
                 raise HTTPException(status_code=503, detail="Metadata store missing")
-            if "_" not in data.id:
-                raise HTTPException(400, "Invalid ID format")
-            s, t = data.id.split("_", 1)
+            s, t = _resolve_edge_endpoints(data)
             hashes = _edge_relation_hashes(s, t)
             if not hashes:
                 return {"success": False, "message": "未找到关系", "count": 0}
@@ -900,9 +941,7 @@ class MemorixServer:
             """按 WebUI 边 ID 冷冻关系。"""
             if not self.plugin.metadata_store:
                 raise HTTPException(status_code=503, detail="Metadata store missing")
-            if "_" not in data.id:
-                raise HTTPException(400, "Invalid ID format")
-            s, t = data.id.split("_", 1)
+            s, t = _resolve_edge_endpoints(data)
             hashes = _edge_relation_hashes(s, t)
             if not hashes:
                 return {"success": False, "message": "未找到关系", "count": 0}
@@ -1069,18 +1108,71 @@ class MemorixServer:
         async def manual_save():
             """手动保存所有数据到磁盘"""
             try:
-                saved_components = []
-                if self.plugin.graph_store is not None:
-                    self.plugin.graph_store.save()
-                    saved_components.append("graph_store")
-                if self.plugin.vector_store is not None:
-                    self.plugin.vector_store.save()
-                    saved_components.append("vector_store")
+                saved_components: List[str] = []
+                save_all_fn = getattr(self.plugin, "save_all", None)
+                dual_checker = getattr(self.plugin, "_dual_vector_pools_enabled", None)
+                dual_ready = (
+                    bool(dual_checker())
+                    if callable(dual_checker)
+                    else bool(getattr(self.plugin, "_dual_vector_pools_ready", False))
+                )
+                if callable(save_all_fn):
+                    await save_all_fn()
+                    if getattr(self.plugin, "graph_store", None) is not None:
+                        saved_components.append("graph_store")
+                    if getattr(self.plugin, "vector_store", None) is not None:
+                        saved_components.append("vector_store")
+                    if dual_ready:
+                        if getattr(self.plugin, "paragraph_vector_store", None) is not None:
+                            saved_components.append("paragraph_vector_store")
+                        if getattr(self.plugin, "graph_vector_store", None) is not None:
+                            saved_components.append("graph_vector_store")
+                else:
+                    if getattr(self.plugin, "graph_store", None) is not None:
+                        self.plugin.graph_store.save()
+                        saved_components.append("graph_store")
+                    if getattr(self.plugin, "vector_store", None) is not None:
+                        self.plugin.vector_store.save()
+                        saved_components.append("vector_store")
+                    if dual_ready:
+                        for pool_name in ("paragraph_vector_store", "graph_vector_store"):
+                            pool_store = getattr(self.plugin, pool_name, None)
+                            if pool_store is not None and callable(getattr(pool_store, "save", None)):
+                                pool_store.save()
+                                saved_components.append(pool_name)
+
+                img_rt = getattr(self.plugin, "image_memory_runtime", None)
+                if img_rt is None:
+                    admin_svc = getattr(self.app.state, "admin_service", None)
+                    scope_k = str(getattr(self.app.state, "scope_key", "") or "")
+                    if admin_svc is not None and scope_k:
+                        img_rt = getattr(admin_svc, "_image_runtimes", {}).get(scope_k)
+                if img_rt is not None and getattr(img_rt, "vector_store", None) is not None:
+                    persist_fn = getattr(img_rt, "persist_vector_store", None)
+                    if callable(persist_fn):
+                        await asyncio.to_thread(
+                            persist_fn,
+                            img_rt.vector_store,
+                            getattr(img_rt, "fingerprint", {}) or {},
+                        )
+                        saved_components.append("image_vector_store")
+                    elif callable(getattr(img_rt.vector_store, "save", None)):
+                        await asyncio.to_thread(img_rt.vector_store.save)
+                        saved_components.append("image_vector_store")
+
                 logger.info(f"手动保存完成: {saved_components}")
                 return {"success": True, "saved": saved_components}
             except Exception as e:
                 logger.error(f"Manual save failed: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
+
+        def _serialize_public_config(raw_cfg: Dict[str, Any]) -> Dict[str, Any]:
+            masked = mask_sensitive(raw_cfg)
+            img_section = masked.get("image_memory")
+            if isinstance(img_section, dict) and "configured_enabled" in img_section:
+                img_section["effective_enabled"] = bool(img_section.get("enabled", False))
+                img_section["enabled"] = bool(img_section["configured_enabled"])
+            return masked
 
         @self.app.get("/api/config")
         async def get_config():
@@ -1091,12 +1183,19 @@ class MemorixServer:
             }
             plugin_config = getattr(self.plugin, "config", None)
             if isinstance(plugin_config, dict):
-                base_payload["config"] = mask_sensitive(plugin_config)
+                base_payload["config"] = _serialize_public_config(plugin_config)
             return base_payload
 
         @self.app.patch("/api/config/runtime")
         async def patch_runtime_config(data: RuntimeConfigPatch):
             """更新运行时配置，适配新版 basic WebUI 的配置面板。"""
+
+            def _merge_dict_inplace(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
+                for k, v in src.items():
+                    if isinstance(v, dict) and isinstance(dst.get(k), dict):
+                        _merge_dict_inplace(dst[k], v)
+                    else:
+                        dst[k] = v
 
             def _set_nested(target: Dict[str, Any], dotted_key: str, value: Any) -> None:
                 parts = [part for part in str(dotted_key or "").split(".") if part]
@@ -1109,35 +1208,177 @@ class MemorixServer:
                         next_value = {}
                         current[part] = next_value
                     current = next_value
-                current[parts[-1]] = value
+                leaf = parts[-1]
+                if isinstance(value, dict) and isinstance(current.get(leaf), dict):
+                    _merge_dict_inplace(current[leaf], value)
+                else:
+                    current[leaf] = value
 
             plugin_config = getattr(self.plugin, "config", None)
             if not isinstance(plugin_config, dict):
                 raise HTTPException(status_code=500, detail="runtime config is not available")
 
-            for key, value in (data.updates or {}).items():
+            updates = dict(data.updates or {})
+            explicit_img_enabled: Optional[bool] = None
+            if "image_memory.enabled" in updates:
+                explicit_img_enabled = bool(updates["image_memory.enabled"])
+            elif isinstance(updates.get("image_memory"), dict) and "enabled" in updates["image_memory"]:
+                explicit_img_enabled = bool(updates["image_memory"]["enabled"])
+
+            for key, value in updates.items():
                 _set_nested(plugin_config, str(key), value)
 
             settings = getattr(self.plugin, "settings", None)
             settings_config = getattr(settings, "config", None)
             if isinstance(settings_config, dict) and settings_config is not plugin_config:
-                for key, value in (data.updates or {}).items():
+                for key, value in updates.items():
                     _set_nested(settings_config, str(key), value)
 
+            image_cfg_changed = any(
+                str(k) == "image_memory" or str(k).startswith("image_memory.")
+                for k in updates
+            )
+            if image_cfg_changed and isinstance(plugin_config.get("image_memory"), dict):
+                from ..engine.host_shims.embedding_shim import resolve_image_memory_status
+
+                img_dict = plugin_config["image_memory"]
+                if explicit_img_enabled is not None:
+                    img_dict["configured_enabled"] = explicit_img_enabled
+                else:
+                    img_dict.setdefault("configured_enabled", bool(img_dict.get("enabled", True)))
+                effective_img_enabled = bool(resolve_image_memory_status(config=plugin_config)["enabled"])
+                img_dict["enabled"] = effective_img_enabled
+                if isinstance(settings_config, dict) and settings_config is not plugin_config:
+                    settings_config["image_memory"] = dict(img_dict)
+                if not effective_img_enabled and hasattr(self.plugin, "image_memory_runtime"):
+                    self.plugin.image_memory_runtime = None
+
             self.plugin.config = plugin_config
-            if "advanced.enable_auto_save" in (data.updates or {}):
-                self.plugin._runtime_auto_save = bool(data.updates["advanced.enable_auto_save"])
+            if "advanced.enable_auto_save" in updates:
+                self.plugin._runtime_auto_save = bool(updates["advanced.enable_auto_save"])
+            elif isinstance(updates.get("advanced"), dict) and "enable_auto_save" in updates["advanced"]:
+                self.plugin._runtime_auto_save = bool(updates["advanced"]["enable_auto_save"])
+
+            threshold_changed = any(
+                str(k) == "threshold" or str(k).startswith("threshold.")
+                for k in updates
+            )
+            retrieval_changed = any(
+                str(k) == "retrieval"
+                or str(k).startswith("retrieval.")
+                or str(k) == "advanced.debug"
+                for k in updates
+            ) or (isinstance(updates.get("advanced"), dict) and "debug" in updates["advanced"])
+
+            if threshold_changed and hasattr(self.plugin, "threshold_filter"):
+                try:
+                    from ..core.retrieval.threshold import (
+                        DynamicThresholdFilter,
+                        ThresholdConfig,
+                        ThresholdMethod,
+                    )
+
+                    self.plugin.threshold_filter = DynamicThresholdFilter(
+                        ThresholdConfig(
+                            method=ThresholdMethod.ADAPTIVE,
+                            min_threshold=float(self.plugin.get_config("threshold.min_threshold", 0.3)),
+                            max_threshold=float(self.plugin.get_config("threshold.max_threshold", 0.95)),
+                            percentile=float(self.plugin.get_config("threshold.percentile", 75.0)),
+                            std_multiplier=1.5,
+                            min_results=int(self.plugin.get_config("threshold.min_results", 3)),
+                            enable_auto_adjust=bool(self.plugin.get_config("threshold.enable_auto_adjust", True)),
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning(f"Failed to rebuild threshold_filter on runtime patch: {exc}")
+
+            if retrieval_changed and getattr(self.plugin, "retriever", None) is not None:
+                try:
+                    from ..core.retrieval.dual_path import (
+                        DualPathRetriever,
+                        DualPathRetrieverConfig,
+                        FusionConfig,
+                        RelationIntentConfig,
+                        VectorPoolsConfig,
+                    )
+                    from ..core.retrieval.graph_relation_recall import GraphRelationRecallConfig
+                    from ..core.retrieval.posterior_graph import PosteriorGraphConfig
+                    from ..core.retrieval.sparse_bm25 import SparseBM25Config
+
+                    retrieval_raw = plugin_config.get("retrieval", {}) if isinstance(plugin_config.get("retrieval"), dict) else {}
+                    sparse_raw = retrieval_raw.get("sparse", {}) if isinstance(retrieval_raw.get("sparse"), dict) else {}
+                    fusion_raw = retrieval_raw.get("fusion", {}) if isinstance(retrieval_raw.get("fusion"), dict) else {}
+                    search_raw = retrieval_raw.get("search", {}) if isinstance(retrieval_raw.get("search"), dict) else {}
+                    rel_intent_raw = search_raw.get("relation_intent", {}) if isinstance(search_raw.get("relation_intent"), dict) else {}
+                    graph_recall_raw = search_raw.get("graph_recall", {}) if isinstance(search_raw.get("graph_recall"), dict) else {}
+                    post_graph_raw = search_raw.get("posterior_graph", {}) if isinstance(search_raw.get("posterior_graph"), dict) else {}
+                    vp_raw = dict(retrieval_raw.get("vector_pools", {})) if isinstance(retrieval_raw.get("vector_pools"), dict) else {}
+
+                    dual_checker = getattr(self.plugin, "_dual_vector_pools_enabled", None)
+                    dual_ready = (
+                        bool(dual_checker())
+                        if callable(dual_checker)
+                        else bool(getattr(self.plugin, "_dual_vector_pools_ready", False))
+                    )
+                    if not dual_ready:
+                        vp_raw["mode"] = "single"
+
+                    new_cfg = DualPathRetrieverConfig(
+                        top_k_paragraphs=int(self.plugin.get_config("retrieval.top_k_paragraphs", 20)),
+                        top_k_relations=int(self.plugin.get_config("retrieval.top_k_relations", 10)),
+                        top_k_final=int(self.plugin.get_config("retrieval.top_k_final", 10)),
+                        alpha=float(self.plugin.get_config("retrieval.alpha", 0.5)),
+                        enable_ppr=bool(self.plugin.get_config("retrieval.enable_ppr", True)),
+                        ppr_alpha=float(self.plugin.get_config("retrieval.ppr_alpha", 0.85)),
+                        ppr_timeout_seconds=float(self.plugin.get_config("retrieval.ppr_timeout_seconds", 1.5)),
+                        ppr_concurrency_limit=int(self.plugin.get_config("retrieval.ppr_concurrency_limit", 4)),
+                        enable_parallel=bool(self.plugin.get_config("retrieval.enable_parallel", True)),
+                        debug=bool(self.plugin.get_config("advanced.debug", False)),
+                        sparse=SparseBM25Config(**sparse_raw),
+                        fusion=FusionConfig(**fusion_raw),
+                        relation_intent=RelationIntentConfig(**rel_intent_raw),
+                        graph_recall=GraphRelationRecallConfig(**graph_recall_raw),
+                        posterior_graph=PosteriorGraphConfig(**post_graph_raw),
+                        vector_pools=VectorPoolsConfig(**vp_raw),
+                    )
+                    if all(
+                        getattr(self.plugin, attr, None) is not None
+                        for attr in ("vector_store", "graph_store", "metadata_store", "embedding_manager")
+                    ):
+                        p_store = getattr(self.plugin, "paragraph_vector_store", None) if dual_ready else self.plugin.vector_store
+                        g_store = getattr(self.plugin, "graph_vector_store", None) if dual_ready else self.plugin.vector_store
+                        new_retriever = DualPathRetriever(
+                            vector_store=self.plugin.vector_store,
+                            graph_store=self.plugin.graph_store,
+                            metadata_store=self.plugin.metadata_store,
+                            embedding_manager=self.plugin.embedding_manager,
+                            sparse_index=getattr(self.plugin, "sparse_index", None),
+                            config=new_cfg,
+                            paragraph_vector_store=p_store or self.plugin.vector_store,
+                            graph_vector_store=g_store or self.plugin.vector_store,
+                        )
+                        self.plugin.retriever = new_retriever
+                        for dependent_attr in ("episode_retrieval_service", "person_profile_service"):
+                            dep = getattr(self.plugin, dependent_attr, None)
+                            if dep is not None and hasattr(dep, "retriever"):
+                                dep.retriever = new_retriever
+                    else:
+                        self.plugin.retriever.config = new_cfg
+                except Exception as exc:
+                    logger.warning(f"Failed to rebuild retriever on runtime patch: {exc}")
 
             # WebUI 运行在线程内，只能安全更新当前 runtime；AstrBot 插件配置落盘由插件主线程管理。
             persisted = False
+            persist_supported = False
             persist_message = "当前 WebUI 仅支持运行时配置更新；请在 AstrBot 插件配置页持久化配置。"
             return {
                 "success": True,
                 "persisted": persisted,
+                "persist_supported": persist_supported,
                 "persist_message": persist_message,
                 "auto_save_enabled": self.plugin.get_config("advanced.enable_auto_save", True),
                 "auto_save_interval": self.plugin.get_config("advanced.auto_save_interval_minutes", 5),
-                "config": mask_sensitive(plugin_config),
+                "config": _serialize_public_config(plugin_config),
             }
 
         @self.app.post("/api/config/auto_save")
@@ -1146,3 +1387,118 @@ class MemorixServer:
             self.plugin._runtime_auto_save = data.enabled
             logger.info(f"自动保存已{'启用' if data.enabled else '禁用'}（运行时）")
             return {"success": True, "auto_save_enabled": data.enabled}
+
+        @self.app.get("/api/facts")
+        async def list_fact_claims(
+            scope_type: str = "",
+            scope_id: str = "",
+            status: str = "",
+            limit: int = 100,
+        ):
+            """查询当前作用域内的结构化事实账本（Schema 29 Fact Ledger）。"""
+            if self.plugin.metadata_store is None:
+                raise HTTPException(status_code=503, detail="Metadata store not initialized")
+            safe_limit = max(1, min(500, int(limit or 100)))
+            clauses = []
+            params: list[Any] = []
+            if scope_type.strip():
+                clauses.append("scope_type = ?")
+                params.append(scope_type.strip().lower())
+            if scope_id.strip():
+                clauses.append("scope_id = ?")
+                params.append(scope_id.strip())
+            if status.strip():
+                clauses.append("status = ?")
+                params.append(status.strip().lower())
+            where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            rows = self.plugin.metadata_store.query(
+                f"SELECT * FROM fact_claims {where_sql} ORDER BY updated_at DESC LIMIT ?",
+                (*params, safe_limit),
+            )
+            return {"success": True, "items": rows, "count": len(rows)}
+
+        @self.app.get("/api/images/status")
+        async def get_image_memory_status():
+            """获取当前作用域的图片记忆统计状态（Schema 29/31 Image Memory）。"""
+            if self.plugin.metadata_store is None:
+                raise HTTPException(status_code=503, detail="Metadata store not initialized")
+            from ..engine.host_shims.embedding_shim import resolve_image_memory_status
+
+            plugin_cfg = getattr(self.plugin, "config", {}) or {}
+            stats = self.plugin.metadata_store.image_memory_stats()
+            status_meta = resolve_image_memory_status(config=plugin_cfg)
+            return {"success": True, **stats, **status_meta}
+
+        class ChatMigrationCompatPreviewRequest(BaseModel):
+            source_chat_id: str
+            target_chat_id: str
+            migrate_transcript: bool = True
+            note: str = ""
+
+        class ChatMigrationCompatExecuteRequest(BaseModel):
+            confirmed: bool = False
+            confirm_overwrite: bool = False
+            refresh_fingerprint: bool = False
+
+        @self.app.get("/api/chat-migrations/chats")
+        async def compat_list_chat_migration_chats(query: str = "", limit: int = 100):
+            if self.plugin.metadata_store is None:
+                raise HTTPException(status_code=503, detail="Metadata store not initialized")
+            from ..services.chat_migration_service import AstrBotChatMigrationService
+
+            return await AstrBotChatMigrationService(self.plugin).list_chats(query=query, limit=limit)
+
+        @self.app.get("/api/chat-migrations")
+        async def compat_list_chat_migrations(limit: int = 50, status: str = ""):
+            if self.plugin.metadata_store is None:
+                raise HTTPException(status_code=503, detail="Metadata store not initialized")
+            from ..services.chat_migration_service import AstrBotChatMigrationService
+
+            return await AstrBotChatMigrationService(self.plugin).list_jobs(limit=limit, status=status)
+
+        @self.app.post("/api/chat-migrations/preview")
+        async def compat_preview_chat_migration(data: ChatMigrationCompatPreviewRequest):
+            if self.plugin.metadata_store is None:
+                raise HTTPException(status_code=503, detail="Metadata store not initialized")
+            from ..services.chat_migration_service import AstrBotChatMigrationService
+
+            try:
+                return await AstrBotChatMigrationService(self.plugin).preview(
+                    source_chat_id=data.source_chat_id,
+                    target_chat_id=data.target_chat_id,
+                    migrate_transcript=data.migrate_transcript,
+                    note=data.note,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        @self.app.get("/api/chat-migrations/{job_id}")
+        async def compat_get_chat_migration(job_id: str):
+            if self.plugin.metadata_store is None:
+                raise HTTPException(status_code=503, detail="Metadata store not initialized")
+            from ..services.chat_migration_service import AstrBotChatMigrationService
+
+            result = await AstrBotChatMigrationService(self.plugin).get_job(job_id)
+            if not result.get("success"):
+                raise HTTPException(status_code=404, detail=str(result.get("error") or "迁移任务不存在"))
+            return result
+
+        @self.app.post("/api/chat-migrations/{job_id}/execute")
+        async def compat_execute_chat_migration(job_id: str, data: ChatMigrationCompatExecuteRequest):
+            if self.plugin.metadata_store is None:
+                raise HTTPException(status_code=503, detail="Metadata store not initialized")
+            from ..services.chat_migration_service import AstrBotChatMigrationService
+
+            return await AstrBotChatMigrationService(self.plugin).execute(
+                job_id=job_id,
+                confirmed=bool(data.confirmed or data.confirm_overwrite),
+                refresh_fingerprint=data.refresh_fingerprint,
+            )
+
+        @self.app.post("/api/chat-migrations/{job_id}/recover")
+        async def compat_recover_chat_migration(job_id: str):
+            if self.plugin.metadata_store is None:
+                raise HTTPException(status_code=503, detail="Metadata store not initialized")
+            from ..services.chat_migration_service import AstrBotChatMigrationService
+
+            return await AstrBotChatMigrationService(self.plugin).recover(job_id=job_id)

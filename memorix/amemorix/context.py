@@ -3,24 +3,32 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Iterator, Optional, Tuple
 
 from ..core.embedding.api_adapter import EmbeddingAPIAdapter
-from ..core.retrieval import DynamicThresholdFilter, DualPathRetriever, SparseBM25Index
+from ..core.retrieval import DualPathRetriever, DynamicThresholdFilter, SparseBM25Index
 from ..core.storage import GraphStore, MetadataStore, VectorStore
 from ..core.utils.episode_retrieval_service import EpisodeRetrievalService
 from ..core.utils.episode_service import EpisodeService
 from ..core.utils.paragraph_vector_service import ParagraphVectorWriteService
 from ..core.utils.person_profile_service import PersonProfileService
 from ..core.utils.relation_write_service import RelationWriteService
-
 from .common.logging import get_logger
 from .settings import AppSettings
 
 logger = get_logger("A_Memorix.AppContext")
+
+
+def activate_context_shims(ctx: Any) -> contextlib.AbstractContextManager[Any]:
+    """安全激活 ctx 的 scope_shims；兼容单测中的轻量桩对象。"""
+    scope_shims = getattr(ctx, "scope_shims", None)
+    if callable(scope_shims):
+        return scope_shims()
+    return contextlib.nullcontext(ctx)
 
 
 @dataclass
@@ -53,7 +61,17 @@ class AppContext:
     graph_vector_store: Optional[VectorStore] = None
     _dual_vector_pools_ready: bool = False
 
+    @contextlib.contextmanager
+    def scope_shims(self) -> Iterator["AppContext"]:
+        """为当前协程激活本作用域隔离的 config 与 provider_bridge 上下文。"""
+        from ..engine.host_shims import config_shim, llm_shim
+
+        with config_shim.use_scope_config(self.config), llm_shim.use_provider_bridge(self.provider_bridge):
+            yield self
+
     def get_config(self, key: str, default: Any = None) -> Any:
+        if key == "runtime.vector_pools_ready":
+            return bool(self._dual_vector_pools_ready)
         current: Any = self.config
         for part in key.split("."):
             if isinstance(current, dict) and part in current:
@@ -64,6 +82,36 @@ class AppContext:
         if key == "advanced.enable_auto_save" and self._runtime_auto_save is not None:
             return bool(self._runtime_auto_save)
         return current
+
+    def activate_dual_vector_pools(self) -> None:
+        """在线激活双向量池读写与检索路径，无需重启作用域。"""
+        if self.paragraph_vector_store is None or self.graph_vector_store is None:
+            return
+        self._dual_vector_pools_ready = True
+        if isinstance(self.config, dict):
+            runtime_cfg = dict(self.config.get("runtime", {}) if isinstance(self.config.get("runtime"), dict) else {})
+            runtime_cfg["vector_pools_ready"] = True
+            self.config["runtime"] = runtime_cfg
+        if self.retriever is not None:
+            self.retriever.paragraph_vector_store = self.paragraph_vector_store
+            self.retriever.graph_vector_store = self.graph_vector_store
+            vp_cfg = getattr(getattr(self.retriever, "config", None), "vector_pools", None)
+            if vp_cfg is not None and hasattr(vp_cfg, "mode"):
+                vp_cfg.mode = "dual"
+        if self.paragraph_vector_service is not None:
+            self.paragraph_vector_service.vector_store = self.paragraph_vector_store
+        if self.relation_write_service is not None:
+            self.relation_write_service.vector_store = self.graph_vector_store
+        if self.person_profile_service is not None:
+            self.person_profile_service.paragraph_vector_store = self.paragraph_vector_store
+            self.person_profile_service.graph_vector_store = self.graph_vector_store
+            svc_cfg = getattr(self.person_profile_service, "plugin_config", None)
+            if isinstance(svc_cfg, dict):
+                svc_rt = dict(svc_cfg.get("runtime", {}) if isinstance(svc_cfg.get("runtime"), dict) else {})
+                svc_rt["vector_pools_ready"] = True
+                svc_cfg["runtime"] = svc_rt
+        self._runtime_self_check_report = None
+        self._request_dedup_cache.clear()
 
     def is_chat_enabled(
         self,
@@ -180,19 +228,67 @@ class AppContext:
         except Exception as exc:
             logger.warning("Failed to reinforce relation access: %s", exc)
 
+    def is_runtime_ready(self) -> bool:
+        return True
+
+    def persist_vector_store(
+        self,
+        store: Optional[VectorStore],
+        embedding_fingerprint: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """与 KernelRuntimeFacade 对齐，连同模型指纹持久化指定 VectorStore。"""
+        if store is None:
+            return
+        fingerprint = embedding_fingerprint
+        if fingerprint is None:
+            fp_getter = getattr(self.embedding_manager, "get_embedding_fingerprint", None)
+            dim = getattr(store, "dimension", None)
+            if callable(fp_getter) and dim is not None:
+                try:
+                    fingerprint = fp_getter(dimension=int(dim))
+                except Exception:
+                    fingerprint = None
+        if fingerprint is not None:
+            try:
+                store.save(embedding_fingerprint=fingerprint)
+                return
+            except TypeError:
+                pass
+        store.save()
+
+    def enqueue_paragraph_vector_backfill(self, paragraph_hash: str, *, error: str = "") -> None:
+        enqueuer = getattr(self.metadata_store, "enqueue_paragraph_vector_backfill", None)
+        if callable(enqueuer):
+            enqueuer(paragraph_hash, error=error)
+
+    def record_person_evidence_written(self, person_ids: Any, *, reason: str = "") -> None:
+        """与 KernelRuntimeFacade 对齐，在摘要/WebUI 导入写入人物证据后合并画像刷新请求。"""
+        if not bool(self.get_config("person_profile.enabled", True)):
+            return
+        enqueuer = getattr(self.metadata_store, "enqueue_person_profile_refresh", None)
+        if not callable(enqueuer):
+            return
+        clean_reason = str(reason or "").strip() or "memory_ingest"
+        for raw_pid in list(dict.fromkeys(person_ids or [])):
+            token = str(raw_pid or "").strip()
+            if token:
+                enqueuer(person_id=token, reason=clean_reason)
+
     async def save_all(self) -> None:
+        from ..core.utils.async_work import cancellation_safe_to_thread
+
         if self._dual_vector_pools_ready:
-            # 双池就绪：并行存主向量池 + 段落池 + 图谱池 + 图结构。
+            # 双池就绪：并行存主向量池 + 段落池 + 图谱池 + 图结构（连同模型指纹）。
             await asyncio.gather(
-                asyncio.to_thread(self.vector_store.save),
-                asyncio.to_thread(self.graph_store.save),
-                asyncio.to_thread(self.paragraph_vector_store.save),
-                asyncio.to_thread(self.graph_vector_store.save),
+                cancellation_safe_to_thread(self.persist_vector_store, self.vector_store),
+                cancellation_safe_to_thread(self.graph_store.save),
+                cancellation_safe_to_thread(self.persist_vector_store, self.paragraph_vector_store),
+                cancellation_safe_to_thread(self.persist_vector_store, self.graph_vector_store),
             )
             return
         await asyncio.gather(
-            asyncio.to_thread(self.vector_store.save),
-            asyncio.to_thread(self.graph_store.save),
+            cancellation_safe_to_thread(self.persist_vector_store, self.vector_store),
+            cancellation_safe_to_thread(self.graph_store.save),
         )
 
     def _dual_vector_pools_enabled(self) -> bool:

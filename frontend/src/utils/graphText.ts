@@ -1,75 +1,151 @@
-// Graph 视图纯函数工具：调色板、节点/边规范化、度数计算、缩放标签更新、scope 标签。
-// 从 legacy graphPalette/normalizeGraphNode/normalizeGraphEdge/graphDegrees/updateLabelsByZoom/graphScopeLabel
-// （index.html 行 3205-3224, 3744-3805, 3356-3363）提取为纯函数，供 useVisNetwork 与组件复用。
-//
-// 修复点：updateLabelsByZoom 在 legacy 中每次 zoom 都全量 nodes.update（可能数百次/秒拖慢），
-// 新实现由 useVisNetwork 用 RAF 节流调用 buildLabelUpdates，再批量 update。
+// Graph 视图纯函数工具：亮暗双主题技术调色板（Cobalt / Teal / Amber / Slate，零紫红/品红）、节点/边规范化、度数计算、缩放标签更新与作用域标签。
 
 import type { GraphEdge, GraphNode } from "@/services/graphApi";
 
+export const GRAPH_FONT_FACE =
+  'Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif';
+
 /** vis 调色板（依赖当前主题，由调用方传入 dark 布尔）。 */
 export interface GraphPalette {
+  dark: boolean;
+  fontFace: string;
+  nodeBg: string;
+  nodeDeletedBg: string;
   nodeFont: string;
   nodeMuted: string;
+  nodeBorder: string;
+  nodeShadow: string;
+  ghostBg: string;
   edgeFont: string;
   edgeStroke: string;
   edgeColor: string;
+  edgePinned: string;
+  edgeInactive: string;
   edgeHighlight: string;
+  highlightCenterBg: string;
+  highlightCenterBorder: string;
+  highlightCenterFont: string;
+  highlightFirstBg: string;
+  highlightFirstBorder: string;
+  highlightFirstFont: string;
+  highlightSecondBg: string;
+  highlightSecondBorder: string;
+  highlightSecondFont: string;
+  dimNodeBg: string;
+  dimNodeBorder: string;
+  dimNodeFont: string;
+  dimEdgeColor: string;
+  dimEdgeFont: string;
 }
 
 export function graphPalette(dark: boolean): GraphPalette {
   return dark
     ? {
-        nodeFont: "#dbeafe",
-        nodeMuted: "#8091a7",
-        edgeFont: "#9fb3c8",
-        edgeStroke: "#0b1220",
+        dark: true,
+        fontFace: GRAPH_FONT_FACE,
+        nodeBg: "#3b82f6",
+        nodeDeletedBg: "#ef4444",
+        nodeFont: "#e2e8f0",
+        nodeMuted: "#94a3b8",
+        nodeBorder: "#1e293b",
+        nodeShadow: "rgba(2, 6, 23, 0.45)",
+        ghostBg: "#475569",
+        edgeFont: "#cbd5e1",
+        edgeStroke: "#0b111e",
         edgeColor: "#64748b",
-        edgeHighlight: "#93c5fd",
+        edgePinned: "#fbbf24",
+        edgeInactive: "#475569",
+        edgeHighlight: "#2dd4bf",
+        highlightCenterBg: "#2563eb",
+        highlightCenterBorder: "#93c5fd",
+        highlightCenterFont: "#f8fafc",
+        highlightFirstBg: "#14b8a6",
+        highlightFirstBorder: "#99f6e4",
+        highlightFirstFont: "#e2e8f0",
+        highlightSecondBg: "#1e3a5f",
+        highlightSecondBorder: "#475569",
+        highlightSecondFont: "#94a3b8",
+        dimNodeBg: "rgba(30, 41, 59, 0.5)",
+        dimNodeBorder: "rgba(71, 85, 105, 0.4)",
+        dimNodeFont: "#475569",
+        dimEdgeColor: "rgba(100, 116, 139, 0.22)",
+        dimEdgeFont: "#475569",
       }
     : {
-        nodeFont: "#1b2736",
-        nodeMuted: "#91a0ad",
-        edgeFont: "#526679",
-        edgeStroke: "#ffffff",
-        edgeColor: "#9fb4c4",
-        edgeHighlight: "#1da7e7",
+        dark: false,
+        fontFace: GRAPH_FONT_FACE,
+        nodeBg: "#2563eb",
+        nodeDeletedBg: "#dc2626",
+        nodeFont: "#162436",
+        nodeMuted: "#64748b",
+        nodeBorder: "#f8fafc",
+        nodeShadow: "rgba(15, 23, 42, 0.12)",
+        ghostBg: "#cbd5e1",
+        edgeFont: "#475569",
+        edgeStroke: "#f8fafc",
+        edgeColor: "#94a3b8",
+        edgePinned: "#d97706",
+        edgeInactive: "#cbd5e1",
+        edgeHighlight: "#0d9488",
+        highlightCenterBg: "#1d4ed8",
+        highlightCenterBorder: "#dbeafe",
+        highlightCenterFont: "#0f172a",
+        highlightFirstBg: "#0d9488",
+        highlightFirstBorder: "#ccfbf1",
+        highlightFirstFont: "#162436",
+        highlightSecondBg: "#dbeafe",
+        highlightSecondBorder: "#93c5fd",
+        highlightSecondFont: "#475569",
+        dimNodeBg: "#e2e8f0",
+        dimNodeBorder: "#f8fafc",
+        dimNodeFont: "#94a3b8",
+        dimEdgeColor: "rgba(148, 163, 184, 0.34)",
+        dimEdgeFont: "#94a3b8",
       };
 }
 
-/** vis-network 节点规范化（与 legacy normalizeGraphNode 一致）。 */
+/** vis-network 节点规范化（支持亮暗双主题）。 */
 export function normalizeGraphNode(n: GraphNode, palette: GraphPalette): Record<string, unknown> {
   return {
     id: n.id,
     label: n.label || n.id,
-    title: n.id,
+    title: n.label && n.label !== n.id ? `${n.label} (${n.id})` : n.id,
     color: n.is_deleted
-      ? { background: "#d94a4a", border: "#ffffff" }
+      ? { background: palette.nodeDeletedBg, border: palette.nodeBorder }
       : n.is_ghost
-        ? { background: "#d7e5ee", border: "#ffffff" }
-        : { background: "#1da7e7", border: "#ffffff" },
-    font: { color: n.is_ghost ? palette.nodeMuted : palette.nodeFont },
+        ? { background: palette.ghostBg, border: palette.nodeBorder }
+        : { background: palette.nodeBg, border: palette.nodeBorder },
+    font: { color: n.is_ghost ? palette.nodeMuted : palette.nodeFont, face: palette.fontFace },
   };
 }
 
-/** vis-network 边规范化（与 legacy normalizeGraphEdge 一致）。 */
+/** vis-network 边规范化（精确保留原始权重 raw_value，避免 || 1 吞掉 0.05 冷冻边权重；过滤任何后端遗留紫红硬编码）。 */
 export function normalizeGraphEdge(e: GraphEdge, palette: GraphPalette): Record<string, unknown> {
-  const rawValue = Number(e.value || 0);
+  const hasNumericValue = e.value != null && Number.isFinite(Number(e.value));
+  const rawValue = hasNumericValue ? Number(e.value) : 1;
+  const edgeColor =
+    e.is_active === false
+      ? { color: palette.edgeInactive }
+      : e.is_pinned
+        ? { color: palette.edgePinned, highlight: palette.edgeHighlight }
+        : { color: palette.edgeColor, highlight: palette.edgeHighlight };
+
   return {
     id: e.id || `${e.from}_${e.to}`,
     from: e.from,
     to: e.to,
     label: e.label || "",
-    value: Math.max(1, rawValue || 1),
+    value: Math.max(0.5, rawValue),
     raw_value: rawValue,
     arrows: "to",
     dashes: !!e.dashes || e.is_active === false,
-    color:
-      e.color ||
-      (e.is_active === false
-        ? { color: "#c4ced8" }
-        : { color: palette.edgeColor, highlight: palette.edgeHighlight }),
-    font: { color: palette.edgeFont, strokeWidth: 3, strokeColor: palette.edgeStroke },
+    color: edgeColor,
+    font: {
+      color: palette.edgeFont,
+      strokeWidth: 3,
+      strokeColor: palette.edgeStroke,
+      face: palette.fontFace,
+    },
     predicates: e.predicates || [],
     is_pinned: !!e.is_pinned,
     is_protected: !!e.is_protected,
@@ -77,7 +153,14 @@ export function normalizeGraphEdge(e: GraphEdge, palette: GraphPalette): Record<
   };
 }
 
-/** 计算每个节点的度数（与 legacy graphDegrees 一致）。 */
+/** 格式化边权重显示（不把 0.05 覆写为 1）。 */
+export function formatEdgeWeight(value: unknown): string {
+  if (value == null || value === "") return "1.00";
+  const num = Number(value);
+  return Number.isFinite(num) ? num.toFixed(2) : "1.00";
+}
+
+/** 计算每个节点的度数。 */
 export function graphDegrees(edges: GraphEdge[]): Map<string, number> {
   const degree = new Map<string, number>();
   edges.forEach((edge) => {
@@ -88,9 +171,8 @@ export function graphDegrees(edges: GraphEdge[]): Map<string, number> {
 }
 
 /**
- * 构建按缩放显示/隐藏标签的更新列表（与 legacy updateLabelsByZoom 一致）。
+ * 构建按缩放显示/隐藏标签的更新列表。
  * scale >= 0.82 或 hub 节点（度数 >= 前 25% 分位）显示标签，否则隐藏（label=" "）。
- * 返回 {id,label} 数组，供 DataSet.update 批量应用。
  */
 export function buildLabelUpdates(
   nodes: GraphNode[],
@@ -107,9 +189,7 @@ export function buildLabelUpdates(
   });
 }
 
-/** scope 标签（与 legacy graphScopeLabel 一致）。
- * "default" 是后端在无会话触发 runtime 时的兜底作用域标识（scope_resolver 兜底），
- * 不该原样展示给用户，统一映射为「自动 / 最近」。 */
+/** scope 标签："default" 统一映射为「自动 / 最近」。 */
 export function scopeLabel(scopeKey: string, options?: { value: string; label?: string }[]): string {
   const key = String(scopeKey || "");
   if (key === "default") return "自动 / 最近";
@@ -120,16 +200,16 @@ export function scopeLabel(scopeKey: string, options?: { value: string; label?: 
   return key || "自动 / 最近";
 }
 
-/** 当前主题是否为暗色（从 dataset.theme 读取，供 palette 使用）。 */
+/** 当前主题是否为暗色（从 dataset.theme 读取）。 */
 export function isDarkTheme(): boolean {
   return typeof document !== "undefined" && document.documentElement.dataset.theme === "dark";
 }
 
-/** 是否偏好减少动画（与 legacy prefersReducedMotion 一致）。 */
+/** 是否偏好减少动画。 */
 export function prefersReducedMotion(): boolean {
   return (
     typeof window !== "undefined" &&
-    window.matchMedia &&
+    !!window.matchMedia &&
     window.matchMedia("(prefers-reduced-motion: reduce)").matches
   );
 }

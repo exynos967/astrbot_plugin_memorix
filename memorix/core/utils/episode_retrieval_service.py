@@ -1,18 +1,18 @@
-"""Episode hybrid retrieval service."""
+"""Episode 混合检索服务。"""
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from ...amemorix.common.logging import get_logger
+from src.common.logger import get_logger
 
-from ..retrieval import DualPathRetriever, TemporalQueryOptions
+from ..retrieval import DualPathRetriever, RetrievalScope, TemporalQueryOptions
 
 logger = get_logger("A_Memorix.EpisodeRetrievalService")
 
 
 class EpisodeRetrievalService:
-    """Hybrid episode retrieval backed by lexical rows and evidence projection."""
+    """结合词法记录与证据投影的 Episode 混合检索。"""
 
     _RRF_K = 60.0
     _BRANCH_WEIGHTS = {
@@ -20,6 +20,22 @@ class EpisodeRetrievalService:
         "paragraph_evidence": 1.0,
         "relation_evidence": 0.85,
     }
+    _RELATION_QUERY_MARKERS = (
+        "关系",
+        "关联",
+        "联系",
+        "相关",
+        "相互",
+        "之间",
+        "依赖",
+        "属于",
+        "包含",
+        "影响",
+        "导致",
+        "为什么",
+        "怎么",
+        "如何",
+    )
 
     def __init__(
         self,
@@ -40,10 +56,11 @@ class EpisodeRetrievalService:
         person: Optional[str] = None,
         source: Optional[str] = None,
         include_paragraphs: bool = False,
+        scope: Optional[RetrievalScope] = None,
     ) -> List[Dict[str, Any]]:
         clean_query = str(query or "").strip()
         safe_top_k = max(1, int(top_k))
-        candidate_k = max(30, safe_top_k * 6)
+        candidate_k = max(20, safe_top_k * 4)
 
         branches: Dict[str, List[Dict[str, Any]]] = {
             "lexical": self.metadata_store.query_episodes(
@@ -53,6 +70,7 @@ class EpisodeRetrievalService:
                 person=person,
                 source=source,
                 limit=(candidate_k if clean_query else safe_top_k),
+                allowed_episode_ids=scope.episode_ids if scope else None,
             )
         }
 
@@ -64,11 +82,14 @@ class EpisodeRetrievalService:
                     person=person,
                     source=source,
                 )
-                results = await self.retriever.retrieve(
-                    query=clean_query,
-                    top_k=candidate_k,
-                    temporal=temporal,
-                )
+                retrieve_kwargs: Dict[str, Any] = {
+                    "query": clean_query,
+                    "top_k": candidate_k,
+                    "temporal": temporal,
+                }
+                if scope is not None:
+                    retrieve_kwargs["scope"] = scope
+                results = await self.retriever.retrieve(**retrieve_kwargs)
             except Exception as exc:
                 logger.warning(f"episode evidence retrieval failed, fallback to lexical only: {exc}")
             else:
@@ -89,6 +110,12 @@ class EpisodeRetrievalService:
                         list(paragraph_rank_map.keys()),
                         source=source,
                     )
+                    if scope:
+                        paragraph_rows = [
+                            row
+                            for row in paragraph_rows
+                            if str(row.get("episode_id", "") or "").strip() in scope.episode_ids
+                        ]
                     if paragraph_rows:
                         branches["paragraph_evidence"] = self._rank_projected_rows(
                             paragraph_rows,
@@ -96,11 +123,17 @@ class EpisodeRetrievalService:
                             support_key="matched_paragraph_hashes",
                         )
 
-                if relation_rank_map:
+                if relation_rank_map and self._should_project_relation_evidence(clean_query):
                     relation_rows = self.metadata_store.get_episode_rows_by_relation_hashes(
                         list(relation_rank_map.keys()),
                         source=source,
                     )
+                    if scope:
+                        relation_rows = [
+                            row
+                            for row in relation_rows
+                            if str(row.get("episode_id", "") or "").strip() in scope.episode_ids
+                        ]
                     if relation_rows:
                         branches["relation_evidence"] = self._rank_projected_rows(
                             relation_rows,
@@ -165,9 +198,9 @@ class EpisodeRetrievalService:
                     payload.pop("matched_relation_count", None)
                     payload["_fusion_score"] = 0.0
                     bucket[episode_id] = payload
-                bucket[episode_id]["_fusion_score"] = float(
-                    bucket[episode_id].get("_fusion_score", 0.0)
-                ) + weight / (self._RRF_K + float(rank))
+                bucket[episode_id]["_fusion_score"] = float(bucket[episode_id].get("_fusion_score", 0.0)) + weight / (
+                    self._RRF_K + float(rank)
+                )
 
         out = list(bucket.values())
         out.sort(
@@ -180,3 +213,10 @@ class EpisodeRetrievalService:
         for item in out:
             item.pop("_fusion_score", None)
         return out[: max(1, int(top_k))]
+
+    @classmethod
+    def _should_project_relation_evidence(cls, query: str) -> bool:
+        clean_query = str(query or "").strip()
+        if not clean_query:
+            return False
+        return any(marker in clean_query for marker in cls._RELATION_QUERY_MARKERS)

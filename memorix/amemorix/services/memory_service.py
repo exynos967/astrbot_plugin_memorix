@@ -6,7 +6,6 @@ import datetime
 from typing import Any, Dict, List
 
 from ...core.utils.search_execution_service import SearchExecutionRequest, SearchExecutionService
-
 from ..context import AppContext
 
 
@@ -101,8 +100,8 @@ class MemoryService:
         return {"success": True, "count": len(hashes), "frozen_edges": len(edges)}
 
     async def restore(self, hash_value: str, restore_type: str = "relation") -> Dict[str, Any]:
-        from .delete_service import DeleteService
         from ...services.memory_projection_service import MemoryProjectionService
+        from .delete_service import DeleteService
 
         h = str(hash_value or "").strip().lower()
         if not h or restore_type not in {"paragraph", "entity", "relation"}:

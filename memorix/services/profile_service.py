@@ -7,8 +7,10 @@ import time
 import unicodedata
 from typing import Any, Dict, Optional
 
+from ..amemorix.context import activate_context_shims
 from ..amemorix.services.person_profile_service import PersonProfileApiService
 from ..app_context import ScopeRuntimeManager
+from ..core.utils.summary_identity import observe_identity
 
 
 class ProfileService:
@@ -136,62 +138,75 @@ class ProfileService:
         timestamp: Optional[float] = None,
     ) -> Dict[str, Any]:
         runtime = await self.runtime_manager.get_runtime(scope_key)
-        person_id = f"{platform}:{sender_id}"
-        metadata_store = runtime.context.metadata_store
-        existing = metadata_store.get_person_registry(person_id) or {}
-        now = float(timestamp) if timestamp else time.time()
+        with activate_context_shims(runtime.context):
+            person_id = f"{platform}:{sender_id}"
+            metadata_store = runtime.context.metadata_store
+            existing = metadata_store.get_person_registry(person_id) or {}
+            now = float(timestamp) if timestamp else time.time()
 
-        existing_meta = existing.get("metadata")
-        merged_meta = dict(existing_meta) if isinstance(existing_meta, dict) else {}
-        host_identity = merged_meta.get("host_identity")
-        if not isinstance(host_identity, dict):
-            host_identity = {}
+            existing_meta = existing.get("metadata")
+            merged_meta = dict(existing_meta) if isinstance(existing_meta, dict) else {}
+            host_identity = merged_meta.get("host_identity")
+            if not isinstance(host_identity, dict):
+                host_identity = {}
 
-        alias_names = host_identity.get("alias_names")
-        if not isinstance(alias_names, list):
-            alias_names = []
-        current_name = str(sender_name or "").strip()
-        if current_name and current_name not in alias_names:
-            alias_names.append(current_name)
+            alias_names = host_identity.get("alias_names")
+            if not isinstance(alias_names, list):
+                alias_names = []
+            current_name = str(sender_name or "").strip()
+            if current_name and current_name not in alias_names:
+                alias_names.append(current_name)
 
-        host_identity.update(
-            {
-                "sender_id": str(sender_id or "").strip(),
-                "session_id": str(session_id or "").strip(),
-                "group_id": str(group_id or "").strip(),
-                "group_name": str(group_name or "").strip(),
-                "unified_msg_origin": str(unified_msg_origin or "").strip(),
-                "alias_names": alias_names[-10:],
-                "last_seen_at": now,
-            }
-        )
-        merged_meta["host_identity"] = host_identity
-        merged_meta["scope_key"] = scope_key
+            host_identity.update(
+                {
+                    "sender_id": str(sender_id or "").strip(),
+                    "session_id": str(session_id or "").strip(),
+                    "group_id": str(group_id or "").strip(),
+                    "group_name": str(group_name or "").strip(),
+                    "unified_msg_origin": str(unified_msg_origin or "").strip(),
+                    "alias_names": alias_names[-10:],
+                    "last_seen_at": now,
+                }
+            )
+            merged_meta["host_identity"] = host_identity
+            merged_meta["scope_key"] = scope_key
 
-        merged_group_aliases = self._merge_group_aliases(
-            existing.get("group_nick_name"),
-            group_id=group_id,
-            session_id=session_id,
-            sender_name=current_name,
-            updated_at=now,
-        )
+            merged_group_aliases = self._merge_group_aliases(
+                existing.get("group_nick_name"),
+                group_id=group_id,
+                session_id=session_id,
+                sender_name=current_name,
+                updated_at=now,
+            )
 
-        existing_person_name = str(existing.get("person_name", "") or "").strip()
-        existing_nickname = str(existing.get("nickname", "") or "").strip()
-        resolved_name = existing_person_name or current_name or str(sender_id or "").strip()
-        resolved_nickname = existing_nickname or current_name or resolved_name
+            existing_person_name = str(existing.get("person_name", "") or "").strip()
+            existing_nickname = str(existing.get("nickname", "") or "").strip()
+            resolved_name = existing_person_name or current_name or str(sender_id or "").strip()
+            resolved_nickname = existing_nickname or current_name or resolved_name
 
-        return runtime.context.metadata_store.upsert_person_registry(
-            person_id=person_id,
-            person_name=resolved_name,
-            nickname=resolved_nickname,
-            user_id=sender_id,
-            platform=platform,
-            group_nick_name=merged_group_aliases,
-            memory_points=existing.get("memory_points"),
-            last_know=now,
-            metadata=merged_meta,
-        )
+            result = metadata_store.upsert_person_registry(
+                person_id=person_id,
+                person_name=resolved_name,
+                nickname=resolved_nickname,
+                user_id=sender_id,
+                platform=platform,
+                group_nick_name=merged_group_aliases,
+                memory_points=existing.get("memory_points"),
+                last_know=now,
+                metadata=merged_meta,
+            )
+            if platform and sender_id and current_name and hasattr(metadata_store, "set_person_identity_aliases"):
+                try:
+                    observe_identity(
+                        metadata_store,
+                        platform=platform,
+                        user_id=sender_id,
+                        aliases=[current_name],
+                        group_id=group_id,
+                    )
+                except Exception:
+                    pass
+            return result
 
     async def query(
         self,
@@ -204,25 +219,26 @@ class ProfileService:
         context_text: str = "",
     ) -> Dict[str, Any]:
         runtime = await self.runtime_manager.get_runtime(scope_key)
-        service = PersonProfileApiService(runtime.context)
-        result = await service.query(
-            person_id=person_id,
-            person_keyword=person_keyword,
-            top_k=top_k,
-            force_refresh=force_refresh,
-            source_note="astrbot:profile_query",
-        )
-        if not isinstance(result, dict):
-            return {"success": False, "error": "invalid profile payload"}
-        if result.get("success") and result.get("person_id") and str(context_text or "").strip():
-            result.update(
-                self.uncertain_profile_candidates(
-                    runtime.context,
-                    str(result["person_id"]),
-                    str(context_text or ""),
-                )
+        with activate_context_shims(runtime.context):
+            service = PersonProfileApiService(runtime.context)
+            result = await service.query(
+                person_id=person_id,
+                person_keyword=person_keyword,
+                top_k=top_k,
+                force_refresh=force_refresh,
+                source_note="astrbot:profile_query",
             )
-        return result
+            if not isinstance(result, dict):
+                return {"success": False, "error": "invalid profile payload"}
+            if result.get("success") and result.get("person_id") and str(context_text or "").strip():
+                result.update(
+                    self.uncertain_profile_candidates(
+                        runtime.context,
+                        str(result["person_id"]),
+                        str(context_text or ""),
+                    )
+                )
+            return result
 
     async def is_injection_enabled(
         self,
@@ -237,18 +253,21 @@ class ProfileService:
 
     async def set_override(self, *, scope_key: str, person_id: str, override_text: str, updated_by: str = "astrbot"):
         runtime = await self.runtime_manager.get_runtime(scope_key)
-        service = PersonProfileApiService(runtime.context)
-        return await service.set_override(person_id=person_id, override_text=override_text, updated_by=updated_by)
+        with activate_context_shims(runtime.context):
+            service = PersonProfileApiService(runtime.context)
+            return await service.set_override(person_id=person_id, override_text=override_text, updated_by=updated_by)
 
     async def delete_override(self, *, scope_key: str, person_id: str):
         runtime = await self.runtime_manager.get_runtime(scope_key)
-        service = PersonProfileApiService(runtime.context)
-        return await service.delete_override(person_id=person_id)
+        with activate_context_shims(runtime.context):
+            service = PersonProfileApiService(runtime.context)
+            return await service.delete_override(person_id=person_id)
 
     async def upsert_registry(self, *, scope_key: str, payload: Dict[str, Any]):
         runtime = await self.runtime_manager.get_runtime(scope_key)
-        service = PersonProfileApiService(runtime.context)
-        return await service.upsert_registry(payload)
+        with activate_context_shims(runtime.context):
+            service = PersonProfileApiService(runtime.context)
+            return await service.upsert_registry(payload)
 
     async def list_registry(
         self,
@@ -259,5 +278,6 @@ class ProfileService:
         page_size: Optional[int] = None,
     ):
         runtime = await self.runtime_manager.get_runtime(scope_key)
-        service = PersonProfileApiService(runtime.context)
-        return await service.list_registry(keyword=keyword, page=page, page_size=page_size)
+        with activate_context_shims(runtime.context):
+            service = PersonProfileApiService(runtime.context)
+            return await service.list_registry(keyword=keyword, page=page, page_size=page_size)

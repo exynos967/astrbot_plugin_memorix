@@ -217,6 +217,8 @@ def apply_lifecycle_event(
     inactive_since = state.inactive_since
     if inactive_since is not None and not isfinite(float(inactive_since)):
         raise ValueError("inactive_since 必须是有限时间戳")
+    # 墙钟允许被校时回拨，但持久化生命周期时间不能倒退。使用关系自身
+    # 已提交时间形成逻辑墙钟下界，避免回拨期间的新事件制造虚假老化。
     timestamp = max(
         requested_timestamp,
         anchor_at,

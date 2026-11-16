@@ -30,6 +30,14 @@
         "default": "",
         "_special": "select_provider",
         "obvious_hint": true
+      },
+      "fast_chat_provider_id": {
+        "type": "string",
+        "description": "轻量任务模型 Provider ID",
+        "hint": "可选。用于反馈纠错分类、检索调优自然语言改写、聊天日志时间抽取、画像分类等高频轻量任务；留空则自动回退到主聊天模型或当前会话默认 Provider。",
+        "default": "",
+        "_special": "select_provider",
+        "obvious_hint": true
       }
     }
   },
@@ -44,6 +52,12 @@
         "hint": "关闭：使用本地确定性向量，但语义检索精度有限。开启：调用你配置的 OpenAI 兼容 API。开启前请确保下方的 API 地址和密钥已正确填写。",
         "default": false,
         "obvious_hint": true
+      },
+      "enable_cache": {
+        "type": "bool",
+        "description": "启用 Embedding 内存缓存",
+        "hint": "开启后对重复文本向量查询启用进程内 LRU 缓存，降低远程 API 调用与延迟；自检探测会自动绕过缓存。默认关闭。",
+        "default": false
       },
       "dimension": {
         "type": "int",
@@ -754,6 +768,19 @@
             "hint": "此功能暂未启用，保持默认即可。",
             "default": 4
           },
+          "llm_retry": {
+            "type": "object",
+            "description": "导入 LLM 重试限制",
+            "hint": "控制知识导入过程中 LLM 摘要/抽取请求的最大尝试次数。",
+            "items": {
+              "max_attempts": {
+                "type": "int",
+                "description": "单次请求最大尝试次数",
+                "hint": "单次 LLM 请求的最大尝试总次数（含首次调用，至少为 1）。默认 4 次。",
+                "default": 4
+              }
+            }
+          },
           "path_aliases": {
             "type": "object",
             "description": "可扫描的目录",
@@ -820,11 +847,109 @@
       }
     }
   },
+  "image_memory": {
+    "type": "object",
+    "description": "多模态图片记忆（A_Memorix v2.0）",
+    "hint": "管理聊天与知识包中的静态图片资产、认知描述与多模态相似召回。",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用图片记忆存储与管理",
+        "hint": "总开关；默认需先在下方配置多模态图片向量接口（image_memory.openapi）后才会实际启用图片记忆，避免未配置识图向量模型时报错。",
+        "default": true
+      },
+      "require_embedding": {
+        "type": "bool",
+        "description": "未配置图片嵌入模型时禁用图片记忆",
+        "hint": "默认开启（对齐上游防报错策略）：若未配置多模态图片向量接口或自定义嵌入器，自动暂停图片记忆入库与召回，避免识图报错；关闭此项可在无向量模型时仅使用同图精确哈希（exact_hash）模式。",
+        "default": true
+      },
+      "auto_inject_enabled": {
+        "type": "bool",
+        "description": "自动注入图片记忆参考",
+        "hint": "开启后，当用户发送带图消息时，在请求大模型前自动检索历史同图/相似图片记忆并注入【图片记忆-内部参考】。",
+        "default": true
+      },
+      "max_bytes": {
+        "type": "int",
+        "description": "单张图片最大字节数",
+        "hint": "默认 10 MiB（10485760 字节），超限图片将被拒绝入库。",
+        "default": 10485760
+      },
+      "max_pixels": {
+        "type": "int",
+        "description": "单张图片最大像素数",
+        "hint": "默认 4000 万像素，防止超大分辨率图片耗尽内存。",
+        "default": 40000000
+      },
+      "candidate_limit": {
+        "type": "int",
+        "description": "图片相似召回候选上限",
+        "hint": "多模态图片检索时最多返回的相似图片数量。",
+        "default": 8
+      },
+      "similarity_threshold": {
+        "type": "float",
+        "description": "图片余弦相似度阈值",
+        "hint": "低于该阈值的图片向量命中将被过滤，默认 0.72。",
+        "default": 0.72
+      },
+      "openapi": {
+        "type": "object",
+        "description": "图片向量嵌入 API（可选）",
+        "hint": "配置支持多模态图片输入的 OpenAI 兼容 Embeddings 接口后，自动启用图片记忆并解锁跨图视觉相似召回（visual_similar）；未配置时默认自动暂停图片记忆（若关闭 require_embedding 则仅使用免向量同图精确哈希 exact_hash）。",
+        "items": {
+          "enabled": {
+            "type": "bool",
+            "description": "启用多模态图片向量接口",
+            "hint": "默认关闭；填写 base_url 与 model 后开启即可自动构建图片向量索引。",
+            "default": false
+          },
+          "base_url": {
+            "type": "string",
+            "description": "接口地址",
+            "hint": "OpenAI 兼容接口地址，例如 https://api.example.com/v1。",
+            "default": ""
+          },
+          "api_key": {
+            "type": "string",
+            "description": "API Key",
+            "hint": "多模态向量接口密钥。",
+            "default": ""
+          },
+          "model": {
+            "type": "string",
+            "description": "图片向量模型名称",
+            "hint": "支持多模态图片输入的嵌入模型标识。",
+            "default": ""
+          },
+          "dimension": {
+            "type": "int",
+            "description": "图片向量维度",
+            "hint": "模型输出向量维度（探测响应后以实际返回维度为准）。",
+            "default": 512
+          },
+          "timeout_seconds": {
+            "type": "float",
+            "description": "请求超时时间（秒）",
+            "hint": "图片嵌入请求超时秒数，默认 30 秒。",
+            "default": 30.0
+          }
+        }
+      }
+    }
+  },
   "integration": {
     "type": "object",
     "description": "集成功能",
-    "hint": "控制反馈纠错和模糊修正等需要管理员确认的高级能力。模糊修正默认启用但执行仍需确认。",
+    "hint": "控制反馈纠错、模糊修正及 v2.0 扩展管理工具等需要管理员确认的高级能力。",
     "items": {
+      "enable_v2_extended_tools": {
+        "type": "bool",
+        "description": "启用 A_Memorix v2.0 扩展管理工具",
+        "hint": "开启后额外向 LLM 注册 memory_bundle_admin（.amembundle 知识包）、memory_correction_admin（记忆修正契约）与 memory_image_admin（多模态图片记忆）管理工具。",
+        "default": false
+      },
       "feedback_correction_enabled": {
         "type": "bool",
         "description": "启用反馈纠错",

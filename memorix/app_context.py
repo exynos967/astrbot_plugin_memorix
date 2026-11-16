@@ -6,14 +6,18 @@ import asyncio
 import copy
 import hashlib
 import json
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import numpy as np
-from astrbot.api import logger
-from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+
+try:
+    from astrbot.api import logger
+except ImportError:
+    logger = logging.getLogger("astrbot_plugin_memorix")
 
 from .amemorix.bootstrap import build_context
 from .amemorix.settings import DEFAULT_CONFIG, AppSettings
@@ -21,6 +25,73 @@ from .amemorix.task_manager import TaskManager
 from .providers import AstrBotProviderBridge
 
 _SCOPE_DIR_PATTERN = re.compile(r"[^0-9A-Za-z._-]+")
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {
+        "CON", "PRN", "AUX", "NUL",
+        *(f"COM{i}" for i in range(1, 10)),
+        *(f"LPT{i}" for i in range(1, 10)),
+    }
+)
+
+
+def get_astrbot_data_path() -> Optional[str]:
+    """基于公开 StarTools API 安全推导 AstrBot 数据根目录，绝不依赖私有 astrbot.core.* 模块。"""
+    try:
+        from astrbot.api.star import StarTools
+
+        plugin_dir = StarTools.get_data_dir("astrbot_plugin_memorix")
+        if plugin_dir:
+            resolved = Path(plugin_dir).resolve()
+            if resolved.parent.name == "plugin_data":
+                return str(resolved.parent.parent)
+            return str(resolved.parent)
+    except Exception:
+        return None
+    return None
+
+
+def resolve_plugin_data_dir(
+    *,
+    plugin_config: Optional[Dict[str, Any]] = None,
+    astrbot_context: Any = None,
+    plugin_name: str = "astrbot_plugin_memorix",
+    base_data_dir: Optional[Path | str] = None,
+) -> Path:
+    """统一解析插件持久化数据根目录，确保 MemorixPlugin 与 ScopeRuntimeManager 完全一致。"""
+    name = str(plugin_name or "astrbot_plugin_memorix").strip() or "astrbot_plugin_memorix"
+    cfg = plugin_config if isinstance(plugin_config, dict) else {}
+    storage_cfg = cfg.get("storage")
+    if isinstance(storage_cfg, dict):
+        custom_dir = storage_cfg.get("data_dir")
+        if custom_dir:
+            return Path(str(custom_dir)).resolve()
+
+    if base_data_dir is not None and str(base_data_dir).strip():
+        return Path(base_data_dir).resolve()
+
+    try:
+        from astrbot.api.star import StarTools
+
+        data_dir = StarTools.get_data_dir(name)
+        if data_dir:
+            return Path(data_dir).resolve()
+    except Exception:
+        pass
+
+    ctx_data_dir = getattr(astrbot_context, "_data_dir", None) or getattr(astrbot_context, "data_dir", None)
+    if callable(ctx_data_dir):
+        try:
+            ctx_data_dir = ctx_data_dir()
+        except Exception:
+            ctx_data_dir = None
+    if ctx_data_dir:
+        return (Path(str(ctx_data_dir)).resolve() / "memorix_data").resolve()
+
+    data_root_raw = get_astrbot_data_path()
+    if data_root_raw:
+        return (Path(data_root_raw) / "plugin_data" / name).resolve()
+
+    return (Path.cwd() / "data" / "plugin_data" / name).resolve()
 
 
 def _deep_merge(base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
@@ -45,6 +116,9 @@ class LocalEmbeddingAdapter:
     async def encode(self, texts, **kwargs):
         del kwargs
         return await asyncio.to_thread(self._encode_sync, texts)
+
+    async def encode_batch(self, texts, **kwargs):
+        return await self.encode(list(texts or []), **kwargs)
 
     def _encode_sync(self, texts):
         if isinstance(texts, str):
@@ -82,32 +156,52 @@ class ScopeRuntimeManager:
     def __init__(
         self,
         *,
-        plugin_name: str,
-        plugin_config: Dict[str, Any],
+        plugin_name: str = "astrbot_plugin_memorix",
+        plugin_config: Optional[Dict[str, Any]] = None,
         astrbot_context: Any = None,
+        base_data_dir: Optional[Path | str] = None,
+        exact_scope_dir: Optional[Path | str] = None,
+        provider_bridge: Optional[Any] = None,
     ):
         self.plugin_name = plugin_name
         self.plugin_config = dict(plugin_config or {})
         self.astrbot_context = astrbot_context
+        self.base_data_dir = Path(base_data_dir).resolve() if base_data_dir is not None else None
+        self.exact_scope_dir = Path(exact_scope_dir).resolve() if exact_scope_dir is not None else None
+        self.provider_bridge = provider_bridge
         self._runtimes: Dict[str, ScopeRuntime] = {}
         self._lock = asyncio.Lock()
         self._closing = False
 
+    def _resolve_plugin_data_dir(self, plugin_name: Optional[str] = None) -> Path:
+        """安全解析插件数据根目录，优先读取显式配置与官方 StarTools，再回退上下文目录。"""
+        name = str(plugin_name or self.plugin_name or "astrbot_plugin_memorix")
+        return resolve_plugin_data_dir(
+            plugin_config=self.plugin_config,
+            astrbot_context=self.astrbot_context,
+            plugin_name=name,
+            base_data_dir=self.base_data_dir,
+        )
+
     def _scope_base_dir(self) -> Path:
-        data_root_raw = get_astrbot_data_path()
-        data_root = Path(data_root_raw) if data_root_raw else (Path.cwd() / "data")
-        base = data_root / "plugin_data" / self.plugin_name / "scopes"
+        base = self._resolve_plugin_data_dir(self.plugin_name) / "scopes"
         base.mkdir(parents=True, exist_ok=True)
         return base.resolve()
 
     def _scope_dir(self, scope_key: str) -> Path:
+        if self.exact_scope_dir is not None:
+            target = self.exact_scope_dir.resolve()
+            target.mkdir(parents=True, exist_ok=True)
+            self._write_scope_manifest(target, scope_key)
+            return target
         base_resolved = self._scope_base_dir()
-        safe_scope = self._sanitize_scope_dirname(scope_key)
+        canonical_key = str(scope_key or "").strip() or "default"
+        safe_scope = self._sanitize_scope_dirname(canonical_key)
         target = (base_resolved / safe_scope).resolve()
         try:
             target.relative_to(base_resolved)
         except ValueError:
-            fallback = f"scope_{hashlib.sha256(str(scope_key or '').encode('utf-8')).hexdigest()[:16]}"
+            fallback = f"scope_{hashlib.sha256(canonical_key.encode('utf-8')).hexdigest()[:16]}"
             logger.warning(
                 "unsafe scope dir detected, fallback applied: scope=%s fallback=%s",
                 scope_key,
@@ -115,8 +209,8 @@ class ScopeRuntimeManager:
             )
             target = base_resolved / fallback
         existing_key = self._read_scope_manifest(target)
-        if existing_key and existing_key != str(scope_key or "").strip():
-            fallback = f"scope_{hashlib.sha256(str(scope_key or '').encode('utf-8')).hexdigest()[:16]}"
+        if existing_key and existing_key != canonical_key:
+            fallback = f"scope_{hashlib.sha256(canonical_key.encode('utf-8')).hexdigest()[:16]}"
             logger.warning(
                 "scope dir collision, fallback applied: scope=%s existing=%s fallback=%s",
                 scope_key,
@@ -125,22 +219,27 @@ class ScopeRuntimeManager:
             )
             target = (base_resolved / fallback).resolve()
         target.mkdir(parents=True, exist_ok=True)
-        self._write_scope_manifest(target, scope_key)
+        self._write_scope_manifest(target, canonical_key)
         logger.debug("resolved scope dir: scope=%s dir=%s", target.name, target)
         return target
 
     @staticmethod
     def _sanitize_scope_dirname(scope_key: str) -> str:
-        text = str(scope_key or "default").strip()
+        text = re.sub(r"[\x00-\x1f\x7f]+", "_", str(scope_key or "default")).strip()
         text = text.replace("/", "_").replace("\\", "_").replace(":", "_")
         text = re.sub(r"\s+", "_", text)
         text = _SCOPE_DIR_PATTERN.sub("_", text)
         text = text.strip("._")
-        if ".." in text:
+        while ".." in text:
             text = text.replace("..", "_")
+        text = text.strip("._")
         if text in {"", ".", ".."}:
             return "default"
+        stem = text.split(".", 1)[0].upper()
+        if stem in _WINDOWS_RESERVED_NAMES:
+            text = f"safe_{text}"
         return text[:128] or "default"
+
 
     @staticmethod
     def _read_scope_manifest(scope_dir: Path) -> str:
@@ -215,10 +314,30 @@ class ScopeRuntimeManager:
         cfg = _deep_merge(DEFAULT_CONFIG, self.plugin_config)
         cfg.setdefault("storage", {})
         cfg["storage"]["data_dir"] = str(self._scope_dir(scope_key))
+        img_cfg = cfg.get("image_memory")
+        if isinstance(img_cfg, dict):
+            user_enabled = bool(
+                img_cfg["configured_enabled"]
+                if "configured_enabled" in img_cfg
+                else img_cfg.get("enabled", True)
+            )
+            img_cfg = {**img_cfg, "configured_enabled": user_enabled}
+            cfg["image_memory"] = img_cfg
+            if user_enabled:
+                from .engine.host_shims.embedding_shim import is_image_memory_enabled
+
+                if not is_image_memory_enabled(config=cfg):
+                    img_cfg["enabled"] = False
+                    logger.info(
+                        "image_memory.require_embedding is enabled and image embedding is unconfigured; disabling image memory for scope=%s",
+                        scope_key,
+                    )
 
         return cfg
 
-    def _build_provider_bridge(self) -> Optional[AstrBotProviderBridge]:
+    def _build_provider_bridge(self) -> Optional[Any]:
+        if self.provider_bridge is not None:
+            return self.provider_bridge
         if self.astrbot_context is None:
             return None
         provider_cfg = self.plugin_config.get("provider", {})
@@ -228,6 +347,7 @@ class ScopeRuntimeManager:
             astrbot_context=self.astrbot_context,
             # 聊天模型可选 AstrBot 中已定义 provider（配置优先）。
             chat_provider_id=str(provider_cfg.get("chat_provider_id", "") or ""),
+            fast_chat_provider_id=str(provider_cfg.get("fast_chat_provider_id", "") or ""),
         )
 
     def _patch_local_embedding(self, runtime: ScopeRuntime) -> None:
@@ -246,7 +366,7 @@ class ScopeRuntimeManager:
     async def get_runtime(self, scope_key: str) -> ScopeRuntime:
         if self._closing:
             raise RuntimeError("Memorix runtime manager is closing")
-        key = str(scope_key or "default")
+        key = str(scope_key or "").strip() or "default"
         existing = self._runtimes.get(key)
         if existing is not None:
             logger.debug("runtime cache hit: scope=%s", key)
@@ -262,10 +382,14 @@ class ScopeRuntimeManager:
 
             cfg = self._build_scope_config(key)
             settings = AppSettings(config=cfg)
-            logger.info("create runtime: scope=%s data_dir=%s", key, settings.data_dir)
-            ctx = await asyncio.to_thread(build_context, settings)
-            ctx.astrbot_context = self.astrbot_context
             provider_bridge = self._build_provider_bridge()
+            from .engine.host_shims import config_shim, install_host_shims, llm_shim
+
+            install_host_shims(config=cfg, provider_bridge=provider_bridge, scope_local=True)
+            logger.info("create runtime: scope=%s data_dir=%s", key, settings.data_dir)
+            with config_shim.use_scope_config(cfg), llm_shim.use_provider_bridge(provider_bridge):
+                ctx = await asyncio.to_thread(build_context, settings)
+            ctx.astrbot_context = self.astrbot_context
             ctx.provider_bridge = provider_bridge
             task_manager = TaskManager(ctx)
             runtime = ScopeRuntime(scope_key=key, settings=settings, context=ctx, task_manager=task_manager)
@@ -285,7 +409,10 @@ class ScopeRuntimeManager:
 
                 from .services.graph_rename_service import GraphRenameService
 
-                await GraphRenameService(ctx).reconcile()
+                try:
+                    await GraphRenameService(ctx).reconcile()
+                except Exception as exc:
+                    logger.warning("[memorix] graph rename reconcile failed non-fatally: scope=%s: %s", key, exc)
                 await task_manager.start()
             except BaseException:
                 try:
@@ -340,20 +467,62 @@ class ScopeRuntimeManager:
         )
         return policy
 
-    async def close_all(self) -> None:
+    async def close_scope(self, scope_key: str) -> None:
+        key = str(scope_key or "").strip() or "default"
         async with self._lock:
-            self._closing = True
-            runtimes = list(self._runtimes.values())
-            self._runtimes.clear()
+            runtime = self._runtimes.get(key)
+        if runtime is None:
+            return
+        try:
+            await runtime.task_manager.stop()
+        except RuntimeError:
+            logger.warning(
+                "stop task manager timed out while background workers drain; deferring context close: scope=%s",
+                runtime.scope_key,
+                exc_info=True,
+            )
+            raise
+        except Exception:
+            logger.warning("stop task manager failed: scope=%s", runtime.scope_key, exc_info=True)
+        async with self._lock:
+            if self._runtimes.get(key) is runtime:
+                self._runtimes.pop(key, None)
+        try:
+            await runtime.context.close()
+        except Exception:
+            logger.warning("close context failed: scope=%s", runtime.scope_key, exc_info=True)
+
+    async def close_all(self, *, mark_closing: bool = True) -> None:
+        async with self._lock:
+            if mark_closing:
+                self._closing = True
+            runtimes = list(self._runtimes.items())
 
         logger.info("close all runtimes: count=%s", len(runtimes))
-        for runtime in runtimes:
+        pending_Error: Optional[RuntimeError] = None
+        for key, runtime in runtimes:
             try:
                 await runtime.task_manager.stop()
+            except RuntimeError as exc:
+                pending_Error = pending_Error or exc
+                logger.warning(
+                    "stop task manager timed out while background workers drain; keeping runtime alive: scope=%s",
+                    runtime.scope_key,
+                    exc_info=True,
+                )
+                continue
             except Exception:
                 logger.warning("stop task manager failed: scope=%s", runtime.scope_key, exc_info=True)
+            async with self._lock:
+                if self._runtimes.get(key) is runtime:
+                    self._runtimes.pop(key, None)
             try:
                 await runtime.context.close()
             except Exception:
                 logger.warning("close context failed: scope=%s", runtime.scope_key, exc_info=True)
+        if pending_Error is not None:
+            async with self._lock:
+                self._closing = False
+            raise pending_Error
         logger.info("all runtimes closed")
+

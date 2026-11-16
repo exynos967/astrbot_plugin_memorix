@@ -194,7 +194,7 @@ def build_profile_injection_text(
         selected.extend([f"## {title}", *lines, ""])
 
     selected_uncertain = dedupe_profile_bullets(uncertain_candidates, limit=2)
-    if selected_uncertain:
+    if not section_is_empty(selected_uncertain):
         selected.extend(["## 不确定信息（未确认，不可当作确定事实）", *selected_uncertain, ""])
     elif not meaningful_found and include_uncertain_fallback:
         uncertain = sections.get("不确定信息", [])[: max(0, int(uncertain_fallback_limit))]

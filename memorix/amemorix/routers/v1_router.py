@@ -8,13 +8,13 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
+from ...core.utils.runtime_self_check import ensure_runtime_self_check
 from ..services import (
     DeleteService,
     MemoryService,
     PersonProfileApiService,
     QueryService,
 )
-from ...core.utils.runtime_self_check import ensure_runtime_self_check
 
 router = APIRouter(prefix="/v1", tags=["v1"])
 
@@ -56,6 +56,11 @@ class ImportTaskCreateRequest(BaseModel):
     options: Dict[str, Any] = Field(default_factory=dict)
 
 
+class UploadTicketCreateRequest(BaseModel):
+    kind: str
+    options: Dict[str, Any] = Field(default_factory=dict)
+
+
 class SummaryTaskCreateRequest(BaseModel):
     session_id: Optional[str] = None
     source: str = ""
@@ -66,6 +71,16 @@ class SummaryTaskCreateRequest(BaseModel):
 class QuerySearchRequest(BaseModel):
     query: str
     top_k: Optional[int] = None
+
+
+class QueryAutoRequest(BaseModel):
+    query: str
+    top_k: int = 5
+    stream_id: Optional[str] = None
+    group_id: Optional[str] = None
+    user_id: Optional[str] = None
+    source: Optional[str] = None
+    strict_source: bool = False
 
 
 class QueryTimeRequest(BaseModel):
@@ -193,6 +208,20 @@ class FuzzyModifyAdminRequest(BaseModel):
     payload: Dict[str, Any] = Field(default_factory=dict)
 
 
+class ChatMigrationPreviewRequest(BaseModel):
+    source_chat_id: str
+    target_chat_id: str
+    migrate_transcript: bool = True
+    note: str = ""
+    requested_by: str = "webui"
+
+
+class ChatMigrationExecuteRequest(BaseModel):
+    confirmed: bool = False
+    confirm_overwrite: bool = False
+    refresh_fingerprint: bool = False
+
+
 def _ctx(request: Request):
     return request.app.state.context
 
@@ -302,9 +331,56 @@ def _status_from_async_summary(summary: Dict[str, Any]) -> str:
     if int(counts.get("queued", 0) or 0) > 0:
         return "waiting"
     latest_status = str(latest.get("status") or "").strip().lower()
+    if latest_status == "cancelled":
+        latest_status = "canceled"
     if latest_status in {"failed", "canceled"}:
         return latest_status
     return "ready"
+
+
+def _merge_native_import_summary(base_summary: Dict[str, Any], import_task_manager: Any) -> Dict[str, Any]:
+    if import_task_manager is None:
+        return base_summary
+    native_tasks = getattr(import_task_manager, "_tasks", None)
+    if not isinstance(native_tasks, dict) or not native_tasks:
+        return base_summary
+
+    raw_counts = dict(base_summary.get("counts") or {})
+    counts: Dict[str, int] = {
+        key: int(raw_counts.get(key, 0) or 0)
+        for key in ("queued", "running", "succeeded", "failed", "canceled", "total", *raw_counts.keys())
+    }
+    latest = base_summary.get("latest") if isinstance(base_summary.get("latest"), dict) else None
+    latest_ts = float((latest or {}).get("updated_at") or (latest or {}).get("created_at") or 0.0)
+
+    status_map = {
+        "queued": "queued",
+        "preparing": "queued",
+        "running": "running",
+        "cancel_requested": "running",
+        "completed": "succeeded",
+        "completed_with_errors": "succeeded",
+        "succeeded": "succeeded",
+        "failed": "failed",
+        "cancelled": "canceled",
+        "canceled": "canceled",
+    }
+
+    for record in list(native_tasks.values()):
+        to_summary = getattr(record, "to_summary", None)
+        item = to_summary() if callable(to_summary) else (dict(record) if isinstance(record, dict) else None)
+        if not isinstance(item, dict):
+            continue
+        raw_status = str(item.get("status") or "").strip().lower()
+        bucket = status_map.get(raw_status, "queued")
+        counts[bucket] = int(counts.get(bucket, 0) or 0) + 1
+        counts["total"] = int(counts.get("total", 0) or 0) + 1
+        item_ts = float(item.get("updated_at") or item.get("created_at") or 0.0)
+        if latest is None or item_ts >= latest_ts:
+            latest = item
+            latest_ts = item_ts
+
+    return {**base_summary, "counts": counts, "latest": latest}
 
 
 def _status_from_episode_summary(summary: Dict[str, Any]) -> str:
@@ -316,6 +392,17 @@ def _status_from_episode_summary(summary: Dict[str, Any]) -> str:
     if int(counts.get("failed", 0) or 0) > 0:
         return "failed"
     return "ready"
+
+
+@router.post("/upload-tickets")
+async def create_upload_ticket(request: Request, body: UploadTicketCreateRequest):
+    bridge = getattr(request.app.state, "webui_bridge", None)
+    if bridge is None:
+        raise HTTPException(status_code=503, detail="WebUI bridge not initialized")
+    try:
+        return bridge.create_upload_ticket(scope_key=_scope_key(request), body=body.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/import/limits")
@@ -348,6 +435,11 @@ async def dashboard_status(request: Request):
     query_counts = _recent_query_counts(request)
     query_trend = _query_event_histogram(request)
     import_summary = ctx.metadata_store.get_async_task_summary(task_type="import")
+    task_mgr = getattr(request.app.state, "task_manager", None)
+    native_import_mgr = getattr(task_mgr, "import_task_manager", None) or getattr(
+        request.app.state, "import_task_manager", None
+    )
+    import_summary = _merge_native_import_summary(import_summary, native_import_mgr)
     episode_summary = ctx.metadata_store.get_episode_source_rebuild_summary(failed_limit=5)
     runtime_report = getattr(ctx, "_runtime_self_check_report", None)
     runtime_status = "unknown"
@@ -402,6 +494,24 @@ async def query_search(request: Request, body: QuerySearchRequest):
     service = QueryService(_ctx(request))
     try:
         return await service.search(query=body.query, top_k=body.top_k)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/query/auto")
+async def query_auto(request: Request, body: QueryAutoRequest):
+    _record_query_event(request, "auto")
+    service = QueryService(_ctx(request))
+    try:
+        return await service.auto_search(
+            query=body.query,
+            top_k=body.top_k,
+            stream_id=body.stream_id,
+            group_id=body.group_id,
+            user_id=body.user_id,
+            source=body.source,
+            strict_source=body.strict_source,
+        )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -685,3 +795,130 @@ async def fuzzy_modify_admin(request: Request, body: FuzzyModifyAdminRequest):
         return await service.fuzzy_modify_admin(scope_key=scope, action=body.action, **(body.payload or {}))
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/correction")
+async def correction_admin(request: Request, body: StructuredAdminRequest):
+    payload = {key: value for key, value in (body.payload or {}).items() if key not in {"scope_key", "action"}}
+    try:
+        return await _admin_service(request).correction_admin(scope_key=_scope_key(request), action=body.action, **payload)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/bundles")
+async def bundle_admin(request: Request, body: StructuredAdminRequest):
+    payload = {key: value for key, value in (body.payload or {}).items() if key not in {"scope_key", "action"}}
+    try:
+        return await _admin_service(request).bundle_admin(scope_key=_scope_key(request), action=body.action, **payload)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/images")
+async def image_admin(request: Request, body: StructuredAdminRequest):
+    payload = {key: value for key, value in (body.payload or {}).items() if key not in {"scope_key", "action"}}
+    try:
+        return await _admin_service(request).image_admin(scope_key=_scope_key(request), action=body.action, **payload)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/chat-migrations")
+async def chat_migration_admin(request: Request, body: StructuredAdminRequest):
+    payload = {key: value for key, value in (body.payload or {}).items() if key not in {"scope_key", "action"}}
+    try:
+        return await _admin_service(request).chat_migration_admin(
+            scope_key=_scope_key(request),
+            action=body.action,
+            **payload,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/chat-migrations/chats")
+async def list_chat_migration_chats(
+    request: Request,
+    query: str = Query("", description="过滤关键词"),
+    limit: int = Query(100, ge=1, le=500),
+):
+    from ...services.chat_migration_service import AstrBotChatMigrationService
+
+    return await AstrBotChatMigrationService(_ctx(request)).list_chats(query=query, limit=limit)
+
+
+@router.get("/chat-migrations")
+async def list_chat_migration_jobs(
+    request: Request,
+    limit: int = Query(50, ge=1, le=200),
+    status: str = Query("", description="状态过滤"),
+):
+    from ...services.chat_migration_service import AstrBotChatMigrationService
+
+    return await AstrBotChatMigrationService(_ctx(request)).list_jobs(limit=limit, status=status)
+
+
+@router.post("/chat-migrations/preview")
+async def preview_chat_migration(request: Request, body: ChatMigrationPreviewRequest):
+    from ...services.chat_migration_service import AstrBotChatMigrationService
+
+    try:
+        return await AstrBotChatMigrationService(_ctx(request)).preview(
+            source_chat_id=body.source_chat_id,
+            target_chat_id=body.target_chat_id,
+            migrate_transcript=body.migrate_transcript,
+            requested_by=body.requested_by,
+            note=body.note,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/chat-migrations/{job_id}")
+async def get_chat_migration_job(request: Request, job_id: str):
+    from ...services.chat_migration_service import AstrBotChatMigrationService
+
+    result = await AstrBotChatMigrationService(_ctx(request)).get_job(job_id)
+    if not result.get("success"):
+        raise HTTPException(status_code=404, detail=str(result.get("error") or "迁移任务不存在"))
+    return result
+
+
+@router.post("/chat-migrations/{job_id}/execute")
+async def execute_chat_migration_job(request: Request, job_id: str, body: ChatMigrationExecuteRequest):
+    from ...services.chat_migration_service import AstrBotChatMigrationService
+
+    try:
+        return await AstrBotChatMigrationService(_ctx(request)).execute(
+            job_id=job_id,
+            confirmed=bool(body.confirmed or body.confirm_overwrite),
+            refresh_fingerprint=body.refresh_fingerprint,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/chat-migrations/{job_id}/recover")
+async def recover_chat_migration_job(request: Request, job_id: str):
+    from ...services.chat_migration_service import AstrBotChatMigrationService
+
+    try:
+        return await AstrBotChatMigrationService(_ctx(request)).recover(job_id=job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/admin/{component_name}")
+async def unified_contract_admin(component_name: str, request: Request, body: StructuredAdminRequest):
+    try:
+        return await _admin_service(request).dispatch_contract(
+            scope_key=_scope_key(request),
+            component_name=component_name,
+            action=body.action,
+            payload=body.payload,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc

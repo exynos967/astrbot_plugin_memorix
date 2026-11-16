@@ -1,33 +1,56 @@
 """
 人物画像服务
 
-person_id -> 别名解析 -> 图谱证据 + 向量证据 -> 画像快照
+主链路：
+person_id -> 用户名/别名 -> 图谱关系 + 向量证据 -> 证据总结画像 -> 快照版本化存储
 """
 
-from __future__ import annotations
-
-import asyncio
+import hashlib
 import json
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from ...amemorix.common.logging import get_logger
+from json_repair import repair_json
+from sqlalchemy import or_
+from sqlmodel import select
 
-from ..embedding.api_adapter import EmbeddingAPIAdapter
+
+from src.common.database.database import get_db_session
+from src.common.database.database_model import PersonInfo
+from src.common.logger import get_logger
+from src.config.config import global_config
+from src.services import llm_service as llm_api
+
+from ..embedding import EmbeddingAPIAdapter
 from ..retrieval import (
     DualPathRetriever,
     DualPathRetrieverConfig,
     FusionConfig,
+    GraphRelationRecallConfig,
+    PosteriorGraphConfig,
     RetrievalStrategy,
     SparseBM25Config,
     VectorPoolsConfig,
 )
-from ..storage import GraphStore, MetadataStore, VectorStore
+from ..storage import MetadataStore, GraphStore, VectorStore
+from .metadata import coerce_metadata_dict
+from .fact_deduplication import visible_fact_metadata
+from .model_routing import (
+    ResolvedLLMModel,
+    generate_with_resolved_model,
+    resolve_fast_text_generation_model,
+)
+from .profile_text import build_profile_injection_text, build_structured_profile_text
 
 logger = get_logger("A_Memorix.PersonProfileService")
 
+PROFILE_CLASSIFICATION_REQUEST_TYPE = "A_Memorix.PersonProfileEvidenceClassify"
+PROFILE_GENERATION_VERSION = 3
+
 
 class PersonProfileService:
+    """人物画像聚合/刷新服务。"""
+
     def __init__(
         self,
         metadata_store: MetadataStore,
@@ -43,7 +66,6 @@ class PersonProfileService:
         self.metadata_store = metadata_store
         self.graph_store = graph_store
         self.vector_store = vector_store
-        # 双池检索：未提供时回退到 vector_store，保证降级安全
         self.paragraph_vector_store = paragraph_vector_store
         self.graph_vector_store = graph_vector_store
         self.embedding_manager = embedding_manager
@@ -52,7 +74,10 @@ class PersonProfileService:
         self.retriever = retriever or self._build_retriever()
 
     def _cfg(self, key: str, default: Any = None) -> Any:
-        current: Any = self.plugin_config if isinstance(self.plugin_config, dict) else {}
+        """读取嵌套配置。"""
+        if not isinstance(self.plugin_config, dict):
+            return default
+        current: Any = self.plugin_config
         for part in key.split("."):
             if isinstance(current, dict) and part in current:
                 current = current[part]
@@ -60,7 +85,99 @@ class PersonProfileService:
                 return default
         return current
 
+    @classmethod
+    def _canonical_profile_value(cls, value: Any) -> Any:
+        """规范化画像证据，消除字典顺序、集合顺序和召回排序抖动。"""
+        if isinstance(value, dict):
+            return {
+                str(key): cls._canonical_profile_value(item)
+                for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            }
+        if isinstance(value, (list, tuple, set)):
+            normalized = [cls._canonical_profile_value(item) for item in value]
+            return sorted(
+                normalized,
+                key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True, default=str),
+            )
+        if isinstance(value, float):
+            return round(value, 12)
+        return value
+
+    def _profile_generation_signature(self) -> Dict[str, Any]:
+        """返回会影响画像文本生成结果的实现与模型配置签名。"""
+        model = self._resolve_profile_classification_model()
+        if model is None:
+            model_signature: Dict[str, Any] = {"mode": "rule_based"}
+        else:
+            model_signature = {
+                "mode": "llm",
+                "task_name": model.task_name,
+                "selected_model_name": model.selected_model_name,
+                "model_list": sorted(
+                    str(item).strip() for item in getattr(model.task_config, "model_list", []) if str(item).strip()
+                ),
+            }
+        return {
+            "generation_version": PROFILE_GENERATION_VERSION,
+            "classification_max_tokens": self._profile_classification_max_tokens(),
+            "model": model_signature,
+        }
+
+    def _profile_evidence_fingerprint(
+        self,
+        *,
+        person_id: str,
+        primary_name: str,
+        aliases: List[str],
+        relation_edges: List[Dict[str, Any]],
+        vector_evidence: List[Dict[str, Any]],
+        memory_traits: List[str],
+        fact_claims: List[Dict[str, Any]],
+    ) -> str:
+        """计算画像输入版本；检索分数不属于证据内容，故不进入指纹。"""
+        stable_vector_evidence = [
+            {key: value for key, value in item.items() if key != "score"} for item in vector_evidence
+        ]
+        # 只过滤已知的检索评分字段，保留来源类型及其他证据元数据，原始证据不变。
+        ignored_metadata_fields = {"score_breakdown", "bm25_score", "ppr_signal", "ppr_focus_entity_count", "ppr_boost"}
+        for item in stable_vector_evidence:
+            if "metadata" in item:
+                item["metadata"] = {
+                    key: value
+                    for key, value in coerce_metadata_dict(item["metadata"]).items()
+                    if key not in ignored_metadata_fields
+                }
+        payload = self._canonical_profile_value(
+            {
+                "person_id": person_id,
+                "primary_name": primary_name,
+                "aliases": aliases,
+                "memory_traits": memory_traits,
+                "relation_edges": relation_edges,
+                "vector_evidence": stable_vector_evidence,
+                "fact_claims": fact_claims,
+                "generation": self._profile_generation_signature(),
+            }
+        )
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _profile_classification_max_tokens(self) -> int:
+        """读取人物画像证据分类的最大输出 token 数。"""
+        raw_value = self._cfg("person_profile.evidence_classification_max_tokens", 1200)
+        try:
+            return min(32768, max(128, int(raw_value or 1200)))
+        except (TypeError, ValueError):
+            return 1200
+
     def _build_retriever(self) -> Optional[DualPathRetriever]:
+        """按需构建检索器（无依赖时返回 None）。"""
         if not all(
             [
                 self.vector_store is not None,
@@ -70,33 +187,37 @@ class PersonProfileService:
             ]
         ):
             return None
-
         try:
             sparse_cfg_raw = self._cfg("retrieval.sparse", {}) or {}
             fusion_cfg_raw = self._cfg("retrieval.fusion", {}) or {}
+            graph_recall_cfg_raw = self._cfg("retrieval.search.graph_recall", {}) or {}
+            posterior_graph_cfg_raw = self._cfg("retrieval.search.posterior_graph", {}) or {}
             vector_pools_cfg_raw = self._cfg("retrieval.vector_pools", {}) or {}
             if not isinstance(sparse_cfg_raw, dict):
                 sparse_cfg_raw = {}
             if not isinstance(fusion_cfg_raw, dict):
                 fusion_cfg_raw = {}
+            if not isinstance(graph_recall_cfg_raw, dict):
+                graph_recall_cfg_raw = {}
+            if not isinstance(posterior_graph_cfg_raw, dict):
+                posterior_graph_cfg_raw = {}
             if not isinstance(vector_pools_cfg_raw, dict):
                 vector_pools_cfg_raw = {}
 
-            # 双池就绪判定：runtime 配置显式指定优先，否则依赖两个独立向量池实例
             runtime_cfg = self._cfg("runtime", {}) or {}
             if isinstance(runtime_cfg, dict) and "vector_pools_ready" in runtime_cfg:
                 vector_pools_ready = bool(runtime_cfg.get("vector_pools_ready", False))
             else:
-                vector_pools_ready = (
-                    self.paragraph_vector_store is not None
-                    and self.graph_vector_store is not None
-                )
-            # mode=dual 但双池未就绪时降级 single，避免运行期崩溃
+                vector_pools_ready = self.paragraph_vector_store is not None and self.graph_vector_store is not None
             configured_mode = str(vector_pools_cfg_raw.get("mode", "dual") or "dual").strip().lower()
             if configured_mode == "dual" and not vector_pools_ready:
                 vector_pools_cfg_raw = dict(vector_pools_cfg_raw)
                 vector_pools_cfg_raw["mode"] = "single"
 
+            sparse_cfg = SparseBM25Config(**sparse_cfg_raw)
+            fusion_cfg = FusionConfig(**fusion_cfg_raw)
+            graph_recall_cfg = GraphRelationRecallConfig(**graph_recall_cfg_raw)
+            posterior_graph_cfg = PosteriorGraphConfig(**posterior_graph_cfg_raw)
             vector_pools_cfg = VectorPoolsConfig(**vector_pools_cfg_raw)
             config = DualPathRetrieverConfig(
                 top_k_paragraphs=int(self._cfg("retrieval.top_k_paragraphs", 20)),
@@ -109,8 +230,10 @@ class PersonProfileService:
                 enable_parallel=bool(self._cfg("retrieval.enable_parallel", True)),
                 retrieval_strategy=RetrievalStrategy.DUAL_PATH,
                 debug=bool(self._cfg("advanced.debug", False)),
-                sparse=SparseBM25Config(**sparse_cfg_raw),
-                fusion=FusionConfig(**fusion_cfg_raw),
+                sparse=sparse_cfg,
+                fusion=fusion_cfg,
+                graph_recall=graph_recall_cfg,
+                posterior_graph=posterior_graph_cfg,
                 vector_pools=vector_pools_cfg,
             )
             return DualPathRetriever(
@@ -123,27 +246,101 @@ class PersonProfileService:
                 sparse_index=self.sparse_index,
                 config=config,
             )
-        except Exception as exc:
-            logger.warning("Build profile retriever failed: %s", exc)
+        except Exception as e:
+            logger.warning(f"初始化人物画像检索器失败，将只使用关系证据: {e}")
             return None
 
-    def resolve_person_id(self, identifier: str) -> str:
-        value = str(identifier or "").strip()
-        if not value:
+    @staticmethod
+    def _resolve_person_id_impl(identifier: str, *, metadata_store: Optional[MetadataStore] = None) -> str:
+        """按人工覆盖别名、ID 或唯一确切称呼解析；同名冲突抛出明确错误，子串匹配不能认领身份。"""
+        if not identifier:
             return ""
-        if len(value) == 32 and all(ch in "0123456789abcdefABCDEF" for ch in value):
-            return value.lower()
-        manual_matches = self.metadata_store.find_person_ids_by_manual_alias(value)
-        if len(manual_matches) > 1:
-            raise ValueError("人物别名不唯一，请使用 person_id")
-        if manual_matches:
-            return manual_matches[0]
-        try:
-            return self.metadata_store.resolve_person_registry(value) or ""
-        except Exception:
+        key = str(identifier).strip()
+        if not key:
             return ""
 
-    def _parse_group_nicks(self, raw_value: Any) -> List[str]:
+        if metadata_store is not None and hasattr(metadata_store, "find_person_ids_by_manual_alias"):
+            manual_matches = metadata_store.find_person_ids_by_manual_alias(key)
+            if len(manual_matches) > 1:
+                raise ValueError("人物别名不唯一，请使用 person_id")
+            if len(manual_matches) == 1:
+                return str(manual_matches[0])
+
+        if metadata_store is not None:
+            if hasattr(metadata_store, "get_person_identity"):
+                identity = metadata_store.get_person_identity(key)
+                if identity:
+                    return str(identity["person_id"])
+            if hasattr(metadata_store, "get_person_registry"):
+                reg = metadata_store.get_person_registry(key)
+                if reg:
+                    return str(reg["person_id"])
+
+        candidates = set()
+        if metadata_store is not None:
+            if hasattr(metadata_store, "find_person_identities"):
+                candidates.update(str(item["person_id"]) for item in metadata_store.find_person_identities(key))
+            if hasattr(metadata_store, "find_person_registry_ids"):
+                candidates.update(str(pid) for pid in metadata_store.find_person_registry_ids(key))
+
+        try:
+            with get_db_session(auto_commit=False) as session:
+                record = session.exec(select(PersonInfo.person_id).where(PersonInfo.person_id == key).limit(1)).first()
+                if record:
+                    return str(record)
+
+                records = session.exec(
+                    select(PersonInfo).where(
+                        or_(
+                            PersonInfo.person_name == key,
+                            PersonInfo.user_nickname == key,
+                            PersonInfo.group_cardname.contains(key),
+                        )
+                    )
+                ).all()
+                target = key.casefold()
+                candidates.update(
+                    str(record.person_id)
+                    for record in records
+                    if any(
+                        str(alias or "").strip().casefold() == target
+                        for alias in [
+                            record.person_name,
+                            record.user_nickname,
+                            *PersonProfileService._parse_group_nicks(record.group_cardname),
+                        ]
+                    )
+                )
+        except Exception as e:
+            logger.warning(f"按别名解析 person_id 失败: identifier={key}, err={e}")
+
+        if len(candidates) == 1:
+            return next(iter(candidates))
+        if len(candidates) > 1:
+            raise ValueError("人物别名不唯一，请使用 person_id")
+
+        if len(key) == 32 and all(ch in "0123456789abcdefABCDEF" for ch in key):
+            return key.lower()
+
+        return ""
+
+    class _ResolvePersonIdDescriptor:
+        def __get__(self, instance: Optional["PersonProfileService"], owner: Any = None):
+            if instance is None:
+                return PersonProfileService._resolve_person_id_impl
+
+            def _bound(identifier: str, *, metadata_store: Optional[MetadataStore] = None) -> str:
+                return PersonProfileService._resolve_person_id_impl(
+                    identifier,
+                    metadata_store=metadata_store or instance.metadata_store,
+                )
+
+            return _bound
+
+    resolve_person_id = _ResolvePersonIdDescriptor()
+
+    @staticmethod
+    def _parse_group_nicks(raw_value: Any) -> List[str]:
         if not raw_value:
             return []
         if isinstance(raw_value, list):
@@ -156,13 +353,13 @@ class PersonProfileService:
         names: List[str] = []
         for item in items:
             if isinstance(item, dict):
-                val = str(item.get("group_nick_name", "")).strip()
-                if val:
-                    names.append(val)
+                value = str(item.get("group_cardname") or item.get("group_nick_name") or "").strip()
+                if value:
+                    names.append(value)
             elif isinstance(item, str):
-                val = item.strip()
-                if val:
-                    names.append(val)
+                value = item.strip()
+                if value:
+                    names.append(value)
         return names
 
     def _parse_memory_traits(self, raw_value: Any) -> List[str]:
@@ -189,91 +386,195 @@ class PersonProfileService:
             traits.append(text)
         return traits[:10]
 
-    def get_person_aliases(self, person_id: str, *, include_override: bool = True) -> Tuple[List[str], str, List[str]]:
+    def _collect_alias_suggestions_from_memory(self, person_id: str, trusted_aliases: List[str]) -> List[str]:
+        """收集与人物同段出现的实体，仅作为待人工确认的别名候选。"""
+        if not person_id:
+            return []
+
+        suggestions: List[str] = []
+        excluded = {
+            str(item or "").strip().lower() for item in [person_id, *trusted_aliases] if str(item or "").strip()
+        }
+        seen = set(excluded)
+
+        paragraphs_by_hash: Dict[str, Dict[str, Any]] = {}
+        query_aliases: List[str] = []
+        query_alias_keys = set()
+        for item in trusted_aliases:
+            alias = str(item or "").strip()
+            alias_key = alias.lower()
+            if not alias or alias_key in query_alias_keys:
+                continue
+            query_alias_keys.add(alias_key)
+            query_aliases.append(alias)
+        for alias in query_aliases:
+            try:
+                paragraphs = self.metadata_store.get_paragraphs_by_entity(alias)
+            except Exception as e:
+                logger.warning(f"从记忆证据收集人物别名候选失败: person_id={person_id}, alias={alias}, err={e}")
+                continue
+            for paragraph in paragraphs:
+                paragraph_hash = str(paragraph.get("hash", "") or "").strip()
+                if paragraph_hash and paragraph_hash not in paragraphs_by_hash:
+                    paragraphs_by_hash[paragraph_hash] = paragraph
+
+        for paragraph in list(paragraphs_by_hash.values())[:20]:
+            paragraph_hash = str(paragraph.get("hash", "") or "").strip()
+            if not paragraph_hash:
+                continue
+            try:
+                paragraph_entities = self.metadata_store.get_paragraph_entities(paragraph_hash)
+            except Exception:
+                paragraph_entities = []
+            for entity in paragraph_entities:
+                name = str(entity.get("name", "") or "").strip()
+                if not name or name == person_id:
+                    continue
+                key = name.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                suggestions.append(name)
+        return suggestions
+
+    def _get_derived_person_aliases(self, person_id: str) -> Tuple[List[str], str, List[str]]:
+        """从 ID 绑定的历史称呼、插件人物注册表和人物主档案推导自动别名。"""
         aliases: List[str] = []
         primary_name = ""
         memory_traits: List[str] = []
         if not person_id:
             return aliases, primary_name, memory_traits
-
+        if hasattr(self.metadata_store, "get_person_identity"):
+            identity = self.metadata_store.get_person_identity(person_id)
+            if identity:
+                aliases = list(identity["aliases"])
+                primary_name = str(identity["canonical_name"])
+        if hasattr(self.metadata_store, "get_person_registry"):
+            reg = self.metadata_store.get_person_registry(person_id)
+            if isinstance(reg, dict):
+                reg_name = str(reg.get("person_name") or "").strip()
+                reg_nick = str(reg.get("nickname") or "").strip()
+                reg_group = self._parse_group_nicks(reg.get("group_nick_name"))
+                reg_traits = self._parse_memory_traits(reg.get("memory_points"))
+                if reg_traits:
+                    memory_traits = reg_traits
+                primary_name = primary_name or reg_name or reg_nick or (reg_group[0] if reg_group else "")
+                for item in [reg_name, reg_nick, *reg_group]:
+                    norm = str(item or "").strip()
+                    if norm and norm.lower() not in {a.lower() for a in aliases}:
+                        aliases.append(norm)
         try:
-            record = self.metadata_store.get_person_registry(person_id) or {}
+            with get_db_session(auto_commit=False) as session:
+                record = session.exec(select(PersonInfo).where(PersonInfo.person_id == person_id).limit(1)).first()
+                if record:
+                    person_name = str(record.person_name or "").strip()
+                    nickname = str(record.user_nickname or "").strip()
+                    group_nicks = self._parse_group_nicks(record.group_cardname)
+                    db_traits = self._parse_memory_traits(record.memory_points)
+                    if db_traits:
+                        memory_traits = db_traits
 
-            person_name = str(record.get("person_name", "") or "").strip()
-            nickname = str(record.get("nickname", "") or "").strip()
-            group_nicks = self._parse_group_nicks(record.get("group_nick_name"))
-            memory_traits = self._parse_memory_traits(record.get("memory_points"))
+                    primary_name = primary_name or (
+                        person_name
+                        or nickname
+                        or next((item for item in group_nicks if item), "")
+                        or str(record.user_id or "").strip()
+                        or person_id
+                    )
 
-            primary_name = (
-                person_name
-                or nickname
-                or str(record.get("user_id", "") or "").strip()
-                or person_id
-            )
-
-            candidates = [person_name, nickname] + group_nicks
-            seen = set()
-            for item in candidates:
-                norm = str(item or "").strip()
-                if not norm or norm in seen:
-                    continue
-                seen.add(norm)
-                aliases.append(norm)
-        except Exception as exc:
-            logger.warning("Parse person aliases failed: %s", exc)
-        if include_override:
-            override = self.metadata_store.get_person_profile_alias_override(person_id)
-            if override is not None:
-                aliases = override["aliases"]
+                    candidates = [*aliases, person_name, nickname] + group_nicks
+                    aliases = []
+                    seen = set()
+                    for item in candidates:
+                        norm = str(item or "").strip()
+                        key = norm.lower()
+                        if not norm or key in seen:
+                            continue
+                        seen.add(key)
+                        aliases.append(norm)
+        except Exception as e:
+            logger.warning(f"解析人物别名失败: person_id={person_id}, err={e}")
+        if not aliases:
+            aliases = [primary_name or person_id]
+        primary_name = primary_name or aliases[0] or person_id
         return aliases, primary_name, memory_traits
 
     def get_person_alias_details(self, person_id: str) -> Dict[str, Any]:
-        derived, primary_name, _ = self.get_person_aliases(person_id, include_override=False)
-        override = self.metadata_store.get_person_profile_alias_override(person_id)
+        """返回自动别名、人工覆盖和当前实际使用的别名。"""
+        token = str(person_id or "").strip()
+        if not token:
+            return {
+                "person_id": "",
+                "primary_name": "",
+                "derived_aliases": [],
+                "suggested_aliases": [],
+                "manual_aliases": [],
+                "effective_aliases": [],
+                "has_override": False,
+                "memory_traits": [],
+            }
+
+        derived_aliases, primary_name, memory_traits = self._get_derived_person_aliases(token)
+        override = self.metadata_store.get_person_profile_alias_override(token)
+        manual_aliases = list(override.get("aliases", [])) if override else []
+        suggested_aliases = self._collect_alias_suggestions_from_memory(token, derived_aliases + manual_aliases)
         return {
-            "person_id": person_id,
-            "person_name": primary_name,
-            "derived_aliases": derived,
-            "manual_aliases": override["aliases"] if override else None,
-            "effective_aliases": override["aliases"] if override else derived,
+            "person_id": token,
+            "primary_name": primary_name,
+            "derived_aliases": derived_aliases,
+            "suggested_aliases": suggested_aliases,
+            "manual_aliases": manual_aliases,
+            "effective_aliases": manual_aliases if override else derived_aliases,
+            "has_override": override is not None,
+            "memory_traits": memory_traits,
+            "override": override,
         }
 
-    def _with_fact_claims(self, person_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        # 每次读取当前账本，避免事实到期后仍沿用 TTL 内的缓存投影。
-        claims = self.metadata_store.list_person_profile_fact_claims(person_id)
-        result = dict(payload)
-        result["fact_claims"] = claims
-        result["alias_details"] = self.get_person_alias_details(person_id)
-        lines = [str(result.get("profile_text", "") or "")]
-        for uncertain, heading in ((False, "当前确认事实"), (True, "待确认事实线索")):
-            values = [str(claim["value_text"]) for claim in claims if (claim["stability"] == "uncertain") == uncertain]
-            if uncertain:
-                if not self._cfg("person_fact_writeback.update_registry_memory_points", True):
-                    continue
-                values = values[:max(1, int(self._cfg("person_fact_writeback.max_registry_facts", 30)))]
-            if values:
-                lines.append(heading + ":\n" + "\n".join(f"- {value}" for value in values))
-        result["profile_text"] = "\n".join(lines)
-        return result
+    def get_person_aliases(self, person_id: str) -> Tuple[List[str], str, List[str]]:
+        """获取画像实际使用的别名集合、主展示名和记忆特征。"""
+        details = self.get_person_alias_details(person_id)
+        return (
+            list(details["effective_aliases"]),
+            str(details["primary_name"]),
+            list(details["memory_traits"]),
+        )
 
-    def _collect_relation_evidence(self, aliases: List[str], limit: int = 30) -> List[Dict[str, Any]]:
+    def _collect_relation_evidence(
+        self,
+        aliases: List[str],
+        limit: int = 30,
+        *,
+        person_id: str = "",
+    ) -> List[Dict[str, Any]]:
         relation_by_hash: Dict[str, Dict[str, Any]] = {}
         for alias in aliases:
-            for rel in self.metadata_store.get_relations(subject=alias):
+            for rel in self.metadata_store.get_relations(subject=alias, include_inactive=False):
                 h = str(rel.get("hash", ""))
                 if h:
                     relation_by_hash[h] = rel
-            for rel in self.metadata_store.get_relations(object=alias):
+            for rel in self.metadata_store.get_relations(object=alias, include_inactive=False):
                 h = str(rel.get("hash", ""))
                 if h:
                     relation_by_hash[h] = rel
 
         relations = list(relation_by_hash.values())
+        if person_id:
+            relations = [rel for rel in relations if self._is_relation_bound_to_person(rel, person_id=person_id)]
         relations.sort(key=lambda item: float(item.get("confidence", 0.0)), reverse=True)
         relations = relations[: max(1, int(limit))]
+        supporting = (
+            self.metadata_store.get_paragraphs_by_relation_hashes([row["hash"] for row in relations])
+            if relations
+            else {}
+        )
 
         edges: List[Dict[str, Any]] = []
         for rel in relations:
+            paragraphs = supporting.get(rel["hash"], [])
+            if paragraphs and not any(
+                self.metadata_store.fact_relation_has_support(rel["hash"], row) for row in paragraphs
+            ):
+                continue
             edges.append(
                 {
                     "hash": str(rel.get("hash", "")),
@@ -285,72 +586,307 @@ class PersonProfileService:
             )
         return edges
 
-    @staticmethod
-    def _normalize_aliases(aliases: List[str]) -> List[str]:
-        normalized: List[str] = []
-        seen = set()
-        for alias in aliases:
-            text = str(alias or "").strip()
-            if not text or text in seen:
+    def _is_relation_bound_to_person(
+        self,
+        relation: Dict[str, Any],
+        *,
+        person_id: str,
+    ) -> bool:
+        pid = str(person_id or "").strip()
+        if not pid:
+            return False
+
+        metadata = coerce_metadata_dict(relation.get("metadata"))
+        if str(metadata.get("person_id", "") or "").strip() == pid:
+            return True
+        if pid in self._list_tokens(metadata.get("person_ids")):
+            return True
+
+        source_paragraph = str(relation.get("source_paragraph", "") or "").strip()
+        if source_paragraph:
+            try:
+                paragraph = self.metadata_store.get_paragraph(source_paragraph)
+            except Exception:
+                paragraph = None
+            if isinstance(paragraph, dict):
+                payload = {
+                    "hash": source_paragraph,
+                    "source": str(paragraph.get("source", "") or ""),
+                    "metadata": coerce_metadata_dict(paragraph.get("metadata")),
+                }
+                return self._is_evidence_bound_to_person(payload, person_id=pid)
+
+        return False
+
+    def _collect_person_fact_evidence(self, person_id: str, limit: int = 4) -> List[Dict[str, Any]]:
+        token = str(person_id or "").strip()
+        if not token or not hasattr(self.metadata_store, "get_paragraphs_by_source"):
+            return []
+
+        source = f"person_fact:{token}"
+        raw_rows = list(self.metadata_store.get_paragraphs_by_source(source))
+        conn = getattr(self.metadata_store, "_conn", None)
+        if conn is not None:
+            try:
+                extra_rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM paragraphs
+                    WHERE source LIKE 'person_fact:%'
+                      AND source LIKE ?
+                      AND COALESCE(is_deleted, 0) = 0
+                    ORDER BY COALESCE(updated_at, created_at, 0) DESC
+                    LIMIT ?
+                    """,
+                    (f"%:{token}", max(4, int(limit) * 2)),
+                ).fetchall()
+                seen_existing = {str(r.get("hash") or "") for r in raw_rows}
+                row_to_dict = getattr(self.metadata_store, "_row_to_dict", None)
+                for row in extra_rows:
+                    parsed = row_to_dict(row, "paragraph") if callable(row_to_dict) else dict(row)
+                    h = str(parsed.get("hash") or "")
+                    if h and h not in seen_existing:
+                        seen_existing.add(h)
+                        raw_rows.append(parsed)
+            except Exception:
+                pass
+        paragraphs = [
+            row
+            for row in raw_rows
+            if not bool(row.get("is_deleted", 0))
+            and coerce_metadata_dict(row.get("metadata")).get("dedup_phase") != "pending"
+        ]
+        if hasattr(self.metadata_store, "project_fact_paragraph"):
+            paragraphs = [
+                value for row in paragraphs if (value := self.metadata_store.project_fact_paragraph(row)) is not None
+            ]
+        paragraphs.sort(
+            key=lambda item: float(item.get("updated_at") or item.get("created_at") or 0.0),
+            reverse=True,
+        )
+
+        evidence: List[Dict[str, Any]] = []
+        for row in paragraphs[: max(1, int(limit))]:
+            paragraph_hash = str(row.get("hash", "") or "")
+            content = str(row.get("content", "") or "").strip()
+            if not paragraph_hash or not content:
                 continue
-            seen.add(text)
-            normalized.append(text)
-        normalized.sort(key=len, reverse=True)
-        return normalized
+            evidence.append(
+                {
+                    "hash": paragraph_hash,
+                    "type": "paragraph",
+                    "score": 1.1,
+                    "content": content[:220],
+                    "source": str(row.get("source", "") or source),
+                    "metadata": coerce_metadata_dict(row.get("metadata")),
+                }
+            )
+        return self._filter_stale_paragraph_evidence(evidence)
+
+    def _collect_person_fact_claims(self, person_id: str, limit: int = 200) -> List[Dict[str, Any]]:
+        """读取人物事实账本；该顺序直接决定有界画像投影，不能依赖召回分数。"""
+        if not hasattr(self.metadata_store, "list_person_profile_fact_claims"):
+            return []
+        return self.metadata_store.list_person_profile_fact_claims(
+            person_id,
+            effective_at=time.time(),
+            limit=max(1, int(limit)),
+        )
+
+    def _merge_fact_claim_buckets(
+        self,
+        classified_buckets: Dict[str, List[str]],
+        fact_claims: List[Dict[str, Any]],
+    ) -> Dict[str, List[str]]:
+        """将账本事实置于分类证据之前，保证 top-k 抖动不能挤出稳定事实。"""
+
+        merged: Dict[str, List[str]] = {key: [] for key in classified_buckets}
+        for claim in fact_claims:
+            section = str(claim.get("profile_section", "stable_facts") or "stable_facts").strip()
+            if section not in merged:
+                raise ValueError(f"事实 claim 使用了未知画像段落: {section}")
+            text = str(claim.get("value_text", "") or "").strip()
+            if text:
+                self._append_profile_bucket(merged, section, text)
+        for section, values in classified_buckets.items():
+            for value in values:
+                self._append_profile_bucket(merged, section, value)
+        return merged
 
     @staticmethod
-    def _text_matches_alias(value: str, aliases: List[str]) -> bool:
-        text = str(value or "").strip()
-        if not text:
+    def _list_tokens(value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple, set)):
+            return [str(item or "").strip() for item in value if str(item or "").strip()]
+        token = str(value or "").strip()
+        return [token] if token else []
+
+    def _is_evidence_bound_to_person(
+        self,
+        item: Dict[str, Any],
+        *,
+        person_id: str,
+    ) -> bool:
+        """画像证据必须显式绑定到 person_id，避免别名全局召回串人。"""
+        pid = str(person_id or "").strip()
+        if not pid:
             return False
-        lowered = text.lower()
-        for alias in aliases:
-            target = alias.lower()
-            if len(target) <= 1:
-                if lowered == target:
-                    return True
-                continue
-            if target in lowered:
-                return True
+
+        metadata = coerce_metadata_dict(item.get("metadata"))
+        source = str(item.get("source", "") or metadata.get("source", "") or "").strip()
+        if source == f"person_fact:{pid}" or (source.startswith("person_fact:") and source.endswith(f":{pid}")):
+            return True
+
+        if str(metadata.get("person_id", "") or "").strip() == pid:
+            return True
+        if pid in self._list_tokens(metadata.get("person_ids")):
+            return True
+
         return False
 
     def _is_person_related_vector_item(self, item: Dict[str, Any], aliases: List[str]) -> bool:
-        if not aliases:
+        normalized_aliases = [str(alias or "").strip() for alias in aliases if str(alias or "").strip()]
+        if not normalized_aliases:
             return False
-
-        paragraph = self.metadata_store.get_paragraph(str(item.get("hash", "")))
-        if paragraph is not None:
-            if paragraph.get("is_deleted"):
-                return False
-            paragraph_metadata = paragraph.get("metadata") or {}
-            # 人物事实由账本投影，避免撤回后仍从向量证据重新注入。
-            if isinstance(paragraph_metadata, dict) and paragraph_metadata.get("fact_claim_ids"):
-                return False
-
-        if self._text_matches_alias(str(item.get("content", "") or ""), aliases):
+        lowered_aliases = [alias.lower() for alias in normalized_aliases]
+        content = str(item.get("content", "") or "")
+        lowered_content = content.lower()
+        if any(alias in lowered_content for alias in lowered_aliases):
             return True
+        metadata = coerce_metadata_dict(item.get("metadata"))
+        participants = self._list_tokens(metadata.get("participants"))
+        lowered_participants = {p.lower() for p in participants}
+        return any(alias in lowered_participants for alias in lowered_aliases)
 
-        metadata = item.get("metadata", {}) or {}
-        if not isinstance(metadata, dict):
-            return False
+    @staticmethod
+    def _source_type_from_source(source: str) -> str:
+        token = str(source or "").strip()
+        if token.startswith("chat_summary:"):
+            return "chat_summary"
+        if token.startswith("person_fact:"):
+            return "person_fact"
+        return ""
 
-        for key in ("subject", "object", "predicate", "entity", "pivot_entity"):
-            if self._text_matches_alias(str(metadata.get(key, "") or ""), aliases):
-                return True
+    def _enrich_paragraph_evidence_metadata(
+        self,
+        paragraph_hash: str,
+        metadata: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], str]:
+        merged = coerce_metadata_dict(metadata)
+        source = str(merged.get("source", "") or "").strip()
+        try:
+            paragraph = (
+                self.metadata_store.get_paragraph(paragraph_hash)
+                if hasattr(self.metadata_store, "get_paragraph")
+                else None
+            )
+        except Exception:
+            paragraph = None
+        if isinstance(paragraph, dict):
+            paragraph_metadata = coerce_metadata_dict(paragraph.get("metadata"))
+            if paragraph_metadata:
+                merged = {**paragraph_metadata, **merged}
+            source = source or str(paragraph.get("source", "") or "").strip()
+        source_type = str(merged.get("source_type", "") or "").strip() or self._source_type_from_source(source)
+        if source_type:
+            merged["source_type"] = source_type
+        if source:
+            merged["source"] = source
+        return merged, source
 
-        entities = metadata.get("entities")
-        if isinstance(entities, list):
-            for entity in entities:
-                if self._text_matches_alias(str(entity or ""), aliases):
-                    return True
-        return False
+    @staticmethod
+    def _is_chat_summary_evidence(item: Dict[str, Any]) -> bool:
+        metadata = item.get("metadata", {}) if isinstance(item.get("metadata"), dict) else {}
+        source_type = str(metadata.get("source_type", "") or "").strip()
+        source = str(item.get("source", "") or metadata.get("source", "") or "").strip()
+        return source_type == "chat_summary" or source.startswith("chat_summary:")
 
-    async def _collect_vector_evidence(self, aliases: List[str], top_k: int = 12) -> List[Dict[str, Any]]:
-        alias_queries = self._normalize_aliases([a for a in aliases if a])
-        if not alias_queries:
+    def _filter_stale_paragraph_evidence(
+        self,
+        evidence: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        projected: List[Dict[str, Any]] = []
+        for item in evidence:
+            item_metadata = coerce_metadata_dict(item.get("metadata"))
+            if (
+                item.get("type") == "paragraph"
+                and item.get("hash")
+                and (item_metadata.get("dedup_managed") or item_metadata.get("dedup_phase") == "pending")
+                and hasattr(self.metadata_store, "get_paragraph")
+                and hasattr(self.metadata_store, "project_fact_paragraph")
+            ):
+                paragraph = self.metadata_store.get_paragraph(item["hash"])
+                if paragraph is not None and (
+                    coerce_metadata_dict(paragraph.get("metadata")).get("dedup_managed")
+                    or coerce_metadata_dict(paragraph.get("metadata")).get("dedup_phase") == "pending"
+                ):
+                    paragraph = self.metadata_store.project_fact_paragraph(paragraph)
+                    if paragraph is None:
+                        continue
+                    # 投影只删除失效事实，不能扩大调用方已经截断的证据预算。
+                    item = {**item, "content": paragraph["content"][: len(item["content"])]}
+            if "metadata" in item:
+                item = {**item, "metadata": visible_fact_metadata(coerce_metadata_dict(item["metadata"]))}
+            projected.append(item)
+        evidence = projected
+        memory_cfg = global_config.a_memorix.integration
+        if not bool(getattr(memory_cfg, "feedback_correction_paragraph_hard_filter_enabled", True)):
+            return evidence
+        if not hasattr(self.metadata_store, "get_paragraph_stale_relation_marks_batch"):
+            return evidence
+        paragraph_hashes = [
+            str(item.get("hash", "") or "").strip()
+            for item in evidence
+            if str(item.get("type", "") or "").strip() == "paragraph" and str(item.get("hash", "") or "").strip()
+        ]
+        if not paragraph_hashes:
+            return evidence
+
+        marks_by_paragraph = self.metadata_store.get_paragraph_stale_relation_marks_batch(paragraph_hashes)
+        relation_hashes: List[str] = []
+        seen = set()
+        for marks in marks_by_paragraph.values():
+            for mark in marks:
+                relation_hash = str(mark.get("relation_hash", "") or "").strip()
+                if not relation_hash or relation_hash in seen:
+                    continue
+                seen.add(relation_hash)
+                relation_hashes.append(relation_hash)
+        status_map = self.metadata_store.get_relation_status_batch(relation_hashes) if relation_hashes else {}
+
+        filtered: List[Dict[str, Any]] = []
+        for item in evidence:
+            item_type = str(item.get("type", "") or "").strip()
+            item_hash = str(item.get("hash", "") or "").strip()
+            if item_type != "paragraph" or not item_hash:
+                filtered.append(item)
+                continue
+            marks = marks_by_paragraph.get(item_hash, [])
+            should_hide = any(
+                status_map.get(str(mark.get("relation_hash", "") or "").strip()) is None
+                or bool((status_map.get(str(mark.get("relation_hash", "") or "").strip()) or {}).get("is_inactive"))
+                for mark in marks
+                if str(mark.get("relation_hash", "") or "").strip()
+            )
+            if should_hide:
+                continue
+            filtered.append(item)
+        return filtered
+
+    async def _collect_vector_evidence(
+        self,
+        aliases: List[str],
+        top_k: int = 12,
+        person_id: str = "",
+    ) -> List[Dict[str, Any]]:
+        alias_queries = [a for a in aliases if a]
+        pid = str(person_id or "").strip()
+        if not alias_queries and not pid:
             return []
 
         if self.retriever is None:
+            # 回退：无检索器时只做简单内容匹配
             fallback: List[Dict[str, Any]] = []
             seen_hash = set()
             for alias in alias_queries:
@@ -365,44 +901,58 @@ class PersonProfileService:
                             "type": "paragraph",
                             "score": 0.0,
                             "content": str(para.get("content", ""))[:180],
-                            "metadata": {},
+                            "source": str(para.get("source", "") or ""),
+                            "metadata": coerce_metadata_dict(para.get("metadata")),
                         }
                     )
-            return [item for item in fallback if self._is_person_related_vector_item(item, alias_queries)][:top_k]
+                    if pid:
+                        if not self._is_evidence_bound_to_person(fallback[-1], person_id=pid):
+                            fallback.pop()
+                    elif not self._is_person_related_vector_item(fallback[-1], alias_queries):
+                        fallback.pop()
+            return self._filter_stale_paragraph_evidence(fallback[:top_k])
 
-        per_alias_top_k = max(2, int(top_k / max(1, len(alias_queries))))
+        per_alias_top_k = max(2, int(top_k / max(1, len(alias_queries)))) if alias_queries else max(2, top_k)
         seen_hash = set()
         evidence: List[Dict[str, Any]] = []
-        timeout_seconds = float(self._cfg("person_profile.vector_evidence_timeout_seconds", 3.0) or 3.0)
+        for item in self._collect_person_fact_evidence(pid, limit=max(2, min(4, top_k))):
+            h = str(item.get("hash", "") or "")
+            if not h or h in seen_hash:
+                continue
+            seen_hash.add(h)
+            evidence.append(item)
+
         for alias in alias_queries:
             try:
-                results = await asyncio.wait_for(
-                    self.retriever.retrieve(alias, top_k=per_alias_top_k),
-                    timeout=max(0.2, timeout_seconds),
-                )
-            except asyncio.TimeoutError:
-                logger.warning("Vector evidence retrieve timed out: alias=%s", alias)
-                continue
-            except Exception as exc:
-                logger.warning("Vector evidence retrieve failed: %s", exc)
+                results = await self.retriever.retrieve(alias, top_k=per_alias_top_k)
+            except Exception as e:
+                logger.warning(f"向量证据召回失败: alias={alias}, err={e}")
                 continue
             for item in results:
-                h = str(getattr(item, "hash_value", "") or "")
+                h = str(item.hash_value or "")
                 if not h or h in seen_hash:
                     continue
-                seen_hash.add(h)
-                evidence.append(
-                    {
-                        "hash": h,
-                        "type": str(getattr(item, "result_type", "")),
-                        "score": float(getattr(item, "score", 0.0) or 0.0),
-                        "content": str(getattr(item, "content", "") or "")[:220],
-                        "metadata": dict(getattr(item, "metadata", {}) or {}),
-                    }
+                metadata, source = self._enrich_paragraph_evidence_metadata(
+                    h,
+                    coerce_metadata_dict(item.metadata),
                 )
-        filtered = [item for item in evidence if self._is_person_related_vector_item(item, alias_queries)]
-        filtered.sort(key=lambda x: x.get("score", 0.0), reverse=True)
-        return filtered[:top_k]
+                payload = {
+                    "hash": h,
+                    "type": str(item.result_type),
+                    "score": float(item.score or 0.0),
+                    "content": str(item.content or "")[:220],
+                    "source": source,
+                    "metadata": metadata,
+                }
+                if pid:
+                    if not self._is_evidence_bound_to_person(payload, person_id=pid):
+                        continue
+                elif not self._is_person_related_vector_item(payload, alias_queries):
+                    continue
+                seen_hash.add(h)
+                evidence.append(payload)
+        evidence.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+        return self._filter_stale_paragraph_evidence(evidence[:top_k])
 
     def _build_profile_text(
         self,
@@ -412,34 +962,278 @@ class PersonProfileService:
         relation_edges: List[Dict[str, Any]],
         vector_evidence: List[Dict[str, Any]],
         memory_traits: List[str],
+        classified_buckets: Optional[Dict[str, List[str]]] = None,
     ) -> str:
-        lines: List[str] = []
-        lines.append(f"人物ID: {person_id}")
-        if primary_name:
-            lines.append(f"主称呼: {primary_name}")
-        if aliases:
-            lines.append(f"别名: {', '.join(aliases[:8])}")
-        # registry.memory_points 没有证据生命周期，保留原数据供管理查看，不参与自动注入。
+        """基于证据构建画像文本（供 LLM 上下文注入）。"""
+        buckets = classified_buckets or self._classify_profile_evidence_rule_based(
+            relation_edges=relation_edges,
+            vector_evidence=vector_evidence,
+            memory_traits=memory_traits,
+        )
+        return build_structured_profile_text(
+            person_id=person_id,
+            primary_name=primary_name,
+            aliases=aliases[:8],
+            identity_settings=buckets.get("identity_settings", []),
+            relationship_settings=buckets.get("relationship_settings", []),
+            stable_facts=buckets.get("stable_facts", []),
+            interaction_preferences=buckets.get("interaction_preferences", []),
+            recent_interactions=buckets.get("recent_interactions", []),
+            uncertain_notes=buckets.get("uncertain_notes", []),
+        )
 
-        if relation_edges:
-            lines.append("关系证据:")
-            for rel in relation_edges[:6]:
-                s = rel.get("subject", "")
-                p = rel.get("predicate", "")
-                o = rel.get("object", "")
-                conf = float(rel.get("confidence", 0.0))
-                lines.append(f"- {s} {p} {o} (conf={conf:.2f})")
+    def _classify_profile_evidence_rule_based(
+        self,
+        *,
+        relation_edges: List[Dict[str, Any]],
+        vector_evidence: List[Dict[str, Any]],
+        memory_traits: List[str],
+    ) -> Dict[str, List[str]]:
+        """规则分桶画像证据，作为 LLM 不可用时的稳定回退。"""
+        del memory_traits
+        buckets: Dict[str, List[str]] = {
+            "identity_settings": [],
+            "relationship_settings": [],
+            "stable_facts": [],
+            "interaction_preferences": [],
+            "recent_interactions": [],
+            "uncertain_notes": [],
+        }
 
-        if vector_evidence:
-            lines.append("向量证据摘要:")
-            for item in vector_evidence[:4]:
-                content = str(item.get("content", "")).strip()
-                if content:
-                    lines.append(f"- {content}")
+        for rel in relation_edges[:8]:
+            text = self._format_relation_evidence_text(rel)
+            if not text:
+                continue
+            bucket = self._guess_profile_bucket(text)
+            if bucket == "stable_facts":
+                bucket = "relationship_settings"
+            self._append_profile_bucket(buckets, bucket, text)
 
-        if len(lines) <= 2:
-            lines.append("暂无足够证据形成稳定画像。")
-        return "\n".join(lines)
+        for item in vector_evidence:
+            content = str(item.get("content", "") or "").strip()
+            if not content:
+                continue
+            if self._is_chat_summary_evidence(item):
+                self._append_profile_bucket(buckets, "recent_interactions", content)
+                continue
+            self._append_profile_bucket(buckets, self._guess_profile_bucket(content), content)
+        return buckets
+
+    async def _classify_profile_evidence(
+        self,
+        *,
+        person_id: str,
+        primary_name: str,
+        aliases: List[str],
+        relation_edges: List[Dict[str, Any]],
+        vector_evidence: List[Dict[str, Any]],
+        memory_traits: List[str],
+    ) -> Dict[str, List[str]]:
+        """用 LLM 辅助证据分桶，失败时返回规则结果。"""
+        fallback = self._classify_profile_evidence_rule_based(
+            relation_edges=relation_edges,
+            vector_evidence=vector_evidence,
+            memory_traits=memory_traits,
+        )
+        candidates = self._build_profile_classification_candidates(
+            relation_edges=relation_edges,
+            vector_evidence=vector_evidence,
+            memory_traits=memory_traits,
+        )
+        if not candidates:
+            return fallback
+
+        model = self._resolve_profile_classification_model()
+        if model is None:
+            return fallback
+
+        prompt = self._build_profile_classification_prompt(
+            person_id=person_id,
+            primary_name=primary_name,
+            aliases=aliases,
+            candidates=candidates,
+        )
+        try:
+            result = await generate_with_resolved_model(
+                model,
+                PROFILE_CLASSIFICATION_REQUEST_TYPE,
+                prompt,
+                temperature=0.1,
+                max_tokens=self._profile_classification_max_tokens(),
+            )
+        except Exception as exc:
+            logger.debug(f"人物画像证据分类模型调用失败: person_id={person_id}, err={exc}")
+            return fallback
+        if not bool(getattr(result, "success", False)):
+            return fallback
+        response = str(getattr(getattr(result, "completion", None), "response", "") or "").strip()
+        parsed = self._parse_profile_classification_response(response)
+        if not parsed:
+            return fallback
+        return self._merge_profile_classification(fallback, parsed)
+
+    def _resolve_profile_classification_model(self) -> Optional[ResolvedLLMModel]:
+        try:
+            return resolve_fast_text_generation_model(llm_api)
+        except Exception as exc:
+            logger.debug(f"解析人物画像分类模型失败: {exc}")
+            return None
+
+    @staticmethod
+    def _build_profile_classification_prompt(
+        *,
+        person_id: str,
+        primary_name: str,
+        aliases: List[str],
+        candidates: List[Dict[str, str]],
+    ) -> str:
+        return (
+            "你要把人物画像证据归类到固定段落。只根据证据归类，不要编造。\n"
+            f"人物ID: {person_id}\n"
+            f"主称呼: {primary_name}\n"
+            f"别名: {json.dumps(aliases, ensure_ascii=False)}\n\n"
+            "分类定义：\n"
+            "- identity_settings: 稳定身份、角色、长期自我描述、重要背景。\n"
+            "- relationship_settings: 与麦麦、群友、组织、作品角色等长期关系或称呼关系。\n"
+            "- stable_facts: 长期稳定、证据明确的人物事实。\n"
+            "- interaction_preferences: 互动偏好、雷点、沟通习惯、喜欢/讨厌的相处方式。\n"
+            "- recent_interactions: 最近发生、对当前聊天有帮助但不应上升为长期事实的内容。\n"
+            "- uncertain_notes: 证据不足、推测、玩笑、自嘲、临时状态或疑似偏好。\n\n"
+            "要求：\n"
+            "1. 每条内容必须是简短中文陈述句。\n"
+            "2. 不要输出证据编号、hash 或置信度。\n"
+            "3. chat_summary 来源通常只能归入 recent_interactions 或 uncertain_notes。\n"
+            "4. 临时状态、计划、可能、似乎、玩笑类内容不能归入 stable_facts。\n"
+            "5. 只输出 JSON 对象，键为上述六类，值为字符串数组。\n\n"
+            f"证据列表：\n{json.dumps(candidates, ensure_ascii=False, indent=2)}"
+        )
+
+    @staticmethod
+    def _parse_profile_classification_response(raw: str) -> Dict[str, List[str]]:
+        text = str(raw or "").strip()
+        if not text:
+            return {}
+        try:
+            repaired = repair_json(text)
+            payload = json.loads(repaired) if isinstance(repaired, str) else repaired
+        except Exception:
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        allowed_keys = (
+            "identity_settings",
+            "relationship_settings",
+            "stable_facts",
+            "interaction_preferences",
+            "recent_interactions",
+            "uncertain_notes",
+        )
+        parsed: Dict[str, List[str]] = {key: [] for key in allowed_keys}
+        for key in allowed_keys:
+            values = payload.get(key)
+            if not isinstance(values, list):
+                continue
+            parsed[key] = [str(item or "").strip() for item in values if str(item or "").strip()]
+        return parsed
+
+    def _merge_profile_classification(
+        self,
+        fallback: Dict[str, List[str]],
+        llm_result: Dict[str, List[str]],
+    ) -> Dict[str, List[str]]:
+        buckets: Dict[str, List[str]] = {key: [] for key in fallback}
+        for key in buckets:
+            source_values = llm_result.get(key) or fallback.get(key) or []
+            for value in source_values:
+                self._append_profile_bucket(buckets, key, value)
+        return buckets
+
+    def _build_profile_classification_candidates(
+        self,
+        *,
+        relation_edges: List[Dict[str, Any]],
+        vector_evidence: List[Dict[str, Any]],
+        memory_traits: List[str],
+    ) -> List[Dict[str, str]]:
+        del memory_traits
+        candidates: List[Dict[str, str]] = []
+        for index, rel in enumerate(relation_edges[:12], start=1):
+            text = self._format_relation_evidence_text(rel)
+            if text:
+                candidates.append({"id": f"relation-{index}", "source_type": "relation", "text": text})
+        for index, item in enumerate(vector_evidence[:16], start=1):
+            content = str(item.get("content", "") or "").strip()
+            if not content:
+                continue
+            metadata = coerce_metadata_dict(item.get("metadata"))
+            source_type = str(metadata.get("source_type", "") or "").strip()
+            if not source_type:
+                source_type = "chat_summary" if self._is_chat_summary_evidence(item) else "person_fact"
+            candidates.append({"id": f"evidence-{index}", "source_type": source_type, "text": content[:260]})
+        return candidates
+
+    @staticmethod
+    def _append_profile_bucket(buckets: Dict[str, List[str]], bucket: str, text: str) -> None:
+        clean = str(text or "").strip().strip("- ")
+        if not clean:
+            return
+        values = buckets.setdefault(bucket, [])
+        if clean not in values:
+            values.append(clean)
+
+    @staticmethod
+    def _format_relation_evidence_text(rel: Dict[str, Any]) -> str:
+        subject = str(rel.get("subject", "") or "").strip()
+        predicate = str(rel.get("predicate", "") or "").strip()
+        obj = str(rel.get("object", "") or "").strip()
+        if not (subject and predicate and obj):
+            return ""
+        return f"{subject}{predicate}{obj}。"
+
+    @classmethod
+    def _guess_profile_bucket(cls, text: str) -> str:
+        content = str(text or "").strip()
+        if not content:
+            return "stable_facts"
+        if cls._looks_uncertain_or_temporary(content):
+            return "uncertain_notes"
+        if any(
+            token in content
+            for token in ("身份", "职业", "工作", "学生", "老师", "作者", "画师", "设定", "角色", "来自")
+        ):
+            return "identity_settings"
+        if any(token in content for token in ("关系", "朋友", "同事", "群友", "主人", "搭档", "称呼", "叫", "认识")):
+            return "relationship_settings"
+        if any(
+            token in content for token in ("喜欢", "讨厌", "偏好", "习惯", "不喜欢", "希望", "雷点", "介意", "更愿意")
+        ):
+            return "interaction_preferences"
+        return "stable_facts"
+
+    @staticmethod
+    def _looks_uncertain_or_temporary(text: str) -> bool:
+        content = str(text or "").strip()
+        if not content:
+            return False
+        markers = (
+            "可能",
+            "似乎",
+            "好像",
+            "大概",
+            "也许",
+            "疑似",
+            "暂时",
+            "今天",
+            "现在",
+            "刚刚",
+            "最近",
+            "计划",
+            "打算",
+            "玩笑",
+            "自嘲",
+            "临时",
+        )
+        return any(marker in content for marker in markers)
 
     @staticmethod
     def _is_snapshot_stale(snapshot: Optional[Dict[str, Any]], ttl_seconds: float) -> bool:
@@ -456,6 +1250,7 @@ class PersonProfileService:
         return (now - updated_at) >= ttl_seconds
 
     def _apply_manual_override(self, person_id: str, profile_payload: Dict[str, Any]) -> Dict[str, Any]:
+        """将手工覆盖并入画像结果（覆盖 profile_text，同时保留 auto_profile_text）。"""
         payload = dict(profile_payload or {})
         auto_text = str(payload.get("profile_text", "") or "")
         payload["auto_profile_text"] = auto_text
@@ -465,11 +1260,18 @@ class PersonProfileService:
         payload["override_updated_by"] = ""
         payload["profile_source"] = "auto_snapshot"
 
-        if not person_id:
+        if not person_id or self.metadata_store is None:
             return payload
-        override = self.metadata_store.get_person_profile_override(person_id)
+
+        try:
+            override = self.metadata_store.get_person_profile_override(person_id)
+        except Exception as e:
+            logger.warning(f"读取人物画像手工覆盖失败: person_id={person_id}, err={e}")
+            return payload
+
         if not override:
             return payload
+
         manual_text = str(override.get("override_text", "") or "").strip()
         if not manual_text:
             return payload
@@ -491,18 +1293,19 @@ class PersonProfileService:
         force_refresh: bool = False,
         source_note: str = "",
     ) -> Dict[str, Any]:
+        """查询或刷新人物画像。"""
         pid = str(person_id or "").strip()
         if not pid and person_keyword:
             try:
-                pid = self.resolve_person_id(person_keyword)
-            except ValueError as error:
-                return {"success": False, "error": str(error)}
-        if not pid and person_keyword:
-            # basic 场景里常见“人物”只作为图谱实体存在，尚未进入 person_registry。
-            # 允许直接使用关键词生成轻量画像，避免候选表为空时功能不可用。
-            pid = str(person_keyword or "").strip()
+                pid = self.resolve_person_id(person_keyword, metadata_store=self.metadata_store)
+            except ValueError as exc:
+                return {"success": False, "error": str(exc)}
+
         if not pid:
-            return {"success": False, "error": "person_id 无效，且未能通过别名解析"}
+            return {
+                "success": False,
+                "error": "person_id 无效，且未能通过别名解析",
+            }
 
         latest = self.metadata_store.get_latest_person_profile_snapshot(pid)
         if not force_refresh and not self._is_snapshot_stale(latest, ttl_seconds):
@@ -516,14 +1319,58 @@ class PersonProfileService:
             }
             if aliases and not payload.get("aliases"):
                 payload["aliases"] = aliases
-            return self._apply_manual_override(pid, self._with_fact_claims(pid, payload))
+            return {
+                **self._apply_manual_override(pid, payload),
+            }
 
         aliases, primary_name, memory_traits = self.get_person_aliases(pid)
         if not aliases and person_keyword:
             aliases = [person_keyword.strip()]
             primary_name = person_keyword.strip()
-        relation_edges = self._collect_relation_evidence(aliases, limit=max(10, top_k * 2))
-        vector_evidence = await self._collect_vector_evidence(aliases, top_k=max(4, top_k))
+        relation_edges = self._collect_relation_evidence(aliases, limit=max(10, top_k * 2), person_id=pid)
+        vector_evidence = await self._collect_vector_evidence(aliases, top_k=max(4, top_k), person_id=pid)
+        fact_claims = self._collect_person_fact_claims(pid, limit=max(32, top_k * 8))
+        evidence_fingerprint = self._profile_evidence_fingerprint(
+            person_id=pid,
+            primary_name=primary_name,
+            aliases=aliases,
+            relation_edges=relation_edges,
+            vector_evidence=vector_evidence,
+            memory_traits=memory_traits,
+            fact_claims=fact_claims,
+        )
+        expires_at = time.time() + float(ttl_seconds) if ttl_seconds > 0 else None
+        if latest and str(latest.get("evidence_fingerprint", "")) == evidence_fingerprint:
+            snapshot_id = latest.get("snapshot_id")
+            if snapshot_id is None:
+                raise RuntimeError("人物画像快照缺少 snapshot_id，无法执行证据版本短路")
+            refresh_note = source_note if source_note else str(latest.get("source_note", ""))
+            refreshed = self.metadata_store.refresh_person_profile_snapshot_cache(
+                int(snapshot_id),
+                expires_at=expires_at,
+                source_note=refresh_note,
+            )
+            payload = {
+                "success": True,
+                "person_id": pid,
+                "person_name": primary_name,
+                "from_cache": True,
+                "evidence_unchanged": True,
+                **refreshed,
+            }
+            if aliases and not payload.get("aliases"):
+                payload["aliases"] = aliases
+            return self._apply_manual_override(pid, payload)
+
+        classified_buckets = await self._classify_profile_evidence(
+            person_id=pid,
+            primary_name=primary_name,
+            aliases=aliases,
+            relation_edges=relation_edges,
+            vector_evidence=vector_evidence,
+            memory_traits=memory_traits,
+        )
+        classified_buckets = self._merge_fact_claim_buckets(classified_buckets, fact_claims)
 
         evidence_ids = [
             str(item.get("hash", ""))
@@ -545,9 +1392,9 @@ class PersonProfileService:
             relation_edges=relation_edges,
             vector_evidence=vector_evidence,
             memory_traits=memory_traits,
+            classified_buckets=classified_buckets,
         )
 
-        expires_at = time.time() + float(ttl_seconds) if ttl_seconds > 0 else None
         snapshot = self.metadata_store.upsert_person_profile_snapshot(
             person_id=pid,
             profile_text=profile_text,
@@ -555,6 +1402,8 @@ class PersonProfileService:
             relation_edges=relation_edges,
             vector_evidence=vector_evidence,
             evidence_ids=dedup_ids,
+            fact_claim_ids=[str(item.get("claim_id", "")) for item in fact_claims],
+            evidence_fingerprint=evidence_fingerprint,
             expires_at=expires_at,
             source_note=source_note,
         )
@@ -565,17 +1414,19 @@ class PersonProfileService:
             "from_cache": False,
             **snapshot,
         }
-        return self._apply_manual_override(pid, self._with_fact_claims(pid, payload))
+        return {
+            **self._apply_manual_override(pid, payload),
+        }
 
     @staticmethod
     def format_persona_profile_block(profile: Dict[str, Any]) -> str:
+        """格式化给 replyer 的注入块。"""
         if not profile or not profile.get("success"):
             return ""
         text = str(profile.get("profile_text", "") or "").strip()
         if not text:
             return ""
-        return (
-            "【人物画像-内部参考】\n"
-            f"{text}\n"
-            "仅供内部推理，不要向用户逐字复述。"
-        )
+        text = build_profile_injection_text(text)
+        if not text:
+            return ""
+        return f"【人物画像-内部参考】\n{text}\n仅供内部推理，不要向用户逐字复述。"

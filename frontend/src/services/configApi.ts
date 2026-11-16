@@ -1,14 +1,4 @@
-// Dashboard / 配置相关 API（typed 封装）。
-// 后端契约参照：
-//   /v1/query/stats      → memorix/amemorix/routers/v1_router.py:450（scope 经 bridge _scope 路由）
-//   /v1/dashboard/status → v1_router.py:310
-//   /v1/runtime/self_check → v1_router.py:508（POST，force 走 query 参数）
-//   /api/config          → memorix/webui/routes_compat.py:1332
-//   /api/scopes          → memorix/webui/plugin_page_bridge.py:324（bridge 层，返回已知 scope 列表）
-//
-// C5 关键：_scope 是 bridge 层查询参数，用于路由到对应 scope 的嵌入式 app（plugin_page_bridge.py:361-371）。
-// legacy loadStats 不带 _scope → 命中 scope_resolver() 默认 scope；loadGraph 带下拉 scope → 两者源不一致。
-// 新实现统一传 effectiveScope（currentScope || resolvedScope），见 useGraphStore。
+// Dashboard / 运行配置 / 运行时自检与双池存储落盘 API（统一随记忆作用域路由）。
 
 import { api } from "./api";
 
@@ -18,7 +8,7 @@ export interface ScopeOption {
   label: string;
 }
 
-/** /api/scopes 返回结构（bridge 层，与 _scope 无关）。 */
+/** /api/scopes 返回结构。 */
 export interface ScopesPayload {
   current: string;
   scopes: ScopeOption[];
@@ -33,7 +23,25 @@ export interface QueryStats {
   sparse?: unknown;
 }
 
-/** /v1/runtime/self_check 返回结构（字段宽松，运行时报告附加键不定）。 */
+/** v2.0 单个向量池健康快照。 */
+export interface VectorPoolStatus {
+  available?: boolean;
+  dimension?: number | null;
+  num_vectors?: number;
+  has_data?: boolean;
+}
+
+/** v2.0 双向量池运行状态报告。 */
+export interface VectorPoolsReport {
+  configured_mode?: "single" | "dual" | string;
+  effective_mode?: "single" | "dual" | string;
+  ready?: boolean;
+  single_pool?: VectorPoolStatus | null;
+  paragraph_pool?: VectorPoolStatus | null;
+  graph_pool?: VectorPoolStatus | null;
+}
+
+/** /v1/runtime/self_check 返回结构（含 v2.0 双向量池与多阶段维度诊断）。 */
 export interface RuntimeReport {
   ok: boolean;
   message?: string;
@@ -41,6 +49,13 @@ export interface RuntimeReport {
   embedding?: { dimension?: number; expected_dimension?: number; model?: string };
   dimension?: number;
   expected_dimension?: number;
+  configured_dimension?: number | null;
+  requested_dimension?: number | null;
+  vector_store_dimension?: number | null;
+  detected_dimension?: number | null;
+  encoded_dimension?: number | null;
+  elapsed_ms?: number;
+  vector_pools?: VectorPoolsReport | null;
   model?: string;
   checked_at?: number;
   [key: string]: unknown;
@@ -81,10 +96,11 @@ export interface DashboardStatus {
   };
 }
 
-/** /api/config 返回结构（GET，脱敏只读；不含 config_persistence）。 */
+/** /api/config 返回结构（GET，脱敏只读）。 */
 export interface ConfigPayload {
   auto_save_enabled: boolean;
   auto_save_interval: number;
+  persist_supported?: boolean;
   config?: Record<string, unknown>;
 }
 
@@ -94,10 +110,11 @@ export interface RuntimeConfigPatch {
   persist: boolean;
 }
 
-/** PATCH /api/config/runtime 返回结构。persisted 恒为 false（WebUI 仅运行时更新）。 */
+/** PATCH /api/config/runtime 返回结构。 */
 export interface RuntimeConfigResult {
   success: boolean;
   persisted: boolean;
+  persist_supported?: boolean;
   persist_message: string;
   auto_save_enabled: boolean;
   auto_save_interval: number;
@@ -109,28 +126,32 @@ export interface AutoSaveConfig {
   enabled: boolean;
 }
 
-/** POST /api/save 返回结构（手动保存各 store 到磁盘）。 */
+/** POST /api/save 返回结构。 */
 export interface ManualSaveResult {
   success: boolean;
   saved: string[];
 }
 
-/** 已知 scope 列表（bridge 层，与 _scope 无关）。 */
+export interface RuntimeAdminResponse {
+  success?: boolean;
+  error?: string;
+  saved?: string[];
+  report?: RuntimeReport;
+  [k: string]: unknown;
+}
+
 export function fetchScopes(): Promise<ScopesPayload> {
   return api.get<ScopesPayload>("/api/scopes");
 }
 
-/** 图谱/向量统计。统一传 scope 修 C5。 */
 export function fetchStats(scope: string): Promise<QueryStats> {
   return api.get<QueryStats>("/v1/query/stats", { scope });
 }
 
-/** Dashboard 服务分区 + 调用趋势。统一传 scope。 */
 export function fetchDashboardStatus(scope: string): Promise<DashboardStatus> {
   return api.get<DashboardStatus>("/v1/dashboard/status", { scope });
 }
 
-/** 运行时自检（embedding 维度等）。force 走 query 参数，与 legacy 一致。 */
 export function fetchRuntimeSelfCheck(force: boolean, scope: string): Promise<RuntimeReport> {
   return api.post<RuntimeReport>(
     `/v1/runtime/self_check?force=${force ? "true" : "false"}`,
@@ -139,22 +160,37 @@ export function fetchRuntimeSelfCheck(force: boolean, scope: string): Promise<Ru
   );
 }
 
-/** 脱敏只读配置（用于 dashboard autosave 指示；表单渲染在 P3）。 */
 export function fetchConfig(scope: string): Promise<ConfigPayload> {
   return api.get<ConfigPayload>("/api/config", { scope });
 }
 
-/** 保存运行时配置（persist=true 时尝试写文件，但 WebUI 恒返回 persisted=false）。 */
 export function patchRuntimeConfig(patch: RuntimeConfigPatch, scope: string): Promise<RuntimeConfigResult> {
   return api.patch<RuntimeConfigResult>("/api/config/runtime", patch, { scope });
 }
 
-/** 开关自动保存。返回新的 autosave 状态。 */
 export function setAutoSave(enabled: boolean, scope: string): Promise<AutoSaveConfig & ConfigPayload> {
   return api.post<AutoSaveConfig & ConfigPayload>("/api/config/auto_save", { enabled }, { scope });
 }
 
-/** 手动保存所有数据到磁盘（graph_store / vector_store）。 */
 export function manualSave(scope: string): Promise<ManualSaveResult> {
   return api.post<ManualSaveResult>("/api/save", {}, { scope });
+}
+
+/**
+ * 调用 /v1/admin/memory_runtime_admin（支持 save 双池向量+图谱完整落盘、self_check 等）。
+ */
+export async function callRuntimeAdmin(
+  action: "save" | "self_check" | "refresh_self_check" | "set_auto_save" | "paragraph_backfill_once" | "rebuild_all_vectors",
+  payload: Record<string, unknown> = {},
+  scope: string,
+): Promise<RuntimeAdminResponse> {
+  const res = await api.post<RuntimeAdminResponse>(
+    "/v1/admin/memory_runtime_admin",
+    { action, payload },
+    { scope },
+  );
+  if (res && res.success === false) {
+    throw new Error(res.error || `运行时管理操作失败 (${action})`);
+  }
+  return res;
 }

@@ -1,9 +1,6 @@
 <script setup lang="ts">
-// 来源查询 toolbar：节点 / 边 source / 边 target 三输入 + 载入来源按钮。
-// 从 legacy view-sources toolbar（index.html 行 2316-2324, 4502-4517）迁移。
-// 三个输入各接一个 useCandidateMenu 实例，候选源统一为 graph.nodeLabels（P8 loadGraph 后填充）。
-// 输入值直写 store.nodeId/edgeFrom/edgeTo；按钮触发 store.load()。
-import { ref } from "vue";
+// 来源筛选栏：支持按实体节点或成对关系边（起点 + 终点）检索段落，支持回车提交与一键重置筛选。
+import { computed, ref } from "vue";
 import { storeToRefs } from "pinia";
 import { useSourcesStore } from "@/stores/sources";
 import { useGraphStore } from "@/stores/graph";
@@ -12,24 +9,24 @@ import type { CandidateItem } from "@/stores/candidate";
 
 const store = useSourcesStore();
 const graph = useGraphStore();
-// 取 ref 本身：useCandidateMenu 需写回 model.value；store 代理会自动解包，故用 storeToRefs
-const { nodeId, edgeFrom, edgeTo } = storeToRefs(store);
+const { nodeId, edgeFrom, edgeTo, loading } = storeToRefs(store);
 
-// 三个输入的 template ref
 const nodeInput = ref<HTMLInputElement | null>(null);
 const edgeFromInput = ref<HTMLInputElement | null>(null);
 const edgeToInput = ref<HTMLInputElement | null>(null);
 
-/** graph-node 候选源：按 keyword 过滤 nodeLabels，keyword 为空返回全量。 */
+const hasFilter = computed(() =>
+  Boolean(nodeId.value.trim() || edgeFrom.value.trim() || edgeTo.value.trim()),
+);
+
 function nodeCandidates(keyword: string): CandidateItem[] {
   const kw = keyword.trim().toLowerCase();
   return graph.nodeLabels
     .filter((label) => !kw || label.toLowerCase().includes(kw))
-    .slice(0, 20)
-    .map((value) => ({ value, kind: "节点" }));
+    .slice(0, 24)
+    .map((value) => ({ value, kind: "实体" }));
 }
 
-// 三个输入各持独立候选会话；debounceMs 0（同步来源，立即刷新）
 const nodeMenu = useCandidateMenu({
   inputRef: nodeInput,
   model: nodeId,
@@ -48,45 +45,74 @@ const edgeToMenu = useCandidateMenu({
   source: nodeCandidates,
   debounceMs: 0,
 });
+
+function onEnter(): void {
+  if (!loading.value) void store.load();
+}
 </script>
 
 <template>
-  <div class="band" style="margin-top: 0">
+  <div class="band">
+    <div class="panel-title">
+      <h2>来源与证据段落筛选</h2>
+      <span class="section-label">留空显示来源批次汇总；按关系边筛选需同时填写起点与终点</span>
+    </div>
+
     <div class="toolbar">
       <div class="field">
-        <label>节点</label>
+        <label for="source-filter-node">实体节点</label>
         <input
+          id="source-filter-node"
           ref="nodeInput"
           v-model="nodeId"
           class="input"
-          placeholder="entity"
+          placeholder="可选：实体名称"
           @focus="nodeMenu.open"
           @input="nodeMenu.onInput"
+          @keyup.enter="onEnter"
         />
       </div>
+
       <div class="field">
-        <label>边 source</label>
+        <label for="source-filter-edge-from">关系边起点</label>
         <input
+          id="source-filter-edge-from"
           ref="edgeFromInput"
           v-model="edgeFrom"
           class="input"
-          placeholder="from"
+          placeholder="成对填写：主体起点"
           @focus="edgeFromMenu.open"
           @input="edgeFromMenu.onInput"
+          @keyup.enter="onEnter"
         />
       </div>
+
       <div class="field">
-        <label>边 target</label>
+        <label for="source-filter-edge-to">关系边终点</label>
         <input
+          id="source-filter-edge-to"
           ref="edgeToInput"
           v-model="edgeTo"
           class="input"
-          placeholder="to"
+          placeholder="成对填写：客体终点"
           @focus="edgeToMenu.open"
           @input="edgeToMenu.onInput"
+          @keyup.enter="onEnter"
         />
       </div>
-      <button class="btn primary" :disabled="store.loading" @click="store.load()">载入来源</button>
+
+      <button class="btn primary" type="button" :disabled="loading" @click="store.load()">
+        {{ loading ? "查询中…" : "查询来源" }}
+      </button>
+
+      <button
+        class="btn"
+        type="button"
+        :disabled="loading || !hasFilter"
+        @click="store.resetFilters()"
+      >
+        重置条件
+      </button>
     </div>
   </div>
 </template>
