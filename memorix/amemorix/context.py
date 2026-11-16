@@ -70,6 +70,8 @@ class AppContext:
             yield self
 
     def get_config(self, key: str, default: Any = None) -> Any:
+        if key == "runtime.vector_pools_ready":
+            return bool(self._dual_vector_pools_ready)
         current: Any = self.config
         for part in key.split("."):
             if isinstance(current, dict) and part in current:
@@ -80,6 +82,36 @@ class AppContext:
         if key == "advanced.enable_auto_save" and self._runtime_auto_save is not None:
             return bool(self._runtime_auto_save)
         return current
+
+    def activate_dual_vector_pools(self) -> None:
+        """在线激活双向量池读写与检索路径，无需重启作用域。"""
+        if self.paragraph_vector_store is None or self.graph_vector_store is None:
+            return
+        self._dual_vector_pools_ready = True
+        if isinstance(self.config, dict):
+            runtime_cfg = dict(self.config.get("runtime", {}) if isinstance(self.config.get("runtime"), dict) else {})
+            runtime_cfg["vector_pools_ready"] = True
+            self.config["runtime"] = runtime_cfg
+        if self.retriever is not None:
+            self.retriever.paragraph_vector_store = self.paragraph_vector_store
+            self.retriever.graph_vector_store = self.graph_vector_store
+            vp_cfg = getattr(getattr(self.retriever, "config", None), "vector_pools", None)
+            if vp_cfg is not None and hasattr(vp_cfg, "mode"):
+                vp_cfg.mode = "dual"
+        if self.paragraph_vector_service is not None:
+            self.paragraph_vector_service.vector_store = self.paragraph_vector_store
+        if self.relation_write_service is not None:
+            self.relation_write_service.vector_store = self.graph_vector_store
+        if self.person_profile_service is not None:
+            self.person_profile_service.paragraph_vector_store = self.paragraph_vector_store
+            self.person_profile_service.graph_vector_store = self.graph_vector_store
+            svc_cfg = getattr(self.person_profile_service, "plugin_config", None)
+            if isinstance(svc_cfg, dict):
+                svc_rt = dict(svc_cfg.get("runtime", {}) if isinstance(svc_cfg.get("runtime"), dict) else {})
+                svc_rt["vector_pools_ready"] = True
+                svc_cfg["runtime"] = svc_rt
+        self._runtime_self_check_report = None
+        self._request_dedup_cache.clear()
 
     def is_chat_enabled(
         self,

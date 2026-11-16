@@ -290,7 +290,9 @@ async def ensure_runtime_self_check(
         return cache
 
     report = await run_embedding_runtime_self_check(
-        config=getattr(plugin_or_config, "config", plugin_or_config),
+        config=plugin_or_config
+        if callable(getattr(plugin_or_config, "get_config", None))
+        else getattr(plugin_or_config, "config", plugin_or_config),
         vector_store=getattr(plugin_or_config, "vector_store", None)
         if not isinstance(plugin_or_config, dict)
         else plugin_or_config.get("vector_store"),

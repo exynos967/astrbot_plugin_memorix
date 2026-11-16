@@ -601,8 +601,15 @@ class AdminService:
             if act == "rebuild_all_vectors":
                 raw_limit = kwargs.get("limit")
                 adapter = await self._bundle_kernel_adapter(scope_key, ctx, include_image_runtime=False)
-                p_store = adapter._paragraph_store()
-                g_store = adapter._graph_vector_store()
+                configured_mode = str(ctx.get_config("retrieval.vector_pools.mode", "dual") or "dual").strip().lower()
+                promote_dual = (
+                    configured_mode == "dual"
+                    and raw_limit in {None, ""}
+                    and getattr(ctx, "paragraph_vector_store", None) is not None
+                    and getattr(ctx, "graph_vector_store", None) is not None
+                )
+                p_store = ctx.paragraph_vector_store if promote_dual else adapter._paragraph_store()
+                g_store = ctx.graph_vector_store if promote_dual else adapter._graph_vector_store()
                 for store in {p_store, g_store}:
                     if store is not None and hasattr(store, "clear"):
                         store.clear()
@@ -628,17 +635,90 @@ class AdminService:
                 )
                 generated_paragraphs = 0
                 for row in p_rows:
-                    if await adapter._ensure_paragraph_vector(row):
+                    if await adapter._ensure_vector_for_text(
+                        item_hash=str(row.get("hash", "") or ""),
+                        text=str(row.get("content", "") or ""),
+                        vector_store=p_store,
+                    ):
                         generated_paragraphs += 1
                 generated_entities = 0
                 for row in e_rows:
-                    if await adapter._ensure_entity_vector(row):
+                    raw_hash = str(row.get("hash", "") or "").strip()
+                    item_id = f"entity:{raw_hash}" if (promote_dual or adapter._dual_vector_pools_enabled()) else raw_hash
+                    if await adapter._ensure_vector_for_text(
+                        item_hash=item_id,
+                        text=str(row.get("name", "") or ""),
+                        vector_store=g_store,
+                    ):
                         generated_entities += 1
                 generated_relations = 0
                 for row in r_rows:
-                    if await adapter._ensure_relation_vector(row):
+                    raw_hash = str(row.get("hash", "") or "").strip()
+                    item_id = f"relation:{raw_hash}" if (promote_dual or adapter._dual_vector_pools_enabled()) else raw_hash
+                    rel_text = " ".join(
+                        part
+                        for part in (
+                            str(row.get("subject", "") or "").strip(),
+                            str(row.get("predicate", "") or "").strip(),
+                            str(row.get("object", "") or "").strip(),
+                        )
+                        if part
+                    )
+                    if await adapter._ensure_vector_for_text(
+                        item_hash=item_id,
+                        text=rel_text,
+                        vector_store=g_store,
+                    ):
                         generated_relations += 1
-                adapter._persist(force_vectors=True)
+
+                dual_activated = False
+                if promote_dual and p_store is not None and g_store is not None:
+                    dim = int(getattr(p_store, "dimension", 0) or getattr(g_store, "dimension", 0) or 1024)
+                    fp = adapter._current_embedding_fingerprint_for_validation(dim)
+                    if ctx.graph_store is not None:
+                        ctx.graph_store.save()
+                    for store in (p_store, g_store):
+                        try:
+                            if fp is not None:
+                                store.save(embedding_fingerprint=fp)
+                            else:
+                                store.save()
+                        except TypeError:
+                            store.save()
+                    manifest_payload: Dict[str, Any] = {
+                        "status": "ready",
+                        "version": 1,
+                        "mode": "dual",
+                        "dimension": dim,
+                        "created_at": time.time(),
+                        "paragraph_vectors": int(getattr(p_store, "num_vectors", generated_paragraphs)),
+                        "graph_vectors": int(getattr(g_store, "num_vectors", generated_entities + generated_relations)),
+                        "stats": {
+                            "paragraphs": {"done": generated_paragraphs, "failed": 0},
+                            "entities": {"done": generated_entities, "failed": 0},
+                            "relations": {"done": generated_relations, "failed": 0},
+                        },
+                    }
+                    if fp is not None:
+                        manifest_payload["embedding_fingerprint"] = fp
+                    manifest_path = Path(ctx.data_dir) / "vectors" / "dual_ready.json"
+                    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp_manifest = manifest_path.with_suffix(".json.tmp")
+                    tmp_manifest.write_text(
+                        json.dumps(manifest_payload, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                    tmp_manifest.replace(manifest_path)
+                    activator = getattr(ctx, "activate_dual_vector_pools", None)
+                    if callable(activator):
+                        activator()
+                    else:
+                        ctx._dual_vector_pools_ready = True
+                    dual_activated = True
+                else:
+                    adapter._persist(force_vectors=True)
+                    ctx._runtime_self_check_report = None
+
                 total_processed = len(p_rows) + len(e_rows) + len(r_rows)
                 total_generated = generated_paragraphs + generated_entities + generated_relations
                 return {
@@ -651,6 +731,8 @@ class AdminService:
                     "entity_generated": generated_entities,
                     "relation_processed": len(r_rows),
                     "relation_generated": generated_relations,
+                    "dual_activated": dual_activated,
+                    "effective_mode": "dual" if (dual_activated or adapter._dual_vector_pools_enabled()) else "single",
                 }
             if act == "paragraph_backfill_once":
                 limit = self._int(kwargs.get("limit"), 100, 1, 5000)
