@@ -41,9 +41,11 @@ class _LegacyDataUnpickler(pickle.Unpickler):
         "float": float,
         "bool": bool,
     }
-    _SAFE_COLLECTIONS = {"OrderedDict", "defaultdict"}
+    _SAFE_COLLECTIONS = {"OrderedDict", "defaultdict", "Counter", "deque"}
     _SAFE_DATETIME = {"datetime", "date", "time", "timedelta", "timezone"}
+    _SAFE_PATHLIB = {"Path", "PosixPath", "WindowsPath", "PurePath", "PurePosixPath", "PureWindowsPath"}
     _SAFE_NUMPY_TYPES = {
+        "ndarray",
         "dtype",
         "bool_",
         "int8",
@@ -59,9 +61,16 @@ class _LegacyDataUnpickler(pickle.Unpickler):
         "float64",
     }
 
+    def __init__(self, file: BinaryIO) -> None:
+        super().__init__(file, encoding="utf-8", errors="replace")
+
     def find_class(self, module: str, name: str) -> Any:
         if module in {"builtins", "__builtin__"} and name in self._SAFE_BUILTINS:
             return self._SAFE_BUILTINS[name]
+        if module in {"copyreg", "copy_reg"} and name == "_reconstructor":
+            import copyreg
+
+            return copyreg._reconstructor  # noqa: SLF001
         if module == "collections" and name in self._SAFE_COLLECTIONS:
             import collections
 
@@ -70,6 +79,10 @@ class _LegacyDataUnpickler(pickle.Unpickler):
             import datetime
 
             return getattr(datetime, name)
+        if module in {"pathlib", "pathlib._local"} and name in self._SAFE_PATHLIB:
+            import pathlib
+
+            return getattr(pathlib, "PurePosixPath" if "Posix" in name else ("PureWindowsPath" if "Windows" in name else "PurePath"))
         if module == "decimal" and name == "Decimal":
             import decimal
 
@@ -78,16 +91,23 @@ class _LegacyDataUnpickler(pickle.Unpickler):
             import uuid
 
             return uuid.UUID
-        if module in {"numpy", "numpy.core.multiarray", "numpy._core.multiarray"} and name in {"scalar", "dtype"}:
+        if module in {"numpy", "numpy.core.multiarray", "numpy._core.multiarray"} and name in {
+            "scalar",
+            "dtype",
+            "_reconstruct",
+            "ndarray",
+        }:
             import numpy as np
 
             if name == "dtype":
                 return np.dtype
+            if name == "ndarray":
+                return np.ndarray
             multiarray = getattr(getattr(np, "_core", None), "multiarray", None) or getattr(
                 getattr(np, "core", None), "multiarray", None
             )
-            if multiarray is not None and hasattr(multiarray, "scalar"):
-                return multiarray.scalar
+            if multiarray is not None and hasattr(multiarray, name):
+                return getattr(multiarray, name)
         if module == "numpy" and name in self._SAFE_NUMPY_TYPES:
             import numpy as np
 
@@ -393,18 +413,32 @@ def _metadata_to_json_text(raw: Any) -> Tuple[Optional[str], bool]:
         return _json_dumps(raw), True
 
     decoded: Any
-    if isinstance(raw, bytes):
-        if not raw:
+    if isinstance(raw, (bytes, bytearray, memoryview)):
+        raw_bytes = bytes(raw)
+        if not raw_bytes:
             return "", False
         try:
-            decoded = json.loads(raw.decode("utf-8"))
+            decoded = json.loads(raw_bytes.decode("utf-8"))
+            if decoded is None:
+                return "{}", True
             if not isinstance(decoded, dict):
-                raise TypeError("metadata JSON 必须是对象")
+                return _json_dumps({"_legacy_value": decoded}), True
             return _json_dumps(decoded), True
-        except Exception as json_exc:
-            decoded = _loads_legacy_pickle(raw)
+        except Exception:
+            try:
+                decoded = _loads_legacy_pickle(raw_bytes)
+            except pickle.UnpicklingError as unpickle_exc:
+                if "旧存储 pickle 禁止加载全局对象" in str(unpickle_exc):
+                    raise
+                logger.warning("SQLite metadata 二进制字段反序列化失败，已转为安全十六进制备份: %s", unpickle_exc)
+                return _json_dumps({"_corrupt_metadata_hex": raw_bytes.hex()}), True
+            except Exception as legacy_exc:
+                logger.warning("SQLite metadata 二进制字段损坏，已转为安全十六进制备份: %s", legacy_exc)
+                return _json_dumps({"_corrupt_metadata_hex": raw_bytes.hex()}), True
+            if decoded is None:
+                return "{}", True
             if not isinstance(decoded, dict):
-                raise TypeError("pickle metadata 必须解码为 dict") from json_exc
+                return _json_dumps({"_legacy_value": decoded}), True
             return _json_dumps(decoded), True
 
     if isinstance(raw, str):

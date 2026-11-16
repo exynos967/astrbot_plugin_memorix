@@ -1826,21 +1826,27 @@ class MetadataStore(
                 return {}
             try:
                 value = raw_bytes.decode("utf-8")
-            except UnicodeDecodeError as decode_exc:
+            except UnicodeDecodeError:
                 import pickle
 
-                from .format_migration import _loads_legacy_pickle, normalize_legacy_metadata_dict
+                from .format_migration import (
+                    _loads_legacy_pickle,
+                    _normalize_json_compatible,
+                    normalize_legacy_metadata_dict,
+                )
 
                 try:
                     legacy_decoded = _loads_legacy_pickle(raw_bytes)
                 except pickle.UnpicklingError as unpickle_exc:
                     if "旧存储 pickle 禁止加载全局对象" in str(unpickle_exc):
                         raise
-                    raise decode_exc from unpickle_exc
-                except Exception as legacy_exc:
-                    raise decode_exc from legacy_exc
+                    return {"_corrupt_metadata_hex": raw_bytes.hex()}
+                except Exception:
+                    return {"_corrupt_metadata_hex": raw_bytes.hex()}
+                if legacy_decoded is None:
+                    return {}
                 if not isinstance(legacy_decoded, dict):
-                    raise TypeError("metadata 字段必须解码为 dict") from decode_exc
+                    return {"_legacy_value": _normalize_json_compatible(legacy_decoded)}
                 return normalize_legacy_metadata_dict(legacy_decoded)
         if value == "":
             return {}
