@@ -1,6 +1,7 @@
 <script setup lang="ts">
 // Memory 综合治理视图：记忆衰减状态 + 关系保护/置顶 + 双池向量维护 + 结构化事实台账 + 回收站 + 可恢复删除审计。
-import { onMounted } from "vue";
+import { nextTick, onMounted, ref, watch } from "vue";
+import { useRoute } from "vue-router";
 import MemoryStatusPanel from "@/components/memory/MemoryStatusPanel.vue";
 import MemoryActionsPanel from "@/components/memory/MemoryActionsPanel.vue";
 import VectorMaintenancePanel from "@/components/memory/VectorMaintenancePanel.vue";
@@ -11,8 +12,30 @@ import { useMemoryStore } from "@/stores/memory";
 import { useScope } from "@/composables/useScope";
 import type { MemoryAction } from "@/services/memoryApi";
 
+const route = useRoute();
 const memory = useMemoryStore();
 const { loadScopes } = useScope();
+const vectorAnchorRef = ref<HTMLElement | null>(null);
+
+function scrollToSectionIfRequested(): void {
+  if (route.query.section !== "vectors") return;
+  void nextTick(() => {
+    const prefersReduced =
+      typeof window !== "undefined" &&
+      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    vectorAnchorRef.value?.scrollIntoView({
+      behavior: prefersReduced ? "auto" : "smooth",
+      block: "start",
+    });
+  });
+}
+
+watch(
+  () => route.query.section,
+  () => {
+    scrollToSectionIfRequested();
+  },
+);
 
 async function onRun(action: MemoryAction, id: string, hours = 24): Promise<void> {
   await memory.runAction(action, id, hours);
@@ -23,6 +46,7 @@ async function onRestore(hash: string, type: string): Promise<void> {
 }
 
 onMounted(async () => {
+  scrollToSectionIfRequested();
   await loadScopes();
   await Promise.allSettled([
     memory.loadStatus(),
@@ -49,7 +73,9 @@ onMounted(async () => {
       />
     </div>
 
-    <VectorMaintenancePanel />
+    <div ref="vectorAnchorRef">
+      <VectorMaintenancePanel />
+    </div>
 
     <FactLedgerPanel />
 

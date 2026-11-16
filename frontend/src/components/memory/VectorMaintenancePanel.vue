@@ -89,6 +89,13 @@ const maintChips = computed(() => {
       </div>
     </div>
 
+    <div v-if="pools?.configured_mode === 'dual' && !isDual" class="dual-upgrade-note">
+      <span class="tag warn">升级提示</span>
+      <span>
+        当前配置为双向量池模式，但缺少双池清单而降级在单池运行。点击下方「重建双池向量」即可在线启用段落池与图谱池隔离检索。
+      </span>
+    </div>
+
     <div class="pool-cards">
       <div class="pool-card">
         <span class="pool-label">
@@ -119,7 +126,8 @@ const maintChips = computed(() => {
 
     <div class="toolbar vec-actions">
       <button
-        class="btn primary"
+        class="btn"
+        :class="{ primary: isDual }"
         type="button"
         :disabled="memory.vectorBusy"
         @click="memory.backfillMissingVectors(200)"
@@ -127,12 +135,13 @@ const maintChips = computed(() => {
         {{ memory.vectorBusy ? "执行中…" : "回填缺失向量" }}
       </button>
       <button
-        class="btn danger"
+        class="btn"
+        :class="pools?.configured_mode === 'dual' && !isDual ? 'primary' : 'danger'"
         type="button"
         :disabled="memory.vectorBusy"
         @click="memory.rebuildAllVectors()"
       >
-        重建双池向量
+        {{ memory.vectorBusy ? "正在重建…" : "重建双池向量" }}
       </button>
     </div>
 
@@ -148,6 +157,22 @@ const maintChips = computed(() => {
   align-items: baseline;
   gap: 10px;
   flex-wrap: wrap;
+}
+
+.dual-upgrade-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--hairline);
+  border-left: 3px solid var(--amber);
+  border-radius: var(--radius-md);
+  background: var(--surface-soft);
+  color: var(--text);
+  font-size: 12.5px;
+  line-height: 1.5;
 }
 
 .pool-cards {

@@ -1,6 +1,6 @@
 // Dashboard 文本/状态派生工具：纯函数，供总览、服务列表、运行时横幅与设置页自检复用（DRY）。
 
-import type { RuntimeReport } from "@/services/configApi";
+import type { QueryStats, RuntimeReport } from "@/services/configApi";
 import type { VectorPoolsInfo } from "@/services/memoryAdminApi";
 
 const statusLabels: Record<string, string> = {
@@ -136,5 +136,54 @@ export function deriveVectorSummary(
       : legacyVectors != null
         ? `向量库状态${dimText}`
         : "等待加载向量统计",
+  };
+}
+
+export interface DualPoolUpgradeNotice {
+  needed: boolean;
+  legacyVectors: number;
+  paragraphs: number;
+  nodes: number;
+  edges: number;
+}
+
+/**
+ * 判断当前作用域是否为「从旧版单池升级而来、尚未启用 v2.0 双向量池」：
+ * - 配置目标为 dual（configured_mode === "dual"），但实际运行在 single（!ready 或 effective_mode !== "dual"）
+ * - 且当前作用域确实存在历史记忆数据（避免全新空库误弹升级横幅）
+ */
+export function deriveDualPoolUpgradeNotice(
+  stats: QueryStats | null | undefined,
+  report: RuntimeReport | null | undefined,
+): DualPoolUpgradeNotice {
+  const pools = extractVectorPools(report);
+  const singleVectors = Number(
+    pools?.single_pool?.num_vectors ?? stats?.vector_store?.num_vectors ?? 0,
+  );
+  const paragraphs = Number(
+    stats?.metadata_store?.paragraphs ?? stats?.metadata_store?.paragraph_count ?? 0,
+  );
+  const nodes = Number(stats?.graph_store?.num_nodes ?? 0);
+  const edges = Number(stats?.graph_store?.num_edges ?? 0);
+  const hasLegacyData =
+    singleVectors > 0 ||
+    Boolean(pools?.single_pool?.has_data) ||
+    paragraphs > 0 ||
+    nodes > 0 ||
+    edges > 0;
+
+  const configuredMode = String(pools?.configured_mode || "").toLowerCase();
+  const effectiveMode = String(pools?.effective_mode || "").toLowerCase();
+  const isUnmigratedDual =
+    Boolean(pools) &&
+    configuredMode === "dual" &&
+    (effectiveMode !== "dual" || pools?.ready === false);
+
+  return {
+    needed: isUnmigratedDual && hasLegacyData,
+    legacyVectors: singleVectors,
+    paragraphs,
+    nodes,
+    edges,
   };
 }
