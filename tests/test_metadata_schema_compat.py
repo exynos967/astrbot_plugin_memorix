@@ -811,17 +811,30 @@ def test_v23_pickled_metadata_migrates_cleanly_on_connect_and_bootstrap(tmp_path
 
     conn = sqlite3.connect(direct_dir / "metadata.db")
     try:
+        from collections import OrderedDict
+        from datetime import datetime, timezone
+
+        import numpy as np
+
         conn.execute("DELETE FROM schema_migrations WHERE version > 23")
         pickled_meta = pickle.dumps(
-            {
-                "person_id": "aiocqhttp:10001",
-                "tags": {"legacy_set_a", "legacy_set_b"},
-                "person_fact": {
-                    "fact_key": "居住城市",
-                    "value": "上海",
-                    "section": "basic_facts",
-                },
-            },
+            OrderedDict(
+                [
+                    ("person_id", "aiocqhttp:10001"),
+                    ("tags", {"legacy_set_a", "legacy_set_b"}),
+                    ("score", np.float64(0.925)),
+                    ("vec_idx", np.int64(42)),
+                    ("captured_at", datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)),
+                    ("evidence_source", "user_supported"),
+                    (
+                        "fact_claim",
+                        {
+                            "fact_key": "居住城市",
+                            "section": "basic_facts",
+                        },
+                    ),
+                ]
+            ),
             protocol=4,
         )
         assert pickled_meta[0] == 0x80
@@ -876,13 +889,15 @@ def test_v23_pickled_metadata_migrates_cleanly_on_connect_and_bootstrap(tmp_path
         conn2.close()
 
     with (scope_dir / "vectors" / "vectors_metadata.pkl").open("wb") as vf:
+        import numpy as np
+
         pickle.dump(
             {
-                "dimension": 768,
+                "dimension": np.int64(768),
                 "quantization_type": "int8",
                 "is_trained": False,
                 "vector_norm": "l2",
-                "deleted_ids": [],
+                "deleted_ids": [np.int64(11), np.int64(22)],
                 "known_hashes": [],
             },
             vf,
@@ -892,8 +907,8 @@ def test_v23_pickled_metadata_migrates_cleanly_on_connect_and_bootstrap(tmp_path
         pickle.dump(
             {
                 "nodes": ["上海"],
-                "node_to_idx": {"上海": 0},
-                "node_attrs": {},
+                "node_to_idx": {"上海": np.int64(0)},
+                "node_attrs": {"上海": {"saliency": np.float32(0.75)}},
                 "matrix_format": "csr",
                 "total_nodes_added": 1,
                 "total_edges_added": 0,
@@ -927,7 +942,7 @@ def test_decode_metadata_rejects_unsafe_pickle_globals():
             return (os.system, ("echo should_never_run",))
 
     malicious_blob = pickle.dumps({"bad": _Exploit()}, protocol=4)
-    with pytest.raises(UnicodeDecodeError):
+    with pytest.raises(pickle.UnpicklingError, match="旧存储 pickle 禁止加载全局对象"):
         MetadataStore._decode_metadata(malicious_blob)
 
 

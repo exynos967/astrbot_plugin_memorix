@@ -24,16 +24,74 @@ FORMAT_MIGRATION_VERSION = "pickle_to_json_v1"
 
 
 class _LegacyDataUnpickler(pickle.Unpickler):
-    """仅加载旧存储中的基础数据结构，禁止解析任何全局对象。"""
+    """仅加载旧存储中的纯值数据结构（含历史 NumPy 标量/时间/标准容器），禁止解析任何可执行全局对象。"""
 
     _SAFE_BUILTINS = {
         "set": set,
         "frozenset": frozenset,
+        "slice": slice,
+        "complex": complex,
+        "bytearray": bytearray,
+        "bytes": bytes,
+        "dict": dict,
+        "list": list,
+        "tuple": tuple,
+        "str": str,
+        "int": int,
+        "float": float,
+        "bool": bool,
+    }
+    _SAFE_COLLECTIONS = {"OrderedDict", "defaultdict"}
+    _SAFE_DATETIME = {"datetime", "date", "time", "timedelta", "timezone"}
+    _SAFE_NUMPY_TYPES = {
+        "dtype",
+        "bool_",
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+        "float16",
+        "float32",
+        "float64",
     }
 
     def find_class(self, module: str, name: str) -> Any:
         if module in {"builtins", "__builtin__"} and name in self._SAFE_BUILTINS:
             return self._SAFE_BUILTINS[name]
+        if module == "collections" and name in self._SAFE_COLLECTIONS:
+            import collections
+
+            return getattr(collections, name)
+        if module == "datetime" and name in self._SAFE_DATETIME:
+            import datetime
+
+            return getattr(datetime, name)
+        if module == "decimal" and name == "Decimal":
+            import decimal
+
+            return decimal.Decimal
+        if module == "uuid" and name == "UUID":
+            import uuid
+
+            return uuid.UUID
+        if module in {"numpy", "numpy.core.multiarray", "numpy._core.multiarray"} and name in {"scalar", "dtype"}:
+            import numpy as np
+
+            if name == "dtype":
+                return np.dtype
+            multiarray = getattr(getattr(np, "_core", None), "multiarray", None) or getattr(
+                getattr(np, "core", None), "multiarray", None
+            )
+            if multiarray is not None and hasattr(multiarray, "scalar"):
+                return multiarray.scalar
+        if module == "numpy" and name in self._SAFE_NUMPY_TYPES:
+            import numpy as np
+
+            return getattr(np, name)
         raise pickle.UnpicklingError(f"旧存储 pickle 禁止加载全局对象: {module}.{name}")
 
 
@@ -46,6 +104,8 @@ def _loads_legacy_pickle(payload: bytes) -> Any:
 
 
 def _normalize_json_compatible(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
     if isinstance(value, dict):
         return {str(key): _normalize_json_compatible(val) for key, val in value.items()}
     if isinstance(value, (list, tuple)):
@@ -55,7 +115,21 @@ def _normalize_json_compatible(value: Any) -> Any:
         return sorted(normalized_items, key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True))
     if isinstance(value, (bytes, bytearray, memoryview)):
         return bytes(value).decode("utf-8", errors="replace")
-    return value
+    if hasattr(value, "item") and callable(getattr(value, "item", None)):
+        try:
+            return _normalize_json_compatible(value.item())
+        except Exception:
+            pass
+    if hasattr(value, "tolist") and callable(getattr(value, "tolist", None)):
+        try:
+            return _normalize_json_compatible(value.tolist())
+        except Exception:
+            pass
+    if hasattr(value, "isoformat") and callable(getattr(value, "isoformat", None)):
+        return str(value.isoformat())
+    if hasattr(value, "total_seconds") and callable(getattr(value, "total_seconds", None)):
+        return float(value.total_seconds())
+    return str(value)
 
 
 def normalize_legacy_metadata_dict(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -70,8 +144,9 @@ def _json_dumps(value: Any) -> str:
 
 
 def _write_json(path: Path, payload: Dict[str, Any]) -> None:
+    normalized = _normalize_json_compatible(payload)
     with atomic_write(path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, sort_keys=True, indent=2)
+        json.dump(normalized, handle, ensure_ascii=False, sort_keys=True, indent=2)
         handle.write("\n")
 
 
@@ -655,6 +730,7 @@ def run_startup_format_migration(data_dir: Path) -> Dict[str, Any]:
 
         if conn is not None and work["sqlite_required"]:
             summary["sqlite"] = _migrate_sqlite_metadata(conn)
+            conn.commit()
         elif conn is not None:
             summary["sqlite"] = {"updated": 0, "reason": "not_required"}
         else:

@@ -1108,8 +1108,8 @@ class MetadataFactMixin:
                 continue
             raw_metadata = row.get("metadata")
             try:
-                metadata = json.loads(raw_metadata) if raw_metadata else {}
-            except (TypeError, ValueError):
+                metadata = self._decode_metadata(raw_metadata) if raw_metadata else {}
+            except Exception:
                 metadata = {}
             if not isinstance(metadata, dict):
                 metadata = {}

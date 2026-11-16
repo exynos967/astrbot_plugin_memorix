@@ -158,6 +158,10 @@ def migrate_metadata(store: Any) -> dict[str, Any] | None:
                 backup_path = backup_database(store._db_path, source_version=state.version)
                 logger.info("metadata 迁移备份已保存: %s", backup_path)
                 store._migrate_schema()
+                from .format_migration import _migrate_sqlite_metadata, _sqlite_legacy_metadata_exists
+
+                if _sqlite_legacy_metadata_exists(conn):
+                    _migrate_sqlite_metadata(conn)
             else:
                 store._initialize_tables()
             store._ensure_plugin_local_schema()
