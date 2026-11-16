@@ -1,9 +1,9 @@
-// Episode API（typed 封装）。
-// 后端契约（v1 端点，经 bridge _scope 路由到对应 scope 的 AppContext，故统一传 scope）：
-//   POST /v1/query/episode      {query,time_from?,time_to?,person?,source?,top_k?,include_paragraphs} → v1_router.py:413
-//   GET  /v1/episode/{id}?include_paragraphs=true → v1_router.py:497
-//   POST /v1/episode/rebuild     {source} → v1_router.py:456（409 if running）
-//   POST /v1/delete/paragraph    {paragraph_hash} → v1_router.py:513
+// Episode API（typed 封装，统一经 effectiveScope 路由作用域）。
+// 后端契约：
+//   POST /v1/query/episode                 {query,time_from?,time_to?,person?,source?,top_k?,include_paragraphs}
+//   GET  /v1/episode/{id}?include_paragraphs=true
+//   POST /v1/admin/memory_episode_admin    {action: "status"|"rebuild"|"process_sources"|"process_pending"|"discard_migration_backfill", payload}
+//   POST /v1/delete/paragraph              {paragraph_hash}
 
 import { api } from "./api";
 
@@ -21,6 +21,8 @@ export interface EpisodeParagraph {
   hash?: string;
   content?: string;
   type?: string;
+  source?: string;
+  created_at?: number;
   [k: string]: unknown;
 }
 
@@ -53,12 +55,47 @@ export interface EpisodeQueryResult {
   results: Episode[];
 }
 
-export interface EpisodeRebuildResult {
+export interface EpisodeRebuildItem {
   source?: string;
   episode_count?: number;
   fallback_count?: number;
   group_count?: number;
   paragraph_count?: number;
+  reused_group_count?: number;
+  reused_episode_count?: number;
+  [k: string]: unknown;
+}
+
+export interface EpisodeRebuildResult extends EpisodeRebuildItem {
+  success?: boolean;
+  error?: string;
+  rebuilt?: number;
+  unfinished?: number;
+  count?: number;
+  sources?: string[];
+  items?: EpisodeRebuildItem[];
+  failures?: Array<{ source?: string; error?: string }>;
+}
+
+export interface EpisodeLeaseStatus {
+  success?: boolean;
+  error?: string;
+  counts?: {
+    pending?: number;
+    running?: number;
+    failed?: number;
+    succeeded?: number;
+    done?: number;
+    [k: string]: number | undefined;
+  };
+  failed?: Array<{
+    source?: string;
+    last_error?: string;
+    error?: string;
+    attempts?: number;
+    updated_at?: number;
+  }>;
+  has_pending_paragraphs?: boolean;
   [k: string]: unknown;
 }
 
@@ -67,7 +104,20 @@ export interface ParagraphDeleteResult {
   paragraph_hash?: string;
   relation_prune_count?: number;
   deleted_vectors?: number;
+  operation_id?: string;
+  deleted?: {
+    paragraph?: number;
+    entity?: number;
+    relation?: number;
+  };
 }
+
+export type EpisodeAdminAction =
+  | "status"
+  | "rebuild"
+  | "process_sources"
+  | "process_pending"
+  | "discard_migration_backfill";
 
 export function queryEpisodes(
   req: EpisodeQueryRequest,
@@ -87,11 +137,28 @@ export function fetchEpisode(
   });
 }
 
+export async function episodeContractAdmin<T extends { success?: boolean; error?: string }>(
+  action: EpisodeAdminAction,
+  payload: Record<string, unknown>,
+  scope: string,
+): Promise<T> {
+  const res = await api.post<T>(
+    "/v1/admin/memory_episode_admin",
+    { action, payload },
+    { scope },
+  );
+  if (res && res.success === false && res.error) {
+    throw new Error(res.error);
+  }
+  return res;
+}
+
 export function rebuildEpisode(
   source: string,
   scope: string,
 ): Promise<EpisodeRebuildResult> {
-  return api.post<EpisodeRebuildResult>("/v1/episode/rebuild", { source }, { scope });
+  const payload = source.trim() ? { source: source.trim() } : { all: true };
+  return episodeContractAdmin<EpisodeRebuildResult>("rebuild", payload, scope);
 }
 
 export function deleteParagraphByHash(

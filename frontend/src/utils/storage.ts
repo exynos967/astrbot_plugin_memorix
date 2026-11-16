@@ -1,11 +1,11 @@
-// localStorage 安全封装：修复 legacy H7 —— legacy 中 storage 不可用时永久置 null 不再重试。
-// 本实现：每次访问重新尝试真实 localStorage（重试探针），失败降级内存 Map，
-// 即使用户清配额后恢复，下次访问自动回到真实 storage，无需刷新页面。
+// localStorage 安全封装：在模块初始化时探测一次真实 localStorage 可用性，
+// 避免在 sandboxed iframe 中每次读写都反复触发 SecurityError 异常开销；
+// 不可用或写入配额超限时自动降级到内存 Map。
 
 const memoryFallback = new Map<string, string>();
 
-/** 当前是否可安全使用真实 localStorage（每次调用重试，不缓存"不可用"结论）。 */
-export function realStorageAvailable(): boolean {
+function probeRealStorage(): boolean {
+  if (typeof window === "undefined") return false;
   try {
     const probe = "__memorix_storage_probe__";
     window.localStorage.setItem(probe, "1");
@@ -16,43 +16,52 @@ export function realStorageAvailable(): boolean {
   }
 }
 
+const STORAGE_AVAILABLE = probeRealStorage();
+
+/** 当前环境是否可安全访问真实 localStorage（模块初始化时探测并缓存）。 */
+export function realStorageAvailable(): boolean {
+  return STORAGE_AVAILABLE;
+}
+
 export const safeStorage = {
   getItem(key: string): string | null {
-    if (realStorageAvailable()) {
+    if (STORAGE_AVAILABLE) {
       try {
-        return window.localStorage.getItem(key);
+        const val = window.localStorage.getItem(key);
+        if (val !== null) return val;
       } catch {
-        // 落到内存兜底
+        // 降级读取内存兜底
       }
     }
     return memoryFallback.has(key) ? memoryFallback.get(key)! : null;
   },
 
   setItem(key: string, value: string): void {
-    if (realStorageAvailable()) {
+    if (STORAGE_AVAILABLE) {
       try {
         window.localStorage.setItem(key, value);
+        memoryFallback.delete(key);
         return;
       } catch {
-        // 配额满或被禁用，落到内存兜底
+        // 配额满或受限，降级写入内存兜底
       }
     }
     memoryFallback.set(key, value);
   },
 
   removeItem(key: string): void {
-    if (realStorageAvailable()) {
+    if (STORAGE_AVAILABLE) {
       try {
         window.localStorage.removeItem(key);
       } catch {
-        // 忽略，继续清内存
+        // 忽略，继续清理内存兜底
       }
     }
     memoryFallback.delete(key);
   },
 };
 
-/** JSON 读写糖：失败返回 default，不抛错。 */
+/** JSON 读写糖：失败返回 fallback，不抛错。 */
 export function readJSON<T>(key: string, fallback: T): T {
   const raw = safeStorage.getItem(key);
   if (!raw) return fallback;

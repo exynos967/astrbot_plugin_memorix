@@ -1,63 +1,154 @@
 <script setup lang="ts">
-// Episode 查询 toolbar：query 关键词 + source 输入（候选菜单 graph.nodeLabels）+ topk + 查询按钮。
-// 从 legacy view-episodes toolbar（index.html 行 2203-2212）迁移。
-// source 候选为同步 graph.nodeLabels，debounceMs 0；model 用 storeToRefs 解出的 ref。
-import { ref } from "vue";
+// Episode 查询筛选面板：支持关键词、真实来源补全、人物补全、起止时间区间与回车检索。
 import { storeToRefs } from "pinia";
 import { useEpisodeStore } from "@/stores/episode";
 import { useGraphStore } from "@/stores/graph";
-import { useCandidateMenu } from "@/composables/useCandidateMenu";
+import CandidateInput from "@/components/common/CandidateInput.vue";
 import type { CandidateItem } from "@/stores/candidate";
+import { fetchPersonRegistry } from "@/services/personApi";
+import { personCandidateValues } from "@/utils/personText";
 
 const store = useEpisodeStore();
 const graph = useGraphStore();
-// 取 ref 本身：useCandidateMenu 需写回 model.value；store 代理会自动解包，故用 storeToRefs
-const { source } = storeToRefs(store);
+const { query, source, person, timeFrom, timeTo, topk, loading } = storeToRefs(store);
 
-// source 输入框 template ref，供候选菜单 attach
-const sourceInput = ref<HTMLInputElement | null>(null);
-
-/** 来源候选源：按 keyword 过滤 graph.nodeLabels，keyword 为空返回全量。 */
-function sourceCandidates(keyword: string): CandidateItem[] {
-  const kw = keyword.trim().toLowerCase();
-  return graph.nodeLabels
-    .filter((label) => !kw || label.toLowerCase().includes(kw))
-    .slice(0, 20)
-    .map((value) => ({ value, kind: "来源" }));
+async function realSourceCandidates(kw: string): Promise<CandidateItem[]> {
+  const list = await store.getSourceCandidates(kw);
+  return list.map((value) => ({ value, kind: "来源" }));
 }
 
-const sourceMenu = useCandidateMenu({
-  inputRef: sourceInput,
-  model: source,
-  source: sourceCandidates,
-  debounceMs: 0,
-});
+async function personCandidates(kw: string): Promise<CandidateItem[]> {
+  try {
+    const data = await fetchPersonRegistry(kw.trim(), 1, 24, graph.effectiveScope());
+    return personCandidateValues(data.items).map((value) => ({ value, kind: "人物" }));
+  } catch {
+    return [];
+  }
+}
+
+function onEnter(): void {
+  if (!loading.value) void store.loadList();
+}
 </script>
 
 <template>
-  <div class="band" style="margin-top: 0">
-    <div class="panel-title"><h2>情景记忆</h2></div>
+  <div class="band">
+    <div class="panel-title">
+      <h2>情景记忆检索</h2>
+      <span class="section-label">关键词、来源、人物与时间区间联合筛选</span>
+    </div>
+
     <div class="toolbar">
-      <div class="field" style="flex: 2">
-        <label>关键词</label>
-        <input v-model="store.query" class="input" placeholder="episode 关键词" />
-      </div>
-      <div class="field">
-        <label>来源</label>
+      <div class="field" style="flex: 2 1 180px">
+        <label for="episode-query-kw">检索关键词</label>
         <input
-          ref="sourceInput"
-          v-model="store.source"
+          id="episode-query-kw"
+          v-model="query"
           class="input"
-          placeholder="source"
-          @focus="sourceMenu.open"
-          @input="sourceMenu.onInput"
+          placeholder="留空可按条件列出最新情景"
+          @keyup.enter="onEnter"
         />
       </div>
-      <div class="field">
-        <label>Top K</label>
-        <input v-model.number="store.topk" class="input" type="number" min="1" max="50" />
+
+      <CandidateInput
+        v-model="source"
+        :source="realSourceCandidates"
+        :debounce-ms="150"
+        label="记忆来源"
+        placeholder="选择或输入来源名称"
+        :flex="1.4"
+        @choose="onEnter"
+        @keydown.enter.prevent="onEnter"
+      />
+
+      <div class="field topk-field">
+        <label for="episode-query-topk">返回条数</label>
+        <input
+          id="episode-query-topk"
+          v-model.number="topk"
+          class="input tabular"
+          type="number"
+          min="1"
+          max="100"
+          @keyup.enter="onEnter"
+        />
       </div>
-      <button class="btn primary" :disabled="store.loading" @click="store.loadList()">查询</button>
+    </div>
+
+    <div class="toolbar secondary-row">
+      <CandidateInput
+        v-model="person"
+        :source="personCandidates"
+        :debounce-ms="180"
+        label="参与人物"
+        placeholder="人物名称或 ID"
+        :flex="1.4"
+        @choose="onEnter"
+        @keydown.enter.prevent="onEnter"
+      />
+
+      <div class="field" style="flex: 1 1 130px">
+        <label for="episode-time-from">起始时间</label>
+        <input
+          id="episode-time-from"
+          v-model="timeFrom"
+          class="input tabular"
+          placeholder="如 2026-05-01"
+          @keyup.enter="onEnter"
+        />
+      </div>
+
+      <div class="field" style="flex: 1 1 130px">
+        <label for="episode-time-to">结束时间</label>
+        <input
+          id="episode-time-to"
+          v-model="timeTo"
+          class="input tabular"
+          placeholder="如 2026-05-31"
+          @keyup.enter="onEnter"
+        />
+      </div>
+
+      <div class="query-btns">
+        <button
+          class="btn primary"
+          type="button"
+          :disabled="loading"
+          @click="store.loadList()"
+        >
+          {{ loading ? "检索中…" : "查询情景" }}
+        </button>
+        <button
+          class="btn"
+          type="button"
+          :disabled="loading"
+          @click="store.resetFilters()"
+        >
+          重置条件
+        </button>
+      </div>
     </div>
   </div>
 </template>
+
+<style scoped>
+.topk-field {
+  max-width: 104px;
+}
+
+@media (max-width: 640px) {
+  .topk-field {
+    max-width: none;
+  }
+}
+
+.secondary-row {
+  margin-top: 10px;
+}
+
+.query-btns {
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+}
+</style>

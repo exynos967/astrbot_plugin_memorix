@@ -1,14 +1,11 @@
-// Memory API（typed 封装）。
+// Memory API（typed 封装，统一经 effectiveScope 路由作用域）。
 // 后端契约：
-//   POST /v1/memory/status    → v1_router.py:549（MemoryService.status，scope-aware）
-//   POST /v1/memory/reinforce → v1_router.py:562（body: {id}）
-//   POST /v1/memory/protect   → v1_router.py:556（body: {id, hours}）
-//   POST /v1/memory/freeze    → v1_router.py:568（body: {id}）
-//   GET  /api/memory/recycle_bin → routes_compat.py:928（?limit=）
-//   POST /api/memory/restore    → routes_compat.py:951（body: {hash, type}）
-//
-// 与 legacy 一致：status/actions 走 /v1（scope-aware），recycle/restore 走 /api。
-// 统一经 effectiveScope 传 scope（修 C5 类作用域不一致问题）。
+//   POST /v1/memory/status       → MemoryService.status
+//   POST /v1/memory/reinforce    → {id}
+//   POST /v1/memory/protect      → {id, hours}（hours <= 0 为永久置顶 pin，hours > 0 为限时 TTL）
+//   POST /v1/memory/freeze       → {id}
+//   GET  /api/memory/recycle_bin → ?limit=&_scope=（返回 {items, error?}）
+//   POST /v1/memory/restore      → {hash, type: "relation" | "entity" | "paragraph"}
 
 import { api } from "./api";
 
@@ -22,7 +19,7 @@ export interface MemoryStatus {
   ttl_protected_relations: number;
 }
 
-/** /v1/memory/{reinforce,protect,freeze} 返回结构（字段宽松）。 */
+/** /v1/memory/{reinforce,protect,freeze,restore} 返回结构。 */
 export interface MemoryActionResult {
   success?: boolean;
   message?: string;
@@ -30,19 +27,28 @@ export interface MemoryActionResult {
   revived?: number;
   frozen_edges?: number;
   mode?: string;
+  protected_until?: number | null;
+  restored?: number;
+  already_live?: boolean;
   [key: string]: unknown;
 }
 
-/** 回收站单项（关系或实体）。 */
+/** 回收站单项（关系、实体或段落）。 */
 export interface RecycleItem {
   hash?: string;
-  type?: string;
+  type?: "relation" | "entity" | "paragraph" | string;
   subject?: string;
   object?: string;
   predicate?: string;
   name?: string;
   content?: string;
+  source?: string;
   deleted_at?: number;
+}
+
+export interface RecycleBinResponse {
+  items: RecycleItem[];
+  error?: string;
 }
 
 export type MemoryAction = "reinforce" | "protect" | "freeze";
@@ -61,15 +67,27 @@ export function runMemoryAction(
   action: MemoryAction,
   id: string,
   scope: string,
+  hours = 24,
 ): Promise<MemoryActionResult> {
-  const body = action === "protect" ? { id, hours: 24 } : { id };
+  const body = action === "protect" ? { id, hours } : { id };
   return api.post<MemoryActionResult>(ACTION_URL[action], body, { scope });
 }
 
-export function fetchRecycleBin(limit: number, scope: string): Promise<{ items: RecycleItem[] }> {
-  return api.get<{ items: RecycleItem[] }>(`/api/memory/recycle_bin?limit=${limit}`, { scope });
+export function fetchRecycleBin(
+  limit: number,
+  scope: string,
+): Promise<RecycleBinResponse> {
+  return api.get<RecycleBinResponse>(`/api/memory/recycle_bin?limit=${limit}`, { scope });
 }
 
-export function restoreMemory(hash: string, type: string, scope: string): Promise<MemoryActionResult> {
-  return api.post<MemoryActionResult>("/api/memory/restore", { hash, type: type || "relation" }, { scope });
+export function restoreMemory(
+  hash: string,
+  type: string,
+  scope: string,
+): Promise<MemoryActionResult> {
+  return api.post<MemoryActionResult>(
+    "/v1/memory/restore",
+    { hash, type: type || "relation" },
+    { scope },
+  );
 }

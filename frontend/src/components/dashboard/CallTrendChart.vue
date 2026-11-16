@@ -1,8 +1,6 @@
 <script setup lang="ts">
 // 调用趋势图：近 N 小时查询/工具调用频次（柱 + 折线 + 面积）。
-// 纯展示组件，几何计算从 legacy renderCallTrend（index.html 行 2943-3002）忠实移植。
-// 数据来自 dashboard status services.query.{trend_*}。
-// 宽度自适应容器，高度按宽高比 4:1 计算（宽屏可用作 flex:1 撑满视口）。
+// 修复：当后端返回 24 个全 0 分桶时，准确判定为空状态，避免显示误导性的「峰值 1 次 / 区间」。
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef } from "vue";
 import type { TrendBucket } from "@/services/configApi";
 
@@ -42,8 +40,12 @@ onBeforeUnmount(() => {
 });
 
 const WIDTH = computed(() => Math.max(200, containerWidth.value));
-/** 高度：优先容器高度（flex:1 撑高），否则按宽高比回退，最低 120px。 */
-const HEIGHT = computed(() => Math.max(120, containerHeight.value > 40 ? containerHeight.value : Math.round(containerWidth.value / 4)));
+const HEIGHT = computed(() =>
+  Math.max(
+    120,
+    containerHeight.value > 40 ? containerHeight.value : Math.round(containerWidth.value / 4),
+  ),
+);
 
 function fmtTime(sec: number): string {
   return new Date(sec * 1000).toLocaleTimeString("zh-CN", {
@@ -73,10 +75,12 @@ const spanSeconds = computed(
 const meta = computed(() => {
   const hours = Math.max(1, Math.round(spanSeconds.value / 3600));
   const minutes = Math.max(1, Math.round(bucketSeconds.value / 60));
-  return `近 ${hours} 小时 · ${minutes} 分钟区间 · ${total.value} 次`;
+  return `近 ${hours} 小时 · ${minutes} 分钟分桶 · 合计 ${total.value} 次`;
 });
 
-const empty = computed(() => !compact.value.length);
+const empty = computed(
+  () => !compact.value.length || compact.value.every((b) => b.total === 0),
+);
 
 const maxValue = computed(() => Math.max(1, ...compact.value.map((item) => item.total)));
 
@@ -105,10 +109,13 @@ const linePoints = computed(() =>
 );
 
 const areaPoints = computed(
-  () => `${PAD.left},${PAD.top + innerH.value} ${linePoints.value} ${PAD.left + innerW.value},${PAD.top + innerH.value}`,
+  () =>
+    `${PAD.left},${PAD.top + innerH.value} ${linePoints.value} ${PAD.left + innerW.value},${PAD.top + innerH.value}`,
 );
 
-const barWidth = computed(() => Math.max(2, innerW.value / Math.max(1, compact.value.length) - 3));
+const barWidth = computed(() =>
+  Math.max(2, innerW.value / Math.max(1, compact.value.length) - 3),
+);
 
 interface Bar {
   x: number;
@@ -137,11 +144,11 @@ const footEnd = computed(() =>
 <template>
   <div class="band chart-band">
     <div class="panel-title">
-      <h2>调用趋势</h2>
-      <span class="section-label">{{ meta }}</span>
+      <h2>检索与工具调用趋势</h2>
+      <span class="section-label tabular">{{ meta }}</span>
     </div>
     <div ref="chartEl" class="call-chart">
-      <div v-if="empty" class="empty">近 2 小时暂无查询/工具调用记录</div>
+      <div v-if="empty" class="empty">近 2 小时暂无检索或记忆工具调用记录</div>
       <template v-else>
         <svg
           :viewBox="`0 0 ${WIDTH} ${HEIGHT}`"
@@ -151,8 +158,20 @@ const footEnd = computed(() =>
           role="img"
           aria-label="近 2 小时查询与工具调用趋势"
         >
-          <line class="axis" :x1="PAD.left" :y1="PAD.top + innerH" :x2="PAD.left + innerW" :y2="PAD.top + innerH" />
-          <line class="axis" :x1="PAD.left" :y1="PAD.top" :x2="PAD.left" :y2="PAD.top + innerH" />
+          <line
+            class="axis"
+            :x1="PAD.left"
+            :y1="PAD.top + innerH"
+            :x2="PAD.left + innerW"
+            :y2="PAD.top + innerH"
+          />
+          <line
+            class="axis"
+            :x1="PAD.left"
+            :y1="PAD.top"
+            :x2="PAD.left"
+            :y2="PAD.top + innerH"
+          />
           <rect
             v-for="(bar, i) in bars"
             :key="`bar-${i}`"
@@ -176,7 +195,7 @@ const footEnd = computed(() =>
             <title>{{ fmtTime(dot.start) }} · {{ dot.value }} 次</title>
           </circle>
         </svg>
-        <div class="chart-foot">
+        <div class="chart-foot tabular">
           <span>{{ footStart }}</span>
           <span>峰值 {{ maxValue }} 次 / 区间</span>
           <span>{{ footEnd }}</span>

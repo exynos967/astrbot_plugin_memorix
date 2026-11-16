@@ -1,45 +1,80 @@
 <script setup lang="ts">
-// 全局候选菜单（单例，在 App.vue 挂载一份；teleport 到 body）。
-//
-// 修复 H8（候选菜单内部滚动链传播到外部 .view-stack）：
-//   1. CSS overscroll-behavior: contain —— 滚动链隔离。
-//   2. @wheel 处理：stopPropagation 始终阻止冒泡；菜单不可滚动时 preventDefault，
-//      到顶/到底时 preventDefault —— 不让多余滚动量漏给外部容器。
-//
-// 键盘导航（ArrowUp/Down/Enter/Escape）在 capture 阶段拦截，stopPropagation 阻止
-// 输入框自身 Enter 处理器重复触发（如 people 关键词 Enter 触发查询时，菜单开着则
-// 改为选中候选项）。外部 mousedown 关闭；window scroll/resize 重定位（菜单内滚动除外）。
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+// 全局候选菜单（单例，teleport 到 body）：
+// - 响应式视口边界钳制（窄屏与矮视口下均严格贴合上下左右安全边距，绝不悬空或溢出）
+// - 键盘上下导航自动 scrollIntoView({ block: "nearest" })
+// - wheel 滚动链隔离
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useCandidateStore } from "@/stores/candidate";
 
 const store = useCandidateStore();
 const menuRef = ref<HTMLElement | null>(null);
 
-const MAX_HEIGHT = 250;
+const MAX_HEIGHT = 256;
+const EDGE_GAP = 8;
+
+const viewport = ref({
+  w: typeof window !== "undefined" ? window.innerWidth || 360 : 360,
+  h: typeof window !== "undefined" ? window.innerHeight || 640 : 640,
+});
+
+function syncViewport(): void {
+  if (typeof window === "undefined") return;
+  viewport.value = {
+    w: Math.max(window.innerWidth || 320, 200),
+    h: Math.max(window.innerHeight || 480, 200),
+  };
+}
 
 const menuStyle = computed<Record<string, string>>((): Record<string, string> => {
   const a = store.anchor;
-  if (!a) return { display: "none" };
-  const vw = window.innerWidth;
-  const vh = window.innerHeight;
-  // 最小宽度 240px 保证长实体名不被截断（min-width 优先级低于视口防溢出）
-  const width = Math.max(a.width, 240);
-  const spaceBelow = vh - a.bottom;
-  const showBelow = spaceBelow >= 160 || spaceBelow >= a.top;
-  const top = showBelow ? a.bottom + 4 : Math.max(8, a.top - MAX_HEIGHT - 4);
+  if (!a || !store.visible || store.items.length === 0) {
+    return { display: "none" };
+  }
+
+  const vw = viewport.value.w;
+  const vh = viewport.value.h;
+  const maxAllowedWidth = Math.max(140, vw - EDGE_GAP * 2);
+  const desiredMinWidth = Math.min(220, maxAllowedWidth);
+  const width = Math.min(Math.max(a.width, desiredMinWidth), maxAllowedWidth);
+
   let left = a.left;
-  if (left + width > vw - 8) left = vw - width - 8;
-  if (left < 8) left = 8;
-  return {
-    display: store.visible && store.items.length > 0 ? "block" : "none",
+  if (left + width > vw - EDGE_GAP) left = vw - width - EDGE_GAP;
+  if (left < EDGE_GAP) left = EDGE_GAP;
+
+  const spaceBelow = Math.max(0, vh - a.bottom - EDGE_GAP - 4);
+  const spaceAbove = Math.max(0, a.top - EDGE_GAP - 4);
+  const showBelow = spaceBelow >= 160 || spaceBelow >= spaceAbove;
+  const availableHeight = showBelow ? spaceBelow : spaceAbove;
+  const clampedMaxHeight = Math.max(96, Math.min(MAX_HEIGHT, availableHeight));
+
+  const pos: Record<string, string> = {
+    display: "flex",
     left: `${Math.round(left)}px`,
-    top: `${Math.round(top)}px`,
     width: `${Math.round(width)}px`,
-    maxHeight: `${MAX_HEIGHT}px`,
+    maxHeight: `${Math.round(clampedMaxHeight)}px`,
   };
+
+  if (showBelow) {
+    pos.top = `${Math.round(Math.max(EDGE_GAP, a.bottom + 4))}px`;
+  } else {
+    pos.bottom = `${Math.round(Math.max(EDGE_GAP, vh - a.top + 4))}px`;
+  }
+
+  return pos;
 });
 
-/** H8 核心：菜单内 wheel 隔离。 */
+watch(
+  () => store.activeIndex,
+  async (idx) => {
+    if (!store.visible) return;
+    await nextTick();
+    const container = menuRef.value;
+    if (!container) return;
+    const target = container.querySelectorAll<HTMLElement>(".candidate-row")[idx];
+    target?.scrollIntoView({ block: "nearest" });
+  },
+);
+
 function onWheel(e: WheelEvent): void {
   const el = menuRef.value;
   if (!el) return;
@@ -90,15 +125,17 @@ function onDocDown(e: MouseEvent): void {
 function onScroll(e: Event): void {
   if (!store.visible) return;
   const t = e.target as Node | null;
-  if (t && menuRef.value?.contains(t)) return; // 菜单内滚动不重定位（H8）
+  if (t && menuRef.value?.contains(t)) return;
   store.reposition();
 }
 
 function onResize(): void {
+  syncViewport();
   if (store.visible) store.reposition();
 }
 
 onMounted(() => {
+  syncViewport();
   document.addEventListener("keydown", onKeydown, true);
   document.addEventListener("mousedown", onDocDown, true);
   window.addEventListener("scroll", onScroll, true);
@@ -127,6 +164,7 @@ function hover(index: number): void {
       ref="menuRef"
       class="candidate-menu"
       role="listbox"
+      aria-label="候选补全列表"
       :style="menuStyle"
       @wheel="onWheel"
     >
@@ -137,12 +175,13 @@ function hover(index: number): void {
         :class="{ active: idx === store.activeIndex }"
         type="button"
         role="option"
-        :title="item.value"
+        :aria-selected="idx === store.activeIndex"
+        :title="item.label || item.value"
         @mouseenter="hover(idx)"
         @mousedown.prevent="pick(idx)"
       >
-        <span class="candidate-value">{{ item.value }}</span>
-        <span v-if="item.kind" class="candidate-kind">{{ item.kind }}</span>
+        <span class="candidate-value">{{ item.label || item.value }}</span>
+        <span v-if="item.kind || item.hint" class="candidate-kind">{{ item.kind || item.hint }}</span>
       </button>
     </div>
   </Teleport>
@@ -151,41 +190,40 @@ function hover(index: number): void {
 <style scoped>
 .candidate-menu {
   position: fixed;
-  z-index: 9000;
-  overflow: auto;
-  /* H8 修复：滚动链隔离，菜单内滚动不传播到外部 .view-stack */
+  z-index: 9200;
+  overflow-x: hidden;
+  overflow-y: auto;
   overscroll-behavior: contain;
-  scrollbar-width: none;
-  padding: 7px;
-  border: 1px solid var(--hairline);
-  border-radius: 16px;
-  background: var(--surface-strong);
-  box-shadow: var(--shadow);
-  display: flex;
+  scrollbar-width: thin;
+  padding: 4px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-sm);
   flex-direction: column;
   gap: 2px;
 }
-.candidate-menu::-webkit-scrollbar {
-  width: 0;
-  height: 0;
-  display: none;
-}
 
 .candidate-row {
+  min-width: 0;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  min-height: 38px;
-  padding: 7px 12px;
-  border: none;
-  border-radius: 10px;
+  min-height: 36px;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: var(--radius-sm);
   background: transparent;
   color: var(--text);
   text-align: left;
   cursor: pointer;
   font-size: 13px;
+  transition:
+    background-color var(--m-out) var(--ease),
+    color var(--m-out) var(--ease);
 }
+
 .candidate-row:hover,
 .candidate-row.active {
   background: var(--accent-soft);
@@ -193,6 +231,7 @@ function hover(index: number): void {
 }
 
 .candidate-value {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -200,7 +239,18 @@ function hover(index: number): void {
 
 .candidate-kind {
   flex: none;
-  font-size: 11px;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
   color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 768px) {
+  .candidate-row {
+    min-height: 40px;
+  }
 }
 </style>
