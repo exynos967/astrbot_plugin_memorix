@@ -204,3 +204,44 @@ def _install_openai_stub() -> None:
 
 _install_astrbot_stub()
 _install_openai_stub()
+
+import pytest  # noqa: E402
+from astrbot_plugin_memorix.tests.mocks import (  # noqa: E402
+    MockAstrContext,
+    MockAstrMessageEvent,
+    MockChatProvider,
+    create_test_plugin_instance,
+)
+
+
+@pytest.fixture
+def mock_context(tmp_path):
+    return MockAstrContext(data_dir=tmp_path)
+
+
+@pytest.fixture
+def mock_provider():
+    return MockChatProvider()
+
+
+@pytest.fixture
+def make_event():
+    def _factory(message_str="Hello", sender_id="u1", sender_name="User", group_id="g1", **kwargs):
+        return MockAstrMessageEvent(
+            message_str=message_str,
+            sender_id=sender_id,
+            sender_name=sender_name,
+            group_id=group_id,
+            **kwargs,
+        )
+
+    return _factory
+
+
+@pytest.fixture
+def plugin_factory(tmp_path):
+    def _factory(custom_config=None):
+        return create_test_plugin_instance(tmp_path, custom_config)
+
+    return _factory
+

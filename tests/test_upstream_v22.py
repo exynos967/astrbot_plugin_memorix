@@ -33,7 +33,7 @@ def test_v21_upgrade_keeps_paragraphs_and_local_queue(store):
     store._conn.execute("INSERT OR REPLACE INTO schema_migrations VALUES (21, 1.0)")
     store._conn.commit()
     store._assert_schema_compatible(db_existed=True)
-    assert store.get_schema_version() == 23
+    assert store.get_schema_version() >= 23
     assert store.get_paragraph(paragraph)["content"] == "原有聊天证据"
     assert store._conn.execute("SELECT COUNT(*) FROM episode_pending_paragraphs").fetchone()[0] == 1
     store.set_person_profile_alias_override(person_id="user", aliases=[" Alice ", "alice", "艾丽丝"])

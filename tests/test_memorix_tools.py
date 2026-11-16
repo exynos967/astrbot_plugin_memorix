@@ -616,7 +616,8 @@ def test_person_fact_writeback_stores_paragraph_and_registry_points(tmp_path):
 
         record = metadata_store.get_person_registry("qq:u1")
         assert record is not None
-        assert "小明喜欢深夜打游戏" in record["memory_points"]
+        claims = metadata_store.list_fact_claims(scope_type="person", scope_id="qq:u1")
+        assert any("小明喜欢深夜打游戏" in str(c.get("value_text") or "") for c in claims)
         paragraphs = metadata_store.get_paragraphs_by_source("person_fact:s1:qq:u1")
         assert len(paragraphs) == 1
         assert "小明喜欢深夜打游戏" in paragraphs[0]["content"]
