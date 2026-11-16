@@ -1820,10 +1820,22 @@ class MetadataStore(
             return dict(value)
         if value is None:
             return {}
-        if isinstance(value, bytes):
-            if not value:
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            raw_bytes = bytes(value)
+            if not raw_bytes:
                 return {}
-            value = value.decode("utf-8")
+            try:
+                value = raw_bytes.decode("utf-8")
+            except UnicodeDecodeError as decode_exc:
+                from .format_migration import _loads_legacy_pickle, normalize_legacy_metadata_dict
+
+                try:
+                    legacy_decoded = _loads_legacy_pickle(raw_bytes)
+                except Exception:
+                    raise decode_exc
+                if not isinstance(legacy_decoded, dict):
+                    raise TypeError("metadata 字段必须解码为 dict") from decode_exc
+                return normalize_legacy_metadata_dict(legacy_decoded)
         if value == "":
             return {}
         decoded = json.loads(value)

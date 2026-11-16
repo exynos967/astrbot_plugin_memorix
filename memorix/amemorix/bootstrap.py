@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import pickle
 from pathlib import Path
 from typing import Any, Dict
 
@@ -21,6 +20,7 @@ from ..core.retrieval.posterior_graph import PosteriorGraphConfig
 from ..core.retrieval.sparse_bm25 import SparseBM25Config, SparseBM25Index
 from ..core.retrieval.threshold import DynamicThresholdFilter, ThresholdConfig, ThresholdMethod
 from ..core.storage import GraphStore, MetadataStore, QuantizationType, SparseMatrixFormat, VectorStore
+from ..core.storage.format_migration import _load_legacy_pickle, run_startup_format_migration
 from ..core.utils.episode_retrieval_service import EpisodeRetrievalService
 from ..core.utils.episode_segmentation_service import EpisodeSegmentationService
 from ..core.utils.episode_service import EpisodeService
@@ -73,15 +73,43 @@ def _dual_vector_ready(data_dir: Path, *, expected_dimension: int) -> bool:
     ).exists()
 
 
+def _has_existing_vector_metadata(vectors_dir: Path) -> bool:
+    for candidate in (
+        vectors_dir / "vectors_metadata.json",
+        vectors_dir / "vectors_metadata.pkl",
+        vectors_dir / "paragraph" / "vectors_metadata.json",
+        vectors_dir / "graph" / "vectors_metadata.json",
+    ):
+        if candidate.exists():
+            return True
+    return False
+
+
 def _resolve_vector_dimension(settings: AppSettings, vectors_dir: Path) -> int:
+    for json_path in (
+        vectors_dir / "vectors_metadata.json",
+        vectors_dir / "paragraph" / "vectors_metadata.json",
+        vectors_dir / "graph" / "vectors_metadata.json",
+    ):
+        if json_path.exists():
+            try:
+                data = json.loads(json_path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    dim = _safe_int(data.get("dimension"), 0)
+                    if dim > 0:
+                        return dim
+            except Exception as exc:
+                logger.warning("Failed to read existing JSON vector metadata dimension (%s): %s", json_path, exc)
+
     metadata_path = vectors_dir / "vectors_metadata.pkl"
     if metadata_path.exists():
         try:
             with metadata_path.open("rb") as f:
-                data = pickle.load(f)
-            dim = _safe_int(data.get("dimension"), 0)
-            if dim > 0:
-                return dim
+                data = _load_legacy_pickle(f)
+            if isinstance(data, dict):
+                dim = _safe_int(data.get("dimension"), 0)
+                if dim > 0:
+                    return dim
         except Exception as exc:
             logger.warning("Failed to read existing vector metadata dimension: %s", exc)
     return _safe_int(settings.get("embedding.dimension", 1024), 1024)
@@ -113,6 +141,11 @@ def build_context(settings: AppSettings) -> AppContext:
     graph_dir.mkdir(parents=True, exist_ok=True)
     metadata_dir.mkdir(parents=True, exist_ok=True)
 
+    try:
+        run_startup_format_migration(data_dir)
+    except Exception as exc:
+        logger.exception("历史存储格式转换失败，将由各存储通道独立校验并降级: %s", exc)
+
     endpoint_cfg = resolve_openapi_endpoint_config(settings.config, section="embedding")
     configured_dim = _resolve_vector_dimension(settings, vectors_dir)
     adapter = create_embedding_api_adapter(
@@ -129,14 +162,13 @@ def build_context(settings: AppSettings) -> AppContext:
         enable_cache=bool(settings.get("embedding.enable_cache", False)),
     )
 
-    metadata_path = vectors_dir / "vectors_metadata.pkl"
     vector_dim = configured_dim
     embedding_enabled = bool(settings.get("embedding.enabled", False))
     # 维度自动探测恒定开启（embedding 启用时）：fresh store 探测真实维度对齐向量存储，
     # 避免用户配置维度与模型实际输出不符导致索引错乱。原 embedding.auto_detect_dimension
     # 开关从未在 schema 暴露、默认即 True，固化为恒定行为（dimensions 兼容性探测另由
     # adapter.encode 入口独立保证，不依赖此开关）。
-    if embedding_enabled and not metadata_path.exists():
+    if embedding_enabled and not _has_existing_vector_metadata(vectors_dir):
         probed_dim = _probe_embedding_dimension(adapter, configured_dim)
         if probed_dim != configured_dim:
             logger.info(

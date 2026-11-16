@@ -26,7 +26,14 @@ FORMAT_MIGRATION_VERSION = "pickle_to_json_v1"
 class _LegacyDataUnpickler(pickle.Unpickler):
     """仅加载旧存储中的基础数据结构，禁止解析任何全局对象。"""
 
+    _SAFE_BUILTINS = {
+        "set": set,
+        "frozenset": frozenset,
+    }
+
     def find_class(self, module: str, name: str) -> Any:
+        if module in {"builtins", "__builtin__"} and name in self._SAFE_BUILTINS:
+            return self._SAFE_BUILTINS[name]
         raise pickle.UnpicklingError(f"旧存储 pickle 禁止加载全局对象: {module}.{name}")
 
 
@@ -38,8 +45,28 @@ def _loads_legacy_pickle(payload: bytes) -> Any:
     return _load_legacy_pickle(BytesIO(payload))
 
 
+def _normalize_json_compatible(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _normalize_json_compatible(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normalize_json_compatible(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        normalized_items = [_normalize_json_compatible(item) for item in value]
+        return sorted(normalized_items, key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True))
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value).decode("utf-8", errors="replace")
+    return value
+
+
+def normalize_legacy_metadata_dict(payload: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = _normalize_json_compatible(payload)
+    if not isinstance(normalized, dict):
+        raise TypeError("metadata 字段必须解码为 dict")
+    return normalized
+
+
 def _json_dumps(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return json.dumps(_normalize_json_compatible(value), ensure_ascii=False, sort_keys=True)
 
 
 def _write_json(path: Path, payload: Dict[str, Any]) -> None:
