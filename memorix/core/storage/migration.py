@@ -181,8 +181,16 @@ def migrate_metadata(store: Any) -> dict[str, Any] | None:
         logger.info("metadata 自动迁移完成: %s -> %s", state.version, SCHEMA_VERSION)
         return report
     except Exception as exc:
+        import traceback
+
+        logger.exception("metadata 自动迁移失败: %s -> %s", state.version, SCHEMA_VERSION)
+        tb_frames = traceback.extract_tb(exc.__traceback__) if exc.__traceback__ else []
+        last_frame = tb_frames[-1] if tb_frames else None
+        where = f" [v2-migrator {Path(last_frame.filename).name}:{last_frame.lineno}]" if last_frame else " [v2-migrator]"
         location = f"；备份: {backup_path}" if backup_path else ""
-        raise RuntimeError(f"metadata 自动迁移失败，事务已回滚{location}；原因: {exc}") from exc
+        raise RuntimeError(
+            f"metadata 自动迁移失败，事务已回滚{location}；原因{where}: {type(exc).__name__}: {exc}"
+        ) from exc
     finally:
         if foreign_keys_enabled:
             store._conn.execute("PRAGMA foreign_keys = ON")

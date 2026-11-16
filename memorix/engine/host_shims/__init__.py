@@ -157,7 +157,7 @@ def _refresh_memorix_aliases() -> None:
         return
 
     existing_core = sys.modules.get("src.A_memorix.core")
-    if existing_core is not None and existing_core is not memorix_core:
+    if existing_core is not memorix_core:
         for mod_key in [k for k in list(sys.modules) if k.startswith("src.A_memorix.")]:
             sys.modules.pop(mod_key, None)
 

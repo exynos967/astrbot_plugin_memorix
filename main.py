@@ -201,12 +201,16 @@ class MemorixPlugin(Star):
         # 4. 彻底平稳关闭所有活跃作用域的 MemoryEngineFacade (WAL 刷盘与写者锁释放)
         await self._close_component("scope engine manager", self.scope_manager.shutdown_all)
 
-        # 5. 释放宿主桥接全局引用，避免热重载后残留旧插件 Context 句柄
+        # 5. 释放宿主桥接全局引用与 src.A_memorix 别名缓存，避免热重载残留旧模块引用
         try:
+            import sys
+
             from .memorix.engine.host_shims import llm_shim
 
             if llm_shim.get_active_provider_bridge() is self.provider_bridge:
                 llm_shim.set_active_provider_bridge(None)
+            for mod_key in [k for k in list(sys.modules.keys()) if k == "src.A_memorix" or k.startswith("src.A_memorix.")]:
+                sys.modules.pop(mod_key, None)
         except Exception:
             pass
 
