@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional
 
+from ..amemorix.common.logging import get_logger
 from ..amemorix.context import activate_context_shims
 from ..amemorix.services import DeleteService, PersonProfileApiService
 from ..amemorix.services import MemoryService as BaseMemoryService
@@ -33,6 +34,8 @@ from .chat_migration_service import AstrBotChatMigrationService
 from .fact_admin_service import FactAdminService, resolve_canonical_person_id
 from .graph_mutation_service import GraphMutationService
 from .profile_service import ProfileService
+
+logger = get_logger("Memorix.AdminService")
 
 
 class _TuningPluginAdapter:
@@ -224,7 +227,13 @@ class _BundleAndImageKernelAdapter:
         import numpy as np
 
         arr = np.asarray(vec, dtype=np.float32).reshape(1, -1)
-        vector_store.add(arr, [token])
+        if arr.size == 0 or not np.all(np.isfinite(arr)) or float(np.linalg.norm(arr)) <= 1e-12:
+            return False
+        try:
+            vector_store.add(arr, [token])
+        except Exception as exc:
+            logger.warning("[memorix] skip invalid vector write for %s: %s", token, exc)
+            return False
         return True
 
     async def _ensure_paragraph_vector(self, paragraph: Dict[str, Any]) -> bool:
@@ -611,6 +620,10 @@ class AdminService:
                 ctx._runtime_auto_save = enabled
                 return {"success": True, "auto_save": enabled}
             if act == "rebuild_all_vectors":
+                import inspect
+
+                import numpy as np
+
                 raw_limit = kwargs.get("limit")
                 adapter = await self._bundle_kernel_adapter(scope_key, ctx, include_image_runtime=False)
                 configured_mode = str(ctx.get_config("retrieval.vector_pools.mode", "dual") or "dual").strip().lower()
@@ -622,9 +635,6 @@ class AdminService:
                 )
                 p_store = ctx.paragraph_vector_store if promote_dual else adapter._paragraph_store()
                 g_store = ctx.graph_vector_store if promote_dual else adapter._graph_vector_store()
-                for store in {p_store, g_store}:
-                    if store is not None and hasattr(store, "clear"):
-                        store.clear()
                 if raw_limit not in {None, ""}:
                     limit = self._int(raw_limit, 5000, 1, 1_000_000)
                     p_rows = ctx.metadata_store.query(
@@ -645,43 +655,141 @@ class AdminService:
                     if adapter.relation_vectors_enabled
                     else []
                 )
-                generated_paragraphs = 0
-                for row in p_rows:
-                    if await adapter._ensure_vector_for_text(
-                        item_hash=str(row.get("hash", "") or ""),
-                        text=str(row.get("content", "") or ""),
-                        vector_store=p_store,
-                    ):
-                        generated_paragraphs += 1
-                generated_entities = 0
-                for row in e_rows:
-                    raw_hash = str(row.get("hash", "") or "").strip()
-                    item_id = f"entity:{raw_hash}" if (promote_dual or adapter._dual_vector_pools_enabled()) else raw_hash
-                    if await adapter._ensure_vector_for_text(
-                        item_hash=item_id,
-                        text=str(row.get("name", "") or ""),
-                        vector_store=g_store,
-                    ):
-                        generated_entities += 1
-                generated_relations = 0
-                for row in r_rows:
-                    raw_hash = str(row.get("hash", "") or "").strip()
-                    item_id = f"relation:{raw_hash}" if (promote_dual or adapter._dual_vector_pools_enabled()) else raw_hash
-                    rel_text = " ".join(
-                        part
-                        for part in (
-                            str(row.get("subject", "") or "").strip(),
-                            str(row.get("predicate", "") or "").strip(),
-                            str(row.get("object", "") or "").strip(),
+
+                total_candidates = len(p_rows) + len(e_rows) + len(r_rows)
+                probed_dim = 0
+                emb_mgr = adapter.embedding_manager
+                if total_candidates > 0 and emb_mgr is not None:
+                    encode_fn = getattr(emb_mgr, "encode", None)
+                    if callable(encode_fn):
+                        sig_params = inspect.signature(encode_fn).parameters
+                        accepts_use_cache = "use_cache" in sig_params or any(
+                            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_params.values()
                         )
-                        if part
-                    )
-                    if await adapter._ensure_vector_for_text(
-                        item_hash=item_id,
-                        text=rel_text,
-                        vector_store=g_store,
+                        probe_vec = await (
+                            encode_fn("Memorix vector rebuild preflight", use_cache=False)
+                            if accepts_use_cache
+                            else encode_fn("Memorix vector rebuild preflight")
+                        )
+                        probe_arr = np.asarray(probe_vec, dtype=np.float32).reshape(-1) if probe_vec is not None else np.zeros((0,), dtype=np.float32)
+                        if probe_arr.size == 0 or not np.all(np.isfinite(probe_arr)) or float(np.linalg.norm(probe_arr)) <= 1e-12:
+                            last_err = str(getattr(emb_mgr, "last_error", "") or "").strip()
+                            detail = f"：{last_err}" if last_err else "（返回空向量或非有限值，请检查 Embedding 模型与网关配置）"
+                            raise RuntimeError(f"Embedding 服务调用失败，已中止向量重建以保护现有索引{detail}")
+                        probed_dim = int(probe_arr.shape[0])
+
+                for store in {p_store, g_store}:
+                    if store is not None and hasattr(store, "clear"):
+                        store.clear()
+
+                if raw_limit in {None, ""} and probed_dim > 0:
+                    if hasattr(emb_mgr, "set_embedding_dimension"):
+                        emb_mgr.set_embedding_dimension(probed_dim)
+                    for store in {p_store, g_store}:
+                        if store is not None and getattr(store, "dimension", probed_dim) != probed_dim:
+                            store.dimension = probed_dim
+                            if hasattr(store, "_init_index"):
+                                store._init_index()
+                    single_store = getattr(ctx, "vector_store", None)
+                    if (
+                        single_store is not None
+                        and single_store not in {p_store, g_store}
+                        and int(getattr(single_store, "num_vectors", 0) or 0) == 0
+                        and getattr(single_store, "dimension", probed_dim) != probed_dim
                     ):
-                        generated_relations += 1
+                        single_store.dimension = probed_dim
+                        if hasattr(single_store, "_init_index"):
+                            single_store._init_index()
+
+                async def _batch_build_vectors(items: list[tuple[str, str]], target_store: Any) -> int:
+                    if not items or target_store is None or emb_mgr is None:
+                        return 0
+                    encode_batch_fn = getattr(emb_mgr, "encode", None)
+                    if not callable(encode_batch_fn):
+                        done = 0
+                        for item_id, item_text in items:
+                            if await adapter._ensure_vector_for_text(
+                                item_hash=item_id, text=item_text, vector_store=target_store
+                            ):
+                                done += 1
+                        return done
+                    b_size = max(1, min(64, int(getattr(emb_mgr, "batch_size", 32) or 32)))
+                    done = 0
+                    seen_ids: set[str] = set()
+                    deduped = []
+                    for item_id, item_text in items:
+                        tok = str(item_id or "").strip()
+                        txt = str(item_text or "").strip()
+                        if not tok or not txt or tok in seen_ids or tok in target_store:
+                            continue
+                        seen_ids.add(tok)
+                        deduped.append((tok, txt))
+                    for start_idx in range(0, len(deduped), b_size):
+                        chunk = deduped[start_idx : start_idx + b_size]
+                        raw_vecs = await encode_batch_fn([txt for _, txt in chunk])
+                        arr = np.asarray(raw_vecs, dtype=np.float32)
+                        if arr.ndim == 1:
+                            arr = arr.reshape(1, -1)
+                        valid_vecs: list[np.ndarray] = []
+                        valid_ids: list[str] = []
+                        if arr.shape[0] == len(chunk):
+                            for (tok, _), row_vec in zip(chunk, arr):
+                                if row_vec.size > 0 and np.all(np.isfinite(row_vec)) and float(np.linalg.norm(row_vec)) > 1e-12:
+                                    valid_vecs.append(row_vec)
+                                    valid_ids.append(tok)
+                        if valid_vecs:
+                            try:
+                                target_store.add(np.vstack(valid_vecs).astype(np.float32), valid_ids)
+                                done += len(valid_ids)
+                                continue
+                            except Exception as batch_exc:
+                                logger.warning("[memorix] batch vector add fallback to single: %s", batch_exc)
+                        for tok, txt in chunk:
+                            if await adapter._ensure_vector_for_text(
+                                item_hash=tok, text=txt, vector_store=target_store
+                            ):
+                                done += 1
+                    return done
+
+                use_dual_ids = bool(promote_dual or adapter._dual_vector_pools_enabled())
+                p_items = [(str(row.get("hash", "") or ""), str(row.get("content", "") or "")) for row in p_rows]
+                e_items = [
+                    (
+                        f"entity:{str(row.get('hash', '') or '').strip()}"
+                        if use_dual_ids
+                        else str(row.get("hash", "") or "").strip(),
+                        str(row.get("name", "") or ""),
+                    )
+                    for row in e_rows
+                ]
+                r_items = [
+                    (
+                        f"relation:{str(row.get('hash', '') or '').strip()}"
+                        if use_dual_ids
+                        else str(row.get("hash", "") or "").strip(),
+                        " ".join(
+                            part
+                            for part in (
+                                str(row.get("subject", "") or "").strip(),
+                                str(row.get("predicate", "") or "").strip(),
+                                str(row.get("object", "") or "").strip(),
+                            )
+                            if part
+                        ),
+                    )
+                    for row in r_rows
+                ]
+
+                generated_paragraphs = await _batch_build_vectors(p_items, p_store)
+                generated_entities = await _batch_build_vectors(e_items, g_store)
+                generated_relations = await _batch_build_vectors(r_items, g_store)
+
+                total_processed = len(p_rows) + len(e_rows) + len(r_rows)
+                total_generated = generated_paragraphs + generated_entities + generated_relations
+                if total_processed > 0 and total_generated == 0:
+                    last_err = str(getattr(emb_mgr, "last_error", "") or "").strip()
+                    detail = f"：{last_err}" if last_err else ""
+                    raise RuntimeError(f"向量重建失败：共 {total_processed} 条记录均未能生成有效向量{detail}")
 
                 dual_activated = False
                 if promote_dual and p_store is not None and g_store is not None:
@@ -706,9 +814,18 @@ class AdminService:
                         "paragraph_vectors": int(getattr(p_store, "num_vectors", generated_paragraphs)),
                         "graph_vectors": int(getattr(g_store, "num_vectors", generated_entities + generated_relations)),
                         "stats": {
-                            "paragraphs": {"done": generated_paragraphs, "failed": 0},
-                            "entities": {"done": generated_entities, "failed": 0},
-                            "relations": {"done": generated_relations, "failed": 0},
+                            "paragraphs": {
+                                "done": generated_paragraphs,
+                                "failed": max(0, len(p_rows) - generated_paragraphs),
+                            },
+                            "entities": {
+                                "done": generated_entities,
+                                "failed": max(0, len(e_rows) - generated_entities),
+                            },
+                            "relations": {
+                                "done": generated_relations,
+                                "failed": max(0, len(r_rows) - generated_relations),
+                            },
                         },
                     }
                     if fp is not None:
@@ -731,8 +848,6 @@ class AdminService:
                     adapter._persist(force_vectors=True)
                     ctx._runtime_self_check_report = None
 
-                total_processed = len(p_rows) + len(e_rows) + len(r_rows)
-                total_generated = generated_paragraphs + generated_entities + generated_relations
                 return {
                     "success": True,
                     "processed": total_processed,

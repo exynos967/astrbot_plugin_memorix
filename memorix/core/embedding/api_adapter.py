@@ -10,8 +10,10 @@ v2.0.0 vector space fingerprinting (`get_embedding_fingerprint`, `get_embedding_
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
+import re
 import time
 from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -48,6 +50,17 @@ def _is_non_retryable_embedding_error(exc: BaseException) -> bool:
         return True
     status = _extract_http_status_code(exc)
     return status in {400, 404, 422}
+
+
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+_MAX_EMBEDDING_INPUT_CHARS = 8000
+
+
+def _sanitize_embedding_text(raw: Any) -> str:
+    text = _CONTROL_CHARS_RE.sub(" ", str(raw or "")).strip()
+    if len(text) > _MAX_EMBEDDING_INPUT_CHARS:
+        text = text[:_MAX_EMBEDDING_INPUT_CHARS]
+    return text or " "
 
 
 def _normalize_openai_base_url(raw: Optional[str]) -> str:
@@ -90,6 +103,10 @@ def _coerce_embedding_rows(payload: Any) -> List[List[float]]:
                 item = getattr(item, "embedding")
             elif isinstance(item, dict) and "embedding" in item:
                 item = item["embedding"]
+            if isinstance(item, str):
+                decoded_bytes = base64.b64decode(item)
+                if decoded_bytes and len(decoded_bytes) % 4 == 0:
+                    item = np.frombuffer(decoded_bytes, dtype="<f4").tolist()
             if not isinstance(item, list):
                 raise ValueError(f"invalid embedding item type: {type(item).__name__}")
             rows.append([float(value) for value in item])
@@ -230,7 +247,18 @@ class EmbeddingAPIAdapter:
         dimensions: Optional[int] = None,
     ) -> List[List[float]]:
         client = self._get_client()
-        payload: Dict[str, Any] = {"model": self.openai_model, "input": inputs}
+        sanitized_inputs: Union[str, List[str]]
+        if isinstance(inputs, list):
+            sanitized_inputs = [_sanitize_embedding_text(item) for item in inputs]
+        else:
+            sanitized_inputs = _sanitize_embedding_text(inputs)
+        # 显式指定 encoding_format="float"：避免安装 numpy 时 OpenAI SDK 默认注入 encoding_format="base64"，
+        # 导致 NewAPI / OneAPI / vLLM 等兼容网关在解析 []float64 时报 500 query_data_error。
+        payload: Dict[str, Any] = {
+            "model": self.openai_model,
+            "input": sanitized_inputs,
+            "encoding_format": "float",
+        }
         if dimensions is not None:
             payload["dimensions"] = int(dimensions)
 
@@ -241,16 +269,25 @@ class EmbeddingAPIAdapter:
                 rows = _coerce_embedding_rows(resp)
                 self.last_error = None
                 return rows
-            except AttributeError as exc:
-                try:
-                    rows = await self._request_embeddings_raw(payload)
-                    self.last_error = None
-                    return rows
-                except Exception as raw_exc:
-                    last_error = raw_exc
-                    logger.debug("OpenAI SDK embedding parse failed before raw fallback: %s", exc)
             except Exception as exc:
-                last_error = exc
+                if isinstance(exc, AttributeError) or "ValidationError" in type(exc).__name__:
+                    try:
+                        rows = await self._request_embeddings_raw(payload)
+                        self.last_error = None
+                        return rows
+                    except Exception as raw_exc:
+                        last_error = raw_exc
+                        logger.debug("OpenAI SDK embedding parse failed before raw fallback: %s", exc)
+                elif "encoding_format" in str(exc).lower():
+                    try:
+                        minimal_payload = {k: v for k, v in payload.items() if k != "encoding_format"}
+                        rows = await self._request_embeddings_raw(minimal_payload)
+                        self.last_error = None
+                        return rows
+                    except Exception as raw_exc:
+                        last_error = raw_exc
+                else:
+                    last_error = exc
 
             if last_error is not None and _is_non_retryable_embedding_error(last_error):
                 break

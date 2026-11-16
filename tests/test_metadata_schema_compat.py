@@ -1000,3 +1000,78 @@ def test_embedding_401_fails_fast_without_retries_and_surfaces_auth_message():
     assert fake_client.embeddings.calls == 1
     assert adapter._dimensions_support_detected is False
 
+
+def test_embedding_forces_float_encoding_and_rebuild_guards_nan(tmp_path):
+    """回归生产日志：强制 encoding_format='float' 防 NewAPI query_data_error，且重建遇到 NaN 不抛 non-finite。"""
+    import asyncio
+
+    import numpy as np
+    from astrbot_plugin_memorix.memorix.core.embedding.api_adapter import EmbeddingAPIAdapter
+    from astrbot_plugin_memorix.memorix.services.admin_service import AdminService
+    from astrbot_plugin_memorix.memorix.services.container import DomainServiceContainer
+
+    # 1. 验证请求体显式携带 encoding_format="float"（阻止 OpenAI SDK 默认注入 "base64"）并清理控制字符
+    captured_kwargs = []
+
+    class _FakeEmbeddings:
+        async def create(self, **kwargs):
+            captured_kwargs.append(kwargs)
+            return {"data": [{"embedding": [0.5, 0.5, 0.5, 0.5]}]}
+
+    class _FakeClient:
+        embeddings = _FakeEmbeddings()
+
+    adapter = EmbeddingAPIAdapter(
+        default_dimension=4,
+        base_url="http://embedding.test",
+        api_key="valid-key",
+        openai_model="Qwen3-Embedding-8B",
+    )
+    adapter.set_embedding_dimension(4)
+    adapter._dimensions_support_detected = True
+    adapter._supports_dimensions = False
+    adapter._client = _FakeClient()  # type: ignore[assignment]
+    vec = asyncio.run(adapter.encode("测试\x00控制字符清理"))
+    assert np.all(np.isfinite(vec))
+    assert captured_kwargs[0]["encoding_format"] == "float"
+    assert "\x00" not in str(captured_kwargs[0]["input"])
+
+    # 2. 验证 rebuild_all_vectors 预检失败时给出清晰网关错误且绝不抛 vectors contain non-finite values
+    container = DomainServiceContainer(
+        config={"embedding": {"enabled": False, "dimension": 8}},
+        context=None,
+        base_data_dir=tmp_path,
+        provider_bridge=None,
+    )
+    admin: AdminService = container.admin_service
+
+    async def _run_check() -> None:
+        try:
+            rt = await container.runtime_manager.get_runtime("aiocqhttp")
+            rt.context.metadata_store.add_paragraph("测试段落内容", source="chat:1")
+            failing_adapter = EmbeddingAPIAdapter(
+                default_dimension=8,
+                base_url="http://192.168.5.29:3000",
+                api_key="valid-key",
+                openai_model="Qwen3-Embedding-8B",
+                max_retries=1,
+            )
+            failing_adapter.set_embedding_dimension(8)
+            failing_adapter._dimensions_support_detected = True
+
+            async def _fail_req(*args, **kwargs):
+                failing_adapter.last_error = "Error code: 500 - query_data_error"
+                raise RuntimeError("Error code: 500 - query_data_error")
+
+            failing_adapter._request_embeddings = _fail_req  # type: ignore[assignment]
+            rt.context.embedding_manager = failing_adapter
+
+            with pytest.raises(RuntimeError, match="query_data_error") as exc_info:
+                await admin.runtime_admin(scope_key="aiocqhttp", action="rebuild_all_vectors")
+            assert "vectors contain non-finite values" not in str(exc_info.value)
+        finally:
+            await container.runtime_manager.close_all()
+
+    asyncio.run(_run_check())
+
+
