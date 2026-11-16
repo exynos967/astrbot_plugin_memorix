@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+from ..amemorix.context import activate_context_shims
 from ..amemorix.services.query_service import QueryService as BaseQueryService
 from ..app_context import ScopeRuntimeManager
 
@@ -26,16 +27,17 @@ class QueryService:
         enforce_chat_filter: bool = False,
     ) -> Dict[str, Any]:
         runtime = await self.runtime_manager.get_runtime(scope_key)
-        return await BaseQueryService(runtime.context).search(
-            query=query,
-            top_k=top_k,
-            stream_id=stream_id,
-            group_id=group_id,
-            user_id=user_id,
-            source=source,
-            strict_source=strict_source,
-            enforce_chat_filter=enforce_chat_filter,
-        )
+        with activate_context_shims(runtime.context):
+            return await BaseQueryService(runtime.context).search(
+                query=query,
+                top_k=top_k,
+                stream_id=stream_id,
+                group_id=group_id,
+                user_id=user_id,
+                source=source,
+                strict_source=strict_source,
+                enforce_chat_filter=enforce_chat_filter,
+            )
 
     async def time_search(
         self,
@@ -53,18 +55,19 @@ class QueryService:
         enforce_chat_filter: bool = False,
     ) -> Dict[str, Any]:
         runtime = await self.runtime_manager.get_runtime(scope_key)
-        return await BaseQueryService(runtime.context).time_search(
-            query=query,
-            time_from=time_from,
-            time_to=time_to,
-            person=person,
-            source=source,
-            top_k=top_k,
-            stream_id=stream_id,
-            group_id=group_id,
-            user_id=user_id,
-            enforce_chat_filter=enforce_chat_filter,
-        )
+        with activate_context_shims(runtime.context):
+            return await BaseQueryService(runtime.context).time_search(
+                query=query,
+                time_from=time_from,
+                time_to=time_to,
+                person=person,
+                source=source,
+                top_k=top_k,
+                stream_id=stream_id,
+                group_id=group_id,
+                user_id=user_id,
+                enforce_chat_filter=enforce_chat_filter,
+            )
 
     async def auto_search(
         self,
@@ -80,16 +83,17 @@ class QueryService:
         enforce_chat_filter: bool = False,
     ) -> Dict[str, Any]:
         runtime = await self.runtime_manager.get_runtime(scope_key)
-        return await BaseQueryService(runtime.context).auto_search(
-            query=query,
-            top_k=top_k,
-            stream_id=stream_id,
-            group_id=group_id,
-            user_id=user_id,
-            source=source,
-            strict_source=strict_source,
-            enforce_chat_filter=enforce_chat_filter,
-        )
+        with activate_context_shims(runtime.context):
+            return await BaseQueryService(runtime.context).auto_search(
+                query=query,
+                top_k=top_k,
+                stream_id=stream_id,
+                group_id=group_id,
+                user_id=user_id,
+                source=source,
+                strict_source=strict_source,
+                enforce_chat_filter=enforce_chat_filter,
+            )
 
     async def episode(
         self,
@@ -108,19 +112,20 @@ class QueryService:
         enforce_chat_filter: bool = False,
     ) -> Dict[str, Any]:
         runtime = await self.runtime_manager.get_runtime(scope_key)
-        return await BaseQueryService(runtime.context).episode(
-            query=query,
-            time_from=time_from,
-            time_to=time_to,
-            person=person,
-            source=source,
-            top_k=top_k,
-            include_paragraphs=include_paragraphs,
-            stream_id=stream_id,
-            group_id=group_id,
-            user_id=user_id,
-            enforce_chat_filter=enforce_chat_filter,
-        )
+        with activate_context_shims(runtime.context):
+            return await BaseQueryService(runtime.context).episode(
+                query=query,
+                time_from=time_from,
+                time_to=time_to,
+                person=person,
+                source=source,
+                top_k=top_k,
+                include_paragraphs=include_paragraphs,
+                stream_id=stream_id,
+                group_id=group_id,
+                user_id=user_id,
+                enforce_chat_filter=enforce_chat_filter,
+            )
 
     async def aggregate(
         self,
@@ -140,21 +145,23 @@ class QueryService:
         enforce_chat_filter: bool = False,
     ) -> Dict[str, Any]:
         runtime = await self.runtime_manager.get_runtime(scope_key)
-        return await BaseQueryService(runtime.context).aggregate(
-            query=query,
-            time_from=time_from,
-            time_to=time_to,
-            person=person,
-            source=source,
-            top_k=top_k,
-            mix=mix,
-            mix_top_k=mix_top_k,
-            stream_id=stream_id,
-            group_id=group_id,
-            user_id=user_id,
-            enforce_chat_filter=enforce_chat_filter,
-        )
+        with activate_context_shims(runtime.context):
+            return await BaseQueryService(runtime.context).aggregate(
+                query=query,
+                time_from=time_from,
+                time_to=time_to,
+                person=person,
+                source=source,
+                top_k=top_k,
+                mix=mix,
+                mix_top_k=mix_top_k,
+                stream_id=stream_id,
+                group_id=group_id,
+                user_id=user_id,
+                enforce_chat_filter=enforce_chat_filter,
+            )
 
     async def stats(self, *, scope_key: str) -> Dict[str, Any]:
         runtime = await self.runtime_manager.get_runtime(scope_key)
-        return await BaseQueryService(runtime.context).stats()
+        with activate_context_shims(runtime.context):
+            return await BaseQueryService(runtime.context).stats()

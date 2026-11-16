@@ -14,10 +14,8 @@ from typing import Any, Dict, List, Optional
 
 from ...core.strategies.chat_log import ChatLogStrategy
 from ...core.utils.import_payloads import normalize_paragraph_import_item
-
 from ..common.logging import get_logger
 from ..context import AppContext
-
 from .import_service import ImportService
 
 logger = get_logger("A_Memorix.ImportTaskManager")
@@ -282,14 +280,16 @@ class ImportTaskManager:
                 self._worker_task = asyncio.create_task(self._worker_loop(), name="import-task-worker")
 
     async def stop(self) -> None:
+        from ...core.utils.async_work import cancel_and_wait_for_tasks
+
         self._stopping = True
         async with self._lock:
             worker = self._worker_task
-            self._worker_task = None
         if worker:
-            worker.cancel()
-            await asyncio.gather(worker, return_exceptions=True)
+            await cancel_and_wait_for_tasks([worker], operation="ImportTaskManager.stop")
         async with self._lock:
+            if self._worker_task is worker:
+                self._worker_task = None
             for task in self._tasks.values():
                 if task.status not in TASK_TERMINAL:
                     self._mark_task_cancelled(task, "插件已停止，请重新提交任务")
@@ -658,6 +658,8 @@ class ImportTaskManager:
         return task.to_summary()
 
     async def _worker_loop(self) -> None:
+        from ..context import activate_context_shims
+
         while not self._stopping:
             task_id = ""
             async with self._lock:
@@ -673,7 +675,8 @@ class ImportTaskManager:
                 continue
 
             try:
-                await self._process_task(task_id)
+                with activate_context_shims(self.ctx):
+                    await self._process_task(task_id)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -740,10 +743,7 @@ class ImportTaskManager:
             task.updated_at = _now()
 
         try:
-            await asyncio.gather(
-                asyncio.to_thread(self.ctx.vector_store.save),
-                asyncio.to_thread(self.ctx.graph_store.save),
-            )
+            await self.ctx.save_all()
         except Exception as exc:
             logger.warning("save after task failed task=%s err=%s", task_id, exc)
 

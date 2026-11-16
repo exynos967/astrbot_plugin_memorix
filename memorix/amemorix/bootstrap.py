@@ -126,6 +126,7 @@ def build_context(settings: AppSettings) -> AppContext:
         openai_model=str(endpoint_cfg.get("model", "")),
         timeout_seconds=_safe_float(endpoint_cfg.get("timeout_seconds", 30), 30.0),
         max_retries=_safe_int(endpoint_cfg.get("max_retries", 3), 3),
+        enable_cache=bool(settings.get("embedding.enable_cache", False)),
     )
 
     metadata_path = vectors_dir / "vectors_metadata.pkl"
@@ -217,6 +218,26 @@ def build_context(settings: AppSettings) -> AppContext:
             logger.info("Loaded vector store with %s vectors", vector_store.num_vectors)
         except Exception as exc:
             logger.warning("Vector load failed: %s", exc)
+
+    if paragraph_vector_store.has_data():
+        try:
+            paragraph_vector_store.load()
+            logger.info(
+                "Loaded paragraph vector store with %s vectors",
+                paragraph_vector_store.num_vectors,
+            )
+        except Exception as exc:
+            logger.warning("Paragraph vector load failed: %s", exc)
+
+    if graph_vector_store.has_data():
+        try:
+            graph_vector_store.load()
+            logger.info(
+                "Loaded graph vector store with %s vectors",
+                graph_vector_store.num_vectors,
+            )
+        except Exception as exc:
+            logger.warning("Graph vector load failed: %s", exc)
 
     if graph_store.has_data():
         try:

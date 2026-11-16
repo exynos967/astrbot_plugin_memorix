@@ -19,10 +19,10 @@ import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
-from ..common.logging import get_logger
-from ..common.message_api import MessageAPI
 from ...core.utils.hash import compute_hash
 from ...core.utils.model_routing import generate_text
+from ..common.logging import get_logger
+from ..common.message_api import MessageAPI
 from .person_profile_service import PersonProfileApiService
 
 logger = get_logger("A_Memorix.FeedbackService")
@@ -507,12 +507,29 @@ class FeedbackService:
             "4. 不确定时输出 decision=none, confidence<=0.5。"
         )
         try:
-            result = await generate_text(
-                ctx,
-                prompt,
-                request_type="A_Memorix.FeedbackClassify",
+            from ...core.utils.model_routing import (
+                generate_text_with_model,
+                resolve_fast_text_generation_model,
             )
-            payload = self._safe_json_loads(result.text) if result.success else {}
+            from ...engine.host_shims import llm_shim
+            from ..context import activate_context_shims
+
+            with activate_context_shims(ctx):
+                try:
+                    fast_model = resolve_fast_text_generation_model(llm_shim)
+                    llm_res = await generate_text_with_model(
+                        fast_model,
+                        prompt,
+                        request_type="A_Memorix.FeedbackClassify",
+                    )
+                    payload = self._safe_json_loads(llm_res.text) if llm_res.success else {}
+                except Exception:
+                    result = await generate_text(
+                        ctx,
+                        prompt,
+                        request_type="A_Memorix.FeedbackClassify",
+                    )
+                    payload = self._safe_json_loads(result.text) if result.success else {}
         except Exception as exc:
             logger.warning(f"反馈分类器调用失败: {exc}")
             payload = {}
@@ -1081,6 +1098,14 @@ class FeedbackService:
         }
 
     async def _process_feedback_task(self, ctx: Any, scope_key: str, task: Dict[str, Any]) -> None:
+        from ...core.utils.chat_migration_gate import get_chat_migration_gate
+
+        structured = task.get("query_snapshot") if isinstance(task.get("query_snapshot"), dict) else {}
+        gate_session_id = str(task.get("session_id", "") or structured.get("chat_id", "") or "").strip()
+        async with get_chat_migration_gate().activity(gate_session_id):
+            await self._process_unpaused_feedback_task(ctx, scope_key, task)
+
+    async def _process_unpaused_feedback_task(self, ctx: Any, scope_key: str, task: Dict[str, Any]) -> None:
         metadata_store = ctx.metadata_store
         task_id = int(task.get("id") or 0)
         query_tool_id = str(task.get("query_tool_id", "") or "").strip()
@@ -1263,6 +1288,7 @@ class FeedbackService:
         return await episode_service.process_rebuild_batch(
             limit=max(1, int(limit or 1)),
             max_retry=max(1, int(ctx.get_config("episode.pending_max_retry", 3) or 3)),
+            max_wait_seconds=0.0,
         )
 
     # ------------------------------------------------------------------ #
@@ -1613,6 +1639,8 @@ class FeedbackService:
             logger.warning(f"save_all 落盘失败: {exc}")
 
     async def _feedback_correction_loop(self) -> None:
+        from ..context import activate_context_shims
+
         try:
             while not self._stopping:
                 sleep_seconds = float(self._min_check_interval_seconds())
@@ -1635,12 +1663,13 @@ class FeedbackService:
                     if not tasks:
                         continue
                     processed_any = True
-                    for task in tasks:
-                        if self._stopping:
-                            break
-                        if not isinstance(task, dict):
-                            continue
-                        await self._process_feedback_task(ctx, scope_key, task)
+                    with activate_context_shims(ctx):
+                        for task in tasks:
+                            if self._stopping:
+                                break
+                            if not isinstance(task, dict):
+                                continue
+                            await self._process_feedback_task(ctx, scope_key, task)
                 await asyncio.sleep(2.0 if processed_any else sleep_seconds)
         except asyncio.CancelledError:
             raise
@@ -1648,6 +1677,8 @@ class FeedbackService:
             logger.warning(f"feedback_correction loop 异常: {exc}")
 
     async def _feedback_correction_reconcile_loop(self) -> None:
+        from ..context import activate_context_shims
+
         try:
             while not self._stopping:
                 await asyncio.sleep(self._min_reconcile_interval_seconds())
@@ -1665,10 +1696,11 @@ class FeedbackService:
                     if not self._fb_cfg_enabled(ctx) or ctx.metadata_store is None:
                         continue
                     batch_size = self._fb_cfg_reconcile_batch_size(ctx)
-                    if self._fb_cfg_profile_refresh_enabled(ctx):
-                        await self._process_feedback_profile_refresh_batch(ctx, limit=batch_size)
-                    if self._fb_cfg_episode_rebuild_enabled(ctx):
-                        await self._process_feedback_episode_rebuild_batch(ctx, limit=batch_size)
+                    with activate_context_shims(ctx):
+                        if self._fb_cfg_profile_refresh_enabled(ctx):
+                            await self._process_feedback_profile_refresh_batch(ctx, limit=batch_size)
+                        if self._fb_cfg_episode_rebuild_enabled(ctx):
+                            await self._process_feedback_episode_rebuild_batch(ctx, limit=batch_size)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1692,17 +1724,20 @@ class FeedbackService:
             ]
 
     async def stop_background_loops(self) -> None:
+        from ...core.utils.async_work import cancel_and_wait_for_tasks
+
         async with self._lock:
             self._stopping = True
             loops = list(self._loops)
-            self._loops = []
-        for task in loops:
-            task.cancel()
         if loops:
-            await asyncio.gather(*loops, return_exceptions=True)
+            await cancel_and_wait_for_tasks(loops, operation="FeedbackService.stop_background_loops")
+        async with self._lock:
+            self._loops = [t for t in self._loops if not t.done()]
 
     async def trigger_reconcile(self, scope_key: Optional[str] = None) -> Dict[str, Any]:
         """手动触发一次 reconcile（admin 调用），不依赖后台 loop 周期。"""
+        from ..context import activate_context_shims
+
         results: Dict[str, Any] = {}
         scopes = [scope_key] if scope_key else list(self.runtime_manager.get_known_scopes())
         for key in scopes:
@@ -1716,7 +1751,8 @@ class FeedbackService:
                 results[key] = {"skipped": "disabled"}
                 continue
             batch_size = self._fb_cfg_reconcile_batch_size(ctx)
-            profile = await self._process_feedback_profile_refresh_batch(ctx, limit=batch_size) if self._fb_cfg_profile_refresh_enabled(ctx) else {"processed": 0}
-            episode = await self._process_feedback_episode_rebuild_batch(ctx, limit=batch_size) if self._fb_cfg_episode_rebuild_enabled(ctx) else {"processed": 0}
+            with activate_context_shims(ctx):
+                profile = await self._process_feedback_profile_refresh_batch(ctx, limit=batch_size) if self._fb_cfg_profile_refresh_enabled(ctx) else {"processed": 0}
+                episode = await self._process_feedback_episode_rebuild_batch(ctx, limit=batch_size) if self._fb_cfg_episode_rebuild_enabled(ctx) else {"processed": 0}
             results[key] = {"profile_refresh": profile, "episode_rebuild": episode}
         return results

@@ -8,9 +8,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ...core.storage import KnowledgeType, detect_knowledge_type
-from ...core.utils.time_parser import normalize_time_meta
+from ...core.utils.hash import compute_hash, normalize_text
 from ...core.utils.import_payloads import _normalize_person_ids, normalize_paragraph_import_item
-
+from ...core.utils.time_parser import normalize_time_meta
 from ..common.logging import get_logger
 from ..context import AppContext
 
@@ -85,8 +85,12 @@ class ImportService:
             result = await self.import_paragraph(content=para, source=source)
             imported += 1
             hashes.append(str(result["hash"]))
-        self.ctx.vector_store.save()
-        self.ctx.graph_store.save()
+        save_all = getattr(self.ctx, "save_all", None)
+        if callable(save_all):
+            await save_all()
+        else:
+            self.ctx.vector_store.save()
+            self.ctx.graph_store.save()
         return {"mode": "text", "paragraphs": imported, "hashes": hashes}
 
     async def import_paragraph(
@@ -108,17 +112,17 @@ class ImportService:
             resolved_kt = detect_knowledge_type(text).value
 
         normalized_people = _normalize_person_ids(person_ids)
+        pre_existing = self.ctx.metadata_store.get_paragraph(compute_hash(normalize_text(text))) if normalized_people else None
+        old_people = (pre_existing.get("metadata") or {}).get("person_ids", []) if isinstance(pre_existing, dict) else []
+        merged_people = list(dict.fromkeys([*_normalize_person_ids(old_people), *normalized_people]))
         hash_value = self.ctx.metadata_store.add_paragraph(
             content=text,
             source=source,
             knowledge_type=resolved_kt if resolved_kt else KnowledgeType.MIXED.value,
             time_meta=normalize_time_meta(time_meta or {}),
-            metadata={"person_ids": normalized_people},
+            metadata={"person_ids": merged_people} if merged_people else {},
         )
-        if normalized_people:
-            existing = self.ctx.metadata_store.get_paragraph(hash_value)
-            old_people = (existing.get("metadata") or {}).get("person_ids", [])
-            merged_people = list(dict.fromkeys([*_normalize_person_ids(old_people), *normalized_people]))
+        if merged_people:
             self.ctx.metadata_store.update_paragraph_metadata(hash_value, {"person_ids": merged_people})
         for person_id in normalized_people:
             self.ctx.metadata_store.enqueue_person_profile_refresh(person_id=person_id, reason="import_person_evidence")
@@ -219,8 +223,12 @@ class ImportService:
             )
             relation_count += 1
 
-        self.ctx.vector_store.save()
-        self.ctx.graph_store.save()
+        save_all = getattr(self.ctx, "save_all", None)
+        if callable(save_all):
+            await save_all()
+        else:
+            self.ctx.vector_store.save()
+            self.ctx.graph_store.save()
         return {
             "mode": "json",
             "paragraphs": paragraph_count,

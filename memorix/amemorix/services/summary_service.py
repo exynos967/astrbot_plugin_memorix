@@ -6,10 +6,9 @@ import inspect
 import json
 from typing import Any, Dict, List
 
-from ..common.logging import get_logger
-
 from ...core.utils.summary_importer import SummaryImporter
 from ...providers.astrbot_provider_bridge import AstrBotLLMClient
+from ..common.logging import get_logger
 from ..context import AppContext
 
 logger = get_logger("A_Memorix.SummaryService")
@@ -44,7 +43,10 @@ class SummaryService:
     def _build_summary_llm_client(self) -> Any:
         provider_bridge = getattr(self.ctx, "provider_bridge", None)
         if provider_bridge is not None and getattr(provider_bridge, "enabled", False):
-            retries = int(self.ctx.get_config("embedding.retry.max_attempts", 3) or 3)
+            configured_attempts = self.ctx.get_config("web.import.llm_retry.max_attempts", None)
+            if configured_attempts is None:
+                configured_attempts = self.ctx.get_config("embedding.retry.max_attempts", 4)
+            retries = int(configured_attempts or 4)
             logger.info(
                 "summary service uses AstrBot native chat provider: provider_id=%s",
                 str(getattr(provider_bridge, "chat_provider_id", "") or "<session-default>"),

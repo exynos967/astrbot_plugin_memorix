@@ -8,17 +8,60 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
-from astrbot.core.agent.message import TextPart
 
 from .adapters.astrbot_event_adapter import AstrbotEventAdapter, MemorixEvent
+from .core.image.component_paths import build_chat_external_ref
+from .engine.host_shims.embedding_shim import is_image_memory_enabled
 from .tools import _format_search_result_for_llm
+from .utils.message_formatting import capture_event_images_to_safe_dir
 from .utils.profile_injection import build_profile_injection_text
 
 if TYPE_CHECKING:
     from astrbot.api.provider import ProviderRequest
 
+
+class DuckTextPart:
+    """Lightweight duck-typing fallback for AstrBot TextPart."""
+
+    __slots__ = ("type", "text", "_no_save")
+
+    def __init__(self, text: str) -> None:
+        self.type = "text"
+        self.text = str(text or "")
+        self._no_save = False
+
+    def mark_as_temp(self) -> "DuckTextPart":
+        self._no_save = True
+        return self
+
+    def model_dump(self) -> dict[str, Any]:
+        data: dict[str, Any] = {"type": "text", "text": self.text}
+        if self._no_save:
+            data["_no_save"] = True
+        return data
+
+
+def make_temporary_text_part(text: str) -> Any:
+    """Create a temporary text part with fallback to DuckTextPart."""
+    try:
+        from astrbot.core.agent.message import TextPart as CoreTextPart
+
+        part = CoreTextPart(text=text)
+        mark_as_temp = getattr(part, "mark_as_temp", None)
+        if callable(mark_as_temp):
+            return mark_as_temp()
+        setattr(part, "_no_save", True)
+        return part
+    except Exception:
+        return DuckTextPart(text=text).mark_as_temp()
+
+
+TextPart = DuckTextPart
+
 MEMORY_INJECTION_MARKER = "【Memorix 自动记忆参考】"
+IMAGE_MEMORY_REFERENCE_MARKER = "【图片记忆-内部参考】"
 PROFILE_INJECTION_MAX_CHARS = 900
+IMAGE_MEMORY_INJECTION_MAX_CHARS = 900
 MEMORY_INJECTION_MAX_CHARS = 2200
 
 
@@ -270,10 +313,7 @@ class MemoryInjectionController:
         if not isinstance(parts, list):
             parts = []
             request.extra_user_content_parts = parts
-        part = TextPart(text=injection_block)
-        mark_as_temp = getattr(part, "mark_as_temp", None)
-        if callable(mark_as_temp):
-            part = mark_as_temp()
+        part = make_temporary_text_part(text=injection_block)
         parts.append(part)
 
     async def _build_profile_injection_block(self, event: AstrMessageEvent, adapted: MemorixEvent) -> str:
@@ -379,6 +419,163 @@ class MemoryInjectionController:
         formatted = _format_search_result_for_llm(payload, limit=top_k)
         return f"【长期记忆-自动检索】\n{self._truncate_reference_text(formatted, MEMORY_INJECTION_MAX_CHARS)}"
 
+    async def _build_image_memory_injection_block(
+        self,
+        event: AstrMessageEvent,
+        adapted: MemorixEvent,
+        query_text: str,
+    ) -> str:
+        if self.plugin._is_cron_event(event):
+            return ""
+        if not is_image_memory_enabled(config=self.plugin.config):
+            return ""
+        if not self.plugin._bool_cfg(self.plugin.config, "image_memory.auto_inject_enabled", True):
+            return ""
+        clean_query = " ".join(str(query_text or "").split())
+        if clean_query and self.plugin._is_command_message(clean_query):
+            return ""
+
+        admin_service = getattr(self.plugin, "admin_service", None)
+        if admin_service is None:
+            return ""
+
+        self_id = str(
+            getattr(event, "get_self_id", lambda: "")()
+            or getattr(getattr(event, "message_obj", None), "self_id", "")
+            or ""
+        ).strip()
+        if adapted.sender_id and self_id and adapted.sender_id == self_id:
+            return ""
+
+        img_cfg = (
+            self.plugin.config.get("image_memory", {})
+            if isinstance(self.plugin.config.get("image_memory"), dict)
+            else {}
+        )
+        max_bytes = max(1024, int(img_cfg.get("max_bytes", 10 * 1024 * 1024) or (10 * 1024 * 1024)))
+        message_ingestion = getattr(self.plugin, "message_ingestion", None)
+        capture_once = getattr(message_ingestion, "capture_event_once", None)
+        if callable(capture_once):
+            capture = await capture_once(event, need_safe_files=False)
+            if capture.plain_user_text and self.plugin._is_command_message(capture.plain_user_text):
+                return ""
+            captured_images = capture.captured_images
+        else:
+            captured_images = await capture_event_images_to_safe_dir(
+                event,
+                copy_to_cache=False,
+                max_bytes=max_bytes,
+            )
+        if not captured_images:
+            return ""
+
+        chat_id = str(adapted.session_id or adapted.scope_key or "default").strip() or "default"
+        base_msg_id = str(adapted.message_id or "").strip()
+        candidate_limit = self.plugin._int_cfg(
+            self.plugin.config,
+            "image_memory.candidate_limit",
+            4,
+            min_value=1,
+            max_value=10,
+        )
+        try:
+            similarity_threshold = float(img_cfg.get("similarity_threshold", 0.72))
+        except (TypeError, ValueError):
+            similarity_threshold = 0.72
+        similarity_threshold = max(0.0, min(1.0, similarity_threshold))
+
+        from .core.utils.hash import compute_hash
+
+        seen_assets: set[str] = set()
+        lines: list[str] = []
+        for img in captured_images[:3]:
+            if not img.image_bytes and not img.content_hash:
+                continue
+            current_external_ref = ""
+            if base_msg_id:
+                current_external_ref = build_chat_external_ref(
+                    chat_id=chat_id,
+                    message_id=base_msg_id,
+                    component_path=img.component_path,
+                )
+            elif adapted.timestamp:
+                fallback_msg_id = compute_hash(
+                    f"{chat_id}:{adapted.sender_id}:{float(adapted.timestamp)}:{img.component_path}"
+                )
+                current_external_ref = build_chat_external_ref(
+                    chat_id=chat_id,
+                    message_id=fallback_msg_id,
+                    component_path=img.component_path,
+                )
+            result = await admin_service.image_admin(
+                scope_key=adapted.scope_key,
+                action="search",
+                image_bytes=img.image_bytes,
+                content_hash=img.content_hash,
+                current_external_ref=current_external_ref,
+                chat_id=chat_id,
+                session_id=adapted.session_id,
+                candidate_limit=candidate_limit,
+                similarity_threshold=similarity_threshold,
+            )
+            hits = result.get("hits") if isinstance(result, dict) else None
+            if not isinstance(hits, list) or not hits:
+                continue
+            for hit in hits:
+                if not isinstance(hit, dict):
+                    continue
+                asset_id = str(hit.get("asset_id") or "").strip()
+                if not asset_id or asset_id in seen_assets:
+                    continue
+                match_kind = str(hit.get("match_kind") or hit.get("match_type") or "").strip()
+                label = (
+                    "同一图片"
+                    if match_kind == "exact_hash"
+                    else f"相似图片(相似度={float(hit.get('similarity') or 0.0):.2f})"
+                )
+                obs_texts: list[str] = []
+                for obs in (hit.get("observations") or []):
+                    if not isinstance(obs, dict):
+                        continue
+                    txt = " ".join(str(obs.get("text") or "").split())
+                    if txt and txt not in obs_texts:
+                        obs_texts.append(self._truncate_reference_text(txt, 140))
+                    if len(obs_texts) >= 2:
+                        break
+                mem_texts: list[str] = []
+                for mem in (hit.get("related_memories") or []):
+                    if not isinstance(mem, dict):
+                        continue
+                    txt = " ".join(
+                        str(mem.get("content") or mem.get("summary") or mem.get("text") or "").split()
+                    )
+                    if txt and txt not in mem_texts:
+                        mem_texts.append(self._truncate_reference_text(txt, 140))
+                    if len(mem_texts) >= 2:
+                        break
+                detail_parts: list[str] = []
+                if obs_texts:
+                    detail_parts.append("观察：" + "；".join(obs_texts))
+                if mem_texts:
+                    detail_parts.append("关联记忆：" + "；".join(mem_texts))
+                if not detail_parts:
+                    continue
+                seen_assets.add(asset_id)
+                lines.append(f"- [{label}] " + " | ".join(detail_parts))
+                if len(lines) >= 4:
+                    break
+            if len(lines) >= 4:
+                break
+
+        if not lines:
+            return ""
+        body = self._truncate_reference_text("\n".join(lines), IMAGE_MEMORY_INJECTION_MAX_CHARS)
+        return (
+            f"{IMAGE_MEMORY_REFERENCE_MARKER}\n"
+            "以下为当前消息图片的长期记忆召回结果，仅供内部理解参考，不要逐字复述：\n"
+            f"{body}"
+        )
+
     async def _build_llm_memory_injection_block(self, event: AstrMessageEvent, request) -> str:
         if self.plugin._is_cron_event(event):
             return ""
@@ -392,8 +589,9 @@ class MemoryInjectionController:
 
         query_text = self._memory_injection_query_text(event, request)
         sections: list[str] = []
-        profile_result, memory_result = await asyncio.gather(
+        profile_result, image_result, memory_result = await asyncio.gather(
             self._build_profile_injection_block(event, adapted),
+            self._build_image_memory_injection_block(event, adapted, query_text),
             self._build_memory_search_injection_block(adapted, query_text),
             return_exceptions=True,
         )
@@ -401,6 +599,10 @@ class MemoryInjectionController:
             logger.debug("[memorix] profile injection skipped: %s", profile_result)
         elif profile_result:
             sections.append(cast(str, profile_result))
+        if isinstance(image_result, Exception):
+            logger.debug("[memorix] image memory injection skipped: %s", image_result)
+        elif image_result:
+            sections.append(cast(str, image_result))
         if isinstance(memory_result, Exception):
             logger.debug("[memorix] memory search injection skipped: %s", memory_result)
         elif memory_result:

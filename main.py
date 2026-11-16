@@ -2,34 +2,26 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Coroutine
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
-from .memorix.amemorix.services.feedback_service import FeedbackService
-from .memorix.amemorix.services.fuzzy_modify_service import FuzzyModifyService
-from .memorix.app_context import ScopeRuntimeManager
+from .memorix.engine import MemoryEngineFacade, ScopeEngineManager
 from .memorix.memory_injection import MEMORY_INJECTION_MARKER, MemoryInjectionController
 from .memorix.message_ingestion import MessageIngestionController
+from .memorix.providers import AstrBotProviderBridge
 from .memorix.scope_router import ScopeRouter
-from .memorix.services import (
-    AdminService,
-    IngestService,
-    MemoryService,
-    PersonFactWritebackService,
-    ProfileService,
-    QueryService,
-    SummaryService,
-)
+from .memorix.services.container import DomainServiceContainer
 from .memorix.tools import build_memorix_tools
 from .memorix.webui.plugin_page_bridge import PluginPageWebUIBridge
 
 if TYPE_CHECKING:
     from astrbot.api.provider import LLMResponse, ProviderRequest
 
-PLUGIN_VERSION = "1.3.0"
+PLUGIN_VERSION = "2.0.0"
 
 
 @register(
@@ -42,30 +34,64 @@ class MemorixPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
         self.config = dict(config or {})
-        self.scope_router = ScopeRouter(mode=str(self.config.get("scope", {}).get("mode", "group_global")))
-        self.runtime_manager = ScopeRuntimeManager(
-            plugin_name="astrbot_plugin_memorix",
-            plugin_config=self.config,
-            astrbot_context=context,
-        )
 
-        self.ingest_service = IngestService(self.runtime_manager, self.config)
-        self.query_service = QueryService(self.runtime_manager)
-        self.memory_service = MemoryService(self.runtime_manager)
-        self.profile_service = ProfileService(self.runtime_manager)
-        self.summary_service = SummaryService(self.runtime_manager)
-        self.person_fact_writeback_service = PersonFactWritebackService(self.runtime_manager, self.config)
-        self.feedback_service = FeedbackService(
-            self.runtime_manager,
-            self.config,
-            ingest_service=self.ingest_service,
+        # 1. 作用域路由 (Feature #15: 严格以 event.unified_msg_origin 及其映射作为真理之源)
+        self.scope_router = ScopeRouter(mode=str(self.config.get("scope", {}).get("mode", "group_global")))
+
+        # 2. 宿主提供商桥接 (Feature #2, #10)
+        provider_cfg = self.config.get("provider", {})
+        chat_provider_id = (
+            str(provider_cfg.get("chat_provider_id", "") or "")
+            if isinstance(provider_cfg, dict)
+            else ""
         )
-        self.fuzzy_modify_service = FuzzyModifyService(self.runtime_manager, self.config)
-        self.admin_service = AdminService(
-            self.runtime_manager,
-            feedback_service=self.feedback_service,
-            fuzzy_modify_service=self.fuzzy_modify_service,
+        fast_chat_provider_id = (
+            str(provider_cfg.get("fast_chat_provider_id", "") or "")
+            if isinstance(provider_cfg, dict)
+            else ""
         )
+        self.provider_bridge = AstrBotProviderBridge(
+            astrbot_context=context,
+            chat_provider_id=chat_provider_id,
+            fast_chat_provider_id=fast_chat_provider_id,
+        )
+        from .memorix.engine.host_shims import install_host_shims
+
+        install_host_shims(config=self.config, provider_bridge=self.provider_bridge)
+
+        # 3. 领域服务容器与统一作用域引擎管理器 (共享唯一 ScopeRuntimeManager，彻底消除双实例脑裂与 .npz 覆盖竞争)
+        self._explicit_base_data_dir: Path | None = None
+        self._services = DomainServiceContainer(
+            config=self.config,
+            context=context,
+            base_data_dir=None,
+            provider_bridge=self.provider_bridge,
+        )
+        self.scope_manager = ScopeEngineManager(
+            base_data_dir=None,
+            config=self.config,
+            provider_bridge=self.provider_bridge,
+            runtime_manager=self._services.runtime_manager,
+            ingest_service=self._services.ingest_service,
+            query_service=self._services.query_service,
+            admin_service=self._services.admin_service,
+        )
+        self._services.engine_manager = self.scope_manager
+        self.engine_manager = self.scope_manager  # 别名兼容
+
+        # 挂载服务引用至实例属性，保持完全可测试性与向后兼容 (支持 monkeypatch)
+        self.runtime_manager = self._services.runtime_manager
+        self.ingest_service = self._services.ingest_service
+        self.query_service = self._services.query_service
+        self.memory_service = self._services.memory_service
+        self.profile_service = self._services.profile_service
+        self.summary_service = self._services.summary_service
+        self.person_fact_writeback_service = self._services.person_fact_writeback_service
+        self.feedback_service = self._services.feedback_service
+        self.fuzzy_modify_service = self._services.fuzzy_modify_service
+        self.admin_service = self._services.admin_service
+
+        # 4. 宿主适配协同器 (Feature #10, #13)
         self.webui_page_bridge = PluginPageWebUIBridge(
             runtime_manager=self.runtime_manager,
             scope_resolver=self._resolve_dashboard_webui_scope,
@@ -73,17 +99,61 @@ class MemorixPlugin(Star):
         )
         self.memory_injection = MemoryInjectionController(self)
         self.message_ingestion = MessageIngestionController(self)
-        self._llm_tools = []
+
+        self._llm_tools: list[Any] = []
         self._background_tasks: set[asyncio.Task[Any]] = set()
+
+    @property
+    def base_data_dir(self) -> Path:
+        return self._resolve_base_data_dir()
+
+    @base_data_dir.setter
+    def base_data_dir(self, value: Path | str | None) -> None:
+        resolved = Path(value).resolve() if value is not None and str(value).strip() else None
+        self._explicit_base_data_dir = resolved
+        if hasattr(self, "runtime_manager") and self.runtime_manager is not None:
+            self.runtime_manager.base_data_dir = resolved
+
+    def _resolve_base_data_dir(self) -> Path:
+        """安全解析插件持久化存储根目录，与 ScopeRuntimeManager 严格同源且绝不依赖私有 astrbot.core.* 模块。"""
+        if hasattr(self, "runtime_manager") and self.runtime_manager is not None:
+            resolver = getattr(self.runtime_manager, "_resolve_plugin_data_dir", None)
+            if callable(resolver):
+                return Path(resolver("astrbot_plugin_memorix")).resolve()
+        from .memorix.app_context import resolve_plugin_data_dir
+
+        return resolve_plugin_data_dir(
+            plugin_config=self.config,
+            astrbot_context=self.context,
+            plugin_name="astrbot_plugin_memorix",
+            base_data_dir=self._explicit_base_data_dir,
+        )
+
+    async def get_scope_engine(self, scope_or_event: str | AstrMessageEvent) -> MemoryEngineFacade:
+        """根据 scope_key 或 AstrMessageEvent 动态检索当前会话作用域的 MemoryEngineFacade。"""
+        if isinstance(scope_or_event, str):
+            scope_key = scope_or_event
+        else:
+            scope_key = self._resolve_scope(scope_or_event)
+        return await self.scope_manager.get_engine(scope_key)
 
     async def initialize(self) -> None:
         logger.info("[memorix] initialize start")
         try:
+            # 1. 注册 WebUI Bridge
             self.webui_page_bridge.register(self.context, plugin_name="astrbot_plugin_memorix")
+
+            # 2. 挂载 FunctionTools
             self._llm_tools = build_memorix_tools(self)
             self.context.add_llm_tools(*self._llm_tools)
-            await self.person_fact_writeback_service.start()
-            await self.feedback_service.start_background_loops()
+
+            # 3. 启动领域服务后台循环 (写回与反馈审计)
+            p_start = getattr(self.person_fact_writeback_service, "start", None)
+            if callable(p_start):
+                await p_start()
+            f_start = getattr(self.feedback_service, "start_background_loops", None)
+            if callable(f_start):
+                await f_start()
         except BaseException:
             await self.terminate()
             raise
@@ -91,20 +161,55 @@ class MemorixPlugin(Star):
 
     async def terminate(self) -> None:
         logger.info("[memorix] terminate start")
+        # 1. 移除已注册的 LLM 工具
         self._remove_llm_tools()
+
+        # 2. 优雅取消并等待活跃宿主后台协程 (有界超时保障)
         pending = [task for task in self._background_tasks if not task.done()]
         if pending:
             try:
                 await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=5.0)
             except asyncio.TimeoutError:
-                for task in pending:
-                    task.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
-        await self._close_component("person fact writeback", self.person_fact_writeback_service.close)
-        await self._close_component("webui", self.webui_page_bridge.close)
-        await self._close_component("feedback service", self.feedback_service.stop_background_loops)
-        await self._close_component("admin service", self.admin_service.close)
-        await self._close_component("runtime manager", self.runtime_manager.close_all)
+                from .memorix.core.utils.async_work import cancel_and_wait_for_tasks
+
+                try:
+                    await cancel_and_wait_for_tasks(pending, operation="MemorixPlugin.terminate")
+                except Exception:
+                    logger.warning("[memorix] background tasks did not finish within stop timeout", exc_info=True)
+
+        # 3. 按序优雅关闭组件 (兼容存量测试的 monkeypatch: person -> webui -> feedback -> admin -> runtime)
+        p_close = getattr(self.person_fact_writeback_service, "close", None)
+        if callable(p_close):
+            await self._close_component("person fact writeback", p_close)
+
+        w_close = getattr(self.webui_page_bridge, "close", None)
+        if callable(w_close):
+            await self._close_component("webui", w_close)
+
+        f_stop = getattr(self.feedback_service, "stop_background_loops", None)
+        if callable(f_stop):
+            await self._close_component("feedback service", f_stop)
+
+        a_close = getattr(self.admin_service, "close", None)
+        if callable(a_close):
+            await self._close_component("admin service", a_close)
+
+        r_close = getattr(self.runtime_manager, "close_all", None)
+        if callable(r_close):
+            await self._close_component("runtime manager", r_close)
+
+        # 4. 彻底平稳关闭所有活跃作用域的 MemoryEngineFacade (WAL 刷盘与写者锁释放)
+        await self._close_component("scope engine manager", self.scope_manager.shutdown_all)
+
+        # 5. 释放宿主桥接全局引用，避免热重载后残留旧插件 Context 句柄
+        try:
+            from .memorix.engine.host_shims import llm_shim
+
+            if llm_shim.get_active_provider_bridge() is self.provider_bridge:
+                llm_shim.set_active_provider_bridge(None)
+        except Exception:
+            pass
+
         logger.info("[memorix] terminate done")
 
     @staticmethod
@@ -136,6 +241,7 @@ class MemorixPlugin(Star):
                 logger.warning("[memorix] remove LLM tool failed: %s", tool.name, exc_info=True)
 
     def _resolve_scope(self, event: AstrMessageEvent) -> str:
+        """严格基于事件统一消息源 (unified_msg_origin) 及平台路由隔离作用域，防御混淆代理。"""
         return self.scope_router.resolve(event)
 
     @staticmethod
@@ -149,6 +255,9 @@ class MemorixPlugin(Star):
         return task
 
     def _resolve_dashboard_webui_scope(self) -> str:
+        active_scopes = self.scope_manager.list_active_scopes()
+        if active_scopes:
+            return str(active_scopes[-1])
         known_scopes = self.runtime_manager.list_scope_keys()
         return str(known_scopes[-1]) if known_scopes else "default"
 
@@ -199,6 +308,11 @@ class MemorixPlugin(Star):
     async def _is_adapted_chat_enabled(self, adapted, user_id: str = "") -> bool:
         try:
             runtime = await self.runtime_manager.get_runtime(adapted.scope_key)
+        except Exception:
+            logger.error("[memorix] runtime initialization failed during chat filter check: scope=%s", adapted.scope_key, exc_info=True)
+            return False
+
+        try:
             checker = getattr(runtime.context, "is_chat_enabled", None)
             if not callable(checker):
                 return False
@@ -212,6 +326,7 @@ class MemorixPlugin(Star):
         except Exception:
             logger.warning("[memorix] chat filter check failed: scope=%s", adapted.scope_key, exc_info=True)
             return False
+
 
     async def feedback_service_enabled(self, scope_key: str) -> bool:
         try:
@@ -257,6 +372,7 @@ class MemorixPlugin(Star):
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, request: "ProviderRequest") -> None:
+        """KV-Cache 友好记忆注入：仅向 extra_user_content_parts 追加带 mark_as_temp 的临时块，系统提示词完全静态。"""
         await self.memory_injection.inject(event, request)
 
     @filter.event_message_type(filter.EventMessageType.ALL)
