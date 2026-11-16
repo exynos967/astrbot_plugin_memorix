@@ -108,11 +108,13 @@ function onScopeChange(e: Event): void {
 
 <style scoped>
 .topbar {
+  min-width: 0;
+  max-width: 100%;
   display: flex;
   align-items: center;
   justify-content: space-between;
   flex-wrap: wrap;
-  gap: 12px 16px;
+  gap: 10px 14px;
   padding: 12px 24px;
   border-bottom: 1px solid var(--border-color);
   background: var(--shell);
@@ -123,7 +125,7 @@ function onScopeChange(e: Event): void {
   display: flex;
   align-items: center;
   gap: 12px;
-  flex: 1 1 240px;
+  flex: 1 1 180px;
 }
 
 .mobile-menu-btn {
@@ -279,6 +281,21 @@ function onScopeChange(e: Event): void {
   box-shadow: var(--shadow-xs);
 }
 
+@media (max-width: 1160px) {
+  .topbar {
+    padding: 12px 18px;
+  }
+
+  .scope-caption {
+    display: none;
+  }
+
+  .scope-select {
+    min-width: 132px;
+    max-width: 200px;
+  }
+}
+
 @media (max-width: 860px) {
   .topbar {
     padding: 12px 16px;
@@ -288,13 +305,9 @@ function onScopeChange(e: Event): void {
     display: grid;
   }
 
-  .scope-caption {
-    display: none;
-  }
-
   .scope-select {
-    min-width: 140px;
-    max-width: 200px;
+    min-width: 132px;
+    max-width: 196px;
     min-height: 38px;
     height: 38px;
   }

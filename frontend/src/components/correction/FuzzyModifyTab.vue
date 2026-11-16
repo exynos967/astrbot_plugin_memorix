@@ -357,7 +357,7 @@ function formatTime(ts?: number | string): string {
         </div>
       </div>
 
-      <div v-if="store.fuzzyPlans.length" class="table-list">
+      <div v-if="store.fuzzyPlans.length" class="table-list plan-list-container">
         <div
           v-for="plan in store.fuzzyPlans"
           :key="plan.plan_id"
@@ -545,8 +545,12 @@ function formatTime(ts?: number | string): string {
   padding: 4px 10px;
 }
 
+.plan-list-container {
+  container-type: inline-size;
+}
+
 .plan-row {
-  grid-template-columns: minmax(200px, 1.6fr) minmax(136px, 0.8fr) auto auto;
+  grid-template-columns: minmax(180px, 1.6fr) auto auto auto;
 }
 
 .plan-row.is-selected {
@@ -576,15 +580,37 @@ function formatTime(ts?: number | string): string {
   justify-content: flex-end;
 }
 
-@media (max-width: 980px) {
-  .fuzzy-workbench {
-    grid-template-columns: 1fr;
+@container (max-width: 680px) {
+  .plan-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px 12px;
   }
+
+  .plan-row > .row-main {
+    grid-column: 1 / -1;
+  }
+
+  .plan-row-actions {
+    grid-column: 2;
+    justify-self: end;
+  }
+}
+
+@container (max-width: 440px) {
   .plan-row {
     grid-template-columns: 1fr;
   }
+
   .plan-row-actions {
+    grid-column: 1;
+    justify-self: start;
     justify-content: flex-start;
+  }
+}
+
+@media (max-width: 980px) {
+  .fuzzy-workbench {
+    grid-template-columns: 1fr;
   }
 }
 </style>
