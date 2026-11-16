@@ -184,8 +184,8 @@ const rows = computed<ServiceRow[]>(() => {
       <h2>服务分区状态</h2>
       <span class="section-label">各子系统实时状态与快捷入口</span>
     </div>
-    <div class="table-list">
-      <div v-for="row in rows" :key="row.view" class="row-item">
+    <div class="table-list service-list-container">
+      <div v-for="row in rows" :key="row.view" class="row-item service-row">
         <div class="row-main">
           <span class="icon-badge" :class="row.toneClass" aria-hidden="true">
             <NavIcons :name="row.iconName" :size="16" />
@@ -195,22 +195,22 @@ const rows = computed<ServiceRow[]>(() => {
             <span>{{ row.code }}</span>
           </div>
         </div>
-        <div class="service-metric">
+        <div class="service-metric service-scope">
           <strong>{{ row.scope }}</strong>
           <span class="cell-note">功能范围</span>
         </div>
-        <div class="service-metric">
+        <div class="service-metric service-stat">
           <strong>{{ row.metric }}</strong>
           <span class="cell-note">{{ row.note }}</span>
         </div>
-        <div>
+        <div class="service-status">
           <span class="status-pill" :class="statusTone(row.status)">
             {{ statusLabel(row.status) }}
           </span>
-          <span class="cell-note">运行状态</span>
+          <span class="cell-note service-status-caption">运行状态</span>
         </div>
         <button
-          class="btn icon"
+          class="btn icon service-go-btn"
           type="button"
           :title="`前往${row.title}`"
           :aria-label="`前往${row.title}`"
@@ -224,7 +224,77 @@ const rows = computed<ServiceRow[]>(() => {
 </template>
 
 <style scoped>
+.service-list-container {
+  container-type: inline-size;
+}
+
 .row-main-copy {
   min-width: 0;
+}
+
+.service-row {
+  grid-template-columns: minmax(180px, 1.3fr) minmax(160px, 1.05fr) minmax(150px, 1.05fr) auto 36px;
+}
+
+.service-row .service-metric strong {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.service-status {
+  justify-self: end;
+  text-align: right;
+}
+
+.service-go-btn {
+  justify-self: end;
+}
+
+@container (max-width: 820px) {
+  .service-scope {
+    display: none;
+  }
+
+  .service-row {
+    grid-template-columns: minmax(160px, 1.3fr) minmax(140px, 1.1fr) auto 36px;
+    gap: 10px 14px;
+  }
+}
+
+@container (max-width: 540px) {
+  .service-row {
+    grid-template-columns: minmax(0, 1fr) 36px;
+    gap: 6px 12px;
+    padding: 12px 2px;
+  }
+
+  .service-row .row-main {
+    grid-column: 1;
+  }
+
+  .service-stat {
+    grid-column: 1;
+    padding-left: 42px;
+  }
+
+  .service-status {
+    grid-column: 1;
+    justify-self: start;
+    text-align: left;
+    padding-left: 42px;
+  }
+
+  .service-status-caption {
+    display: none;
+  }
+
+  .service-go-btn {
+    grid-column: 2;
+    grid-row: 1 / span 3;
+    align-self: center;
+    justify-self: end;
+  }
 }
 </style>

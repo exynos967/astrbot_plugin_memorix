@@ -1218,7 +1218,19 @@ class MemorixServer:
             if not isinstance(plugin_config, dict):
                 raise HTTPException(status_code=500, detail="runtime config is not available")
 
-            updates = dict(data.updates or {})
+            def _is_masked_secret_entry(dotted_key: str, val: Any) -> bool:
+                if not isinstance(val, str) or not val:
+                    return False
+                lowered = dotted_key.lower()
+                if not any(m in lowered for m in ("api_key", "secret", "token", "password", "passwd")):
+                    return False
+                return "***" in val or (len(val) <= 4 and set(val) == {"*"})
+
+            updates = {
+                str(k): v
+                for k, v in dict(data.updates or {}).items()
+                if not _is_masked_secret_entry(str(k), v)
+            }
             explicit_img_enabled: Optional[bool] = None
             if "image_memory.enabled" in updates:
                 explicit_img_enabled = bool(updates["image_memory.enabled"])

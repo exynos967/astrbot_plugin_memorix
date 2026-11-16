@@ -91,6 +91,12 @@ onMounted(() => {
   }
 }
 
+@media (max-width: 1160px) {
+  .view-stack {
+    padding: 18px 18px 26px;
+  }
+}
+
 @media (max-width: 860px) {
   .view-stack {
     padding: 16px 16px 24px;

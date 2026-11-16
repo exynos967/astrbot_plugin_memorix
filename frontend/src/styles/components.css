@@ -128,8 +128,10 @@
   flex: 0 0 auto;
   border: 1px solid var(--border-color);
   border-radius: var(--radius-md);
-  display: grid;
-  place-items: center;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
   color: var(--accent);
   background: var(--accent-soft);
   font-size: 13px;
@@ -301,7 +303,7 @@
   font-weight: 600;
 }
 
-.row-main span,
+.row-main span:not(.icon-badge):not(.bubble):not(.node-mark):not(.plan-icon),
 .cell-note {
   display: block;
   margin-top: 2px;
@@ -551,6 +553,7 @@
 .btn.icon {
   width: var(--control-h);
   min-width: var(--control-h);
+  height: var(--control-h);
   padding: 0;
   font-size: 15px;
 }
@@ -1174,14 +1177,10 @@
   align-items: center;
 }
 
-/* 响应式断点（1080px / 768px / 480px 全宽度零水平溢出） */
+/* 响应式断点（1120px / 768px / 480px 全宽度零水平溢出） */
 @media (max-width: 1120px) {
   .grid-3 {
     grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .row-item {
-    grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr) auto;
   }
 
   .memory-kpis {
@@ -1202,12 +1201,6 @@
   .settings-groups,
   .settings-fields {
     grid-template-columns: 1fr;
-  }
-
-  .row-item {
-    grid-template-columns: 1fr;
-    gap: 8px;
-    padding: 12px 0;
   }
 
   .memory-recycle-row {
