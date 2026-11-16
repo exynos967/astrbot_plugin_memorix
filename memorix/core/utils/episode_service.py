@@ -2,32 +2,37 @@
 Episode 聚合与落库服务。
 
 流程：
-1. 从 pending 队列读取段落并组批
-2. 按 source + 时间窗口切组
-3. 调用 LLM 语义切分
-4. 写入 episodes + episode_paragraphs
-5. LLM 失败时使用确定性 fallback
+1. 读取 source 的完整活跃段落快照
+2. 按真实时间区间连通分量分组
+3. 复用输入指纹未变的旧 Episode，其余调用 LLM 切分
+4. 返回完整物化计划，由 source revision CAS 原子发布
+5. LLM 失败时让错误进入来源任务重试，不生成替代情景
 """
 
 from __future__ import annotations
 
+from collections import Counter
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
 import asyncio
 import json
 import re
-from collections import Counter
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
 
-from ...amemorix.common.logging import get_logger
+from src.common.logger import get_logger
+from src.config.config import global_config
 
+from . import profile_policy
 from .episode_segmentation_service import EpisodeSegmentationService
 from .hash import compute_hash
+from .runtime_payloads import argument_tokens
 
 logger = get_logger("A_Memorix.EpisodeService")
 
 
 class EpisodeService:
     """Episode MVP 后台处理服务。"""
+
+    MATERIALIZATION_VERSION = "episode_source_revision_v2"
 
     def __init__(
         self,
@@ -82,61 +87,160 @@ class EpisodeService:
         return num
 
     @staticmethod
-    def _paragraph_anchor(paragraph: Dict[str, Any]) -> float:
-        for key in ("event_time_end", "event_time_start", "event_time", "created_at"):
-            value = paragraph.get(key)
-            try:
-                if value is not None:
-                    return float(value)
-            except Exception:
-                continue
-        return 0.0
+    def _paragraph_interval(paragraph: Dict[str, Any]) -> Tuple[float, float]:
+        created_at = EpisodeService._to_optional_float(paragraph.get("created_at"))
+        event_time = EpisodeService._to_optional_float(paragraph.get("event_time"))
+        event_start = EpisodeService._to_optional_float(paragraph.get("event_time_start"))
+        event_end = EpisodeService._to_optional_float(paragraph.get("event_time_end"))
+        start = event_start
+        if start is None:
+            start = event_time if event_time is not None else event_end
+        if start is None:
+            start = created_at if created_at is not None else 0.0
+        end = event_end
+        if end is None:
+            end = event_time if event_time is not None else event_start
+        if end is None:
+            end = created_at if created_at is not None else start
+        if end < start:
+            start, end = end, start
+        return float(start), float(end)
 
     @staticmethod
-    def _paragraph_sort_key(paragraph: Dict[str, Any]) -> Tuple[float, str]:
-        return (
-            EpisodeService._paragraph_anchor(paragraph),
-            str(paragraph.get("hash", "") or ""),
+    def _paragraph_anchor(paragraph: Dict[str, Any]) -> float:
+        return EpisodeService._paragraph_interval(paragraph)[0]
+
+    @staticmethod
+    def _paragraph_sort_key(paragraph: Dict[str, Any]) -> Tuple[float, float, str]:
+        start, end = EpisodeService._paragraph_interval(paragraph)
+        return (start, end, str(paragraph.get("hash", "") or ""))
+
+    def generation_signature(self) -> Dict[str, Any]:
+        memory_cfg = global_config.a_memorix.integration
+        disabled_source_types = sorted(
+            {
+                str(item or "").strip().lower()
+                for item in argument_tokens(
+                    self._cfg("episode.disabled_source_types", ["person_fact", "knowledge_pack"])
+                )
+                if str(item or "").strip()
+            }
+            | {"knowledge_pack"}
         )
+        return {
+            "materialization_version": self.MATERIALIZATION_VERSION,
+            "segmentation": dict(self.segmentation_service.generation_signature()),
+            "grouping": {
+                "max_paragraphs_per_call": max(1, int(self._cfg("episode.max_paragraphs_per_call", 20))),
+                "max_chars_per_call": max(200, int(self._cfg("episode.max_chars_per_call", 6000))),
+                "source_time_window_seconds": max(
+                    60.0,
+                    float(self._cfg("episode.source_time_window_hours", 24)) * 3600.0,
+                ),
+            },
+            "source_policy": {
+                "enabled": bool(self._cfg("episode.enabled", True)),
+                "generation_enabled": bool(self._cfg("episode.generation_enabled", True)),
+                "disabled_source_types": disabled_source_types,
+                "feedback_hard_filter_enabled": bool(
+                    getattr(memory_cfg, "feedback_correction_paragraph_hard_filter_enabled", True)
+                ),
+            },
+        }
 
-    def load_pending_paragraphs(
-        self,
-        pending_rows: List[Dict[str, Any]],
-    ) -> Tuple[List[Dict[str, Any]], List[str]]:
-        """
-        将 pending 行展开为段落上下文。
+    def generation_hash(self, signature: Optional[Dict[str, Any]] = None) -> str:
+        payload = signature if isinstance(signature, dict) else self.generation_signature()
+        return compute_hash(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
-        Returns:
-            (loaded_paragraphs, missing_hashes)
-        """
-        loaded: List[Dict[str, Any]] = []
-        missing: List[str] = []
-        for row in pending_rows or []:
-            p_hash = str(row.get("paragraph_hash", "") or "").strip()
-            if not p_hash:
-                continue
-
-            paragraph = self.metadata_store.get_paragraph(p_hash)
-            if not paragraph:
-                missing.append(p_hash)
-                continue
-
-            loaded.append(
+    def _enrich_paragraph_participants(self, paragraphs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        hashes = [
+            str(paragraph.get("hash", "") or "").strip()
+            for paragraph in paragraphs
+            if str(paragraph.get("hash", "") or "").strip()
+        ]
+        entity_map = self.metadata_store.get_paragraph_entities_by_hashes(hashes)
+        enriched: List[Dict[str, Any]] = []
+        for paragraph in paragraphs:
+            item = dict(paragraph)
+            paragraph_hash = str(item.get("hash", "") or "").strip()
+            item["_participant_names"] = sorted(
                 {
-                    "hash": p_hash,
-                    "source": str(row.get("source") or paragraph.get("source") or "").strip(),
+                    str(entity.get("name", "") or "").strip()
+                    for entity in entity_map.get(paragraph_hash, [])
+                    if str(entity.get("name", "") or "").strip()
+                }
+            )
+            enriched.append(item)
+        return enriched
+
+    def _group_input_fingerprint(self, group: Dict[str, Any]) -> str:
+        """计算分组输入版本，只有会影响分段或派生字段的内容进入指纹。"""
+        paragraphs = sorted(list(group.get("paragraphs") or []), key=self._paragraph_sort_key)
+        paragraph_payloads: List[Dict[str, Any]] = []
+        for paragraph in paragraphs:
+            paragraph_hash = str(paragraph.get("hash", "") or "").strip()
+            participant_names = list(paragraph.get("_participant_names") or [])
+            paragraph_payloads.append(
+                {
+                    "hash": paragraph_hash,
                     "content": str(paragraph.get("content", "") or ""),
-                    "created_at": self._to_optional_float(paragraph.get("created_at"))
-                    or self._to_optional_float(row.get("created_at"))
-                    or 0.0,
+                    "created_at": self._to_optional_float(paragraph.get("created_at")),
                     "event_time": self._to_optional_float(paragraph.get("event_time")),
                     "event_time_start": self._to_optional_float(paragraph.get("event_time_start")),
                     "event_time_end": self._to_optional_float(paragraph.get("event_time_end")),
-                    "time_granularity": str(paragraph.get("time_granularity", "") or "").strip() or None,
+                    "time_granularity": str(paragraph.get("time_granularity", "") or "").strip(),
                     "time_confidence": self._clamp_score(paragraph.get("time_confidence"), default=1.0),
+                    "participants": participant_names,
                 }
             )
-        return loaded, missing
+        segmentation_generation = group.get("_segmentation_generation")
+        if not isinstance(segmentation_generation, dict):
+            segmentation_generation = self.segmentation_service.generation_signature()
+        fingerprint_payload = {
+            "source": str(group.get("source", "") or "").strip(),
+            "segmentation_generation": segmentation_generation,
+            "grouping": {
+                "max_paragraphs_per_call": max(1, int(self._cfg("episode.max_paragraphs_per_call", 20))),
+                "max_chars_per_call": max(200, int(self._cfg("episode.max_chars_per_call", 6000))),
+                "source_time_window_hours": max(
+                    60.0,
+                    float(self._cfg("episode.source_time_window_hours", 24)) * 3600.0,
+                ),
+            },
+            "paragraphs": paragraph_payloads,
+        }
+        return compute_hash(json.dumps(fingerprint_payload, ensure_ascii=False, sort_keys=True))
+
+    @staticmethod
+    def _reusable_group_payloads(
+        group: Dict[str, Any],
+        input_fingerprint: str,
+        cached_by_fingerprint: Dict[str, List[Dict[str, Any]]],
+    ) -> List[Dict[str, Any]]:
+        cached = cached_by_fingerprint.get(input_fingerprint, [])
+        if not cached:
+            return []
+        group_hashes = [
+            str(item.get("hash", "") or "").strip()
+            for item in (group.get("paragraphs") or [])
+            if str(item.get("hash", "") or "").strip()
+        ]
+        cached_hashes = [
+            str(paragraph_hash).strip()
+            for episode in cached
+            for paragraph_hash in (episode.get("evidence_ids") or [])
+            if str(paragraph_hash).strip()
+        ]
+        if not set(cached_hashes).issubset(set(group_hashes)):
+            return []
+        if any(
+            not str(episode.get("title", "") or "").strip()
+            or not str(episode.get("summary", "") or "").strip()
+            or str(episode.get("segmentation_model", "") or "").strip() == "fallback_rule"
+            for episode in cached
+        ):
+            return []
+        return [dict(episode) for episode in cached]
 
     def group_paragraphs(self, paragraphs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
@@ -160,54 +264,50 @@ class EpisodeService:
         groups: List[Dict[str, Any]] = []
         for source, items in by_source.items():
             ordered = sorted(items, key=self._paragraph_sort_key)
-
-            current: List[Dict[str, Any]] = []
-            current_chars = 0
-            last_anchor: Optional[float] = None
-
-            def flush() -> None:
-                nonlocal current, current_chars, last_anchor
-                if not current:
-                    return
-                sorted_current = sorted(current, key=self._paragraph_sort_key)
-                groups.append(
-                    {
-                        "source": source,
-                        "paragraphs": sorted_current,
-                    }
-                )
-                current = []
-                current_chars = 0
-                last_anchor = None
+            temporal_components: List[List[Dict[str, Any]]] = []
+            component: List[Dict[str, Any]] = []
+            frontier_end: Optional[float] = None
 
             for paragraph in ordered:
-                anchor = self._paragraph_anchor(paragraph)
-                content_len = len(str(paragraph.get("content", "") or ""))
+                interval_start, interval_end = self._paragraph_interval(paragraph)
+                if component and frontier_end is not None and interval_start > frontier_end + window_seconds:
+                    temporal_components.append(component)
+                    component = []
+                    frontier_end = None
+                component.append(paragraph)
+                frontier_end = interval_end if frontier_end is None else max(frontier_end, interval_end)
+            if component:
+                temporal_components.append(component)
 
-                need_flush = False
+            # 时间连通性不受模型调用上限影响；上限只在已确定的连通分量内切块。
+            for temporal_component in temporal_components:
+                current: List[Dict[str, Any]] = []
+                current_chars = 0
+                for paragraph in temporal_component:
+                    content_len = len(str(paragraph.get("content", "") or ""))
+                    if current and (
+                        len(current) >= max_paragraphs or current_chars + content_len > max_chars
+                    ):
+                        groups.append({"source": source, "paragraphs": current})
+                        current = []
+                        current_chars = 0
+                    current.append(paragraph)
+                    current_chars += content_len
                 if current:
-                    if len(current) >= max_paragraphs:
-                        need_flush = True
-                    elif current_chars + content_len > max_chars:
-                        need_flush = True
-                    elif last_anchor is not None and abs(anchor - last_anchor) > window_seconds:
-                        need_flush = True
-
-                if need_flush:
-                    flush()
-
-                current.append(paragraph)
-                current_chars += content_len
-                last_anchor = anchor
-
-            flush()
+                    groups.append({"source": source, "paragraphs": current})
 
         groups.sort(
-            key=lambda g: self._paragraph_anchor(g["paragraphs"][0]) if g.get("paragraphs") else 0.0
+            key=lambda group: (
+                self._paragraph_anchor(group["paragraphs"][0]) if group.get("paragraphs") else 0.0,
+                str(group.get("source", "") or ""),
+                str(group["paragraphs"][0].get("hash", "") or "") if group.get("paragraphs") else "",
+            )
         )
         return groups
 
-    def _compute_time_meta(self, paragraphs: List[Dict[str, Any]]) -> Tuple[Optional[float], Optional[float], Optional[str], float]:
+    def _compute_time_meta(
+        self, paragraphs: List[Dict[str, Any]]
+    ) -> Tuple[Optional[float], Optional[float], Optional[str], float]:
         starts: List[float] = []
         ends: List[float] = []
         granularity_priority = {
@@ -230,6 +330,9 @@ class EpisodeService:
             start_candidate = s if s is not None else (t if t is not None else (e if e is not None else c))
             end_candidate = e if e is not None else (t if t is not None else (s if s is not None else c))
 
+            if start_candidate is not None and end_candidate is not None and end_candidate < start_candidate:
+                start_candidate, end_candidate = end_candidate, start_candidate
+
             if start_candidate is not None:
                 starts.append(start_candidate)
             if end_candidate is not None:
@@ -247,16 +350,13 @@ class EpisodeService:
         time_conf = sum(conf_values) / len(conf_values) if conf_values else 1.0
         return time_start, time_end, granularity, self._clamp_score(time_conf, default=1.0)
 
-    def _collect_participants(self, paragraph_hashes: List[str], limit: int = 16) -> List[str]:
+    @staticmethod
+    def _collect_participants(paragraphs: List[Dict[str, Any]], limit: int = 16) -> List[str]:
         seen = set()
         participants: List[str] = []
-        for p_hash in paragraph_hashes:
-            try:
-                entities = self.metadata_store.get_paragraph_entities(p_hash)
-            except Exception:
-                entities = []
-            for item in entities:
-                name = str(item.get("name", "") or "").strip()
+        for paragraph in paragraphs:
+            for raw_name in paragraph.get("_participant_names") or []:
+                name = str(raw_name or "").strip()
                 if not name:
                     continue
                 key = name.lower()
@@ -304,42 +404,6 @@ class EpisodeService:
 
         return [token for token, _ in token_counter.most_common(limit)]
 
-    def _build_fallback_episode(self, group: Dict[str, Any]) -> Dict[str, Any]:
-        paragraphs = group.get("paragraphs", []) or []
-        source = str(group.get("source", "") or "").strip()
-        hashes = [str(p.get("hash", "") or "").strip() for p in paragraphs if str(p.get("hash", "") or "").strip()]
-        snippets = []
-        for p in paragraphs[:3]:
-            text = str(p.get("content", "") or "").strip().replace("\n", " ")
-            if text:
-                snippets.append(text[:140])
-        summary = "；".join(snippets)[:500] if snippets else "自动回退生成的情景记忆。"
-
-        time_start, time_end, granularity, time_conf = self._compute_time_meta(paragraphs)
-        participants = self._collect_participants(hashes, limit=12)
-        keywords = self._derive_keywords(paragraphs, limit=10)
-
-        if time_start is not None:
-            day_text = datetime.fromtimestamp(time_start).strftime("%Y-%m-%d")
-            title = f"{source or 'unknown'} {day_text} 情景片段"
-        else:
-            title = f"{source or 'unknown'} 情景片段"
-
-        return {
-            "title": title[:80],
-            "summary": summary,
-            "paragraph_hashes": hashes,
-            "participants": participants,
-            "keywords": keywords,
-            "time_confidence": time_conf,
-            "llm_confidence": 0.0,
-            "event_time_start": time_start,
-            "event_time_end": time_end,
-            "time_granularity": granularity,
-            "segmentation_model": "fallback_rule",
-            "segmentation_version": EpisodeSegmentationService.SEGMENTATION_VERSION,
-        }
-
     @staticmethod
     def _normalize_episode_hashes(episode_hashes: List[str], group_hashes_ordered: List[str]) -> List[str]:
         in_group = set(group_hashes_ordered)
@@ -364,34 +428,26 @@ class EpisodeService:
             }
 
         source = str(group.get("source", "") or "").strip()
-        group_hashes = [str(p.get("hash", "") or "").strip() for p in paragraphs if str(p.get("hash", "") or "").strip()]
+        input_fingerprint = str(group.get("_input_fingerprint", "") or "").strip()
+        if not input_fingerprint:
+            input_fingerprint = self._group_input_fingerprint(group)
+        group_hashes = [
+            str(p.get("hash", "") or "").strip() for p in paragraphs if str(p.get("hash", "") or "").strip()
+        ]
         group_start, group_end, _, _ = self._compute_time_meta(paragraphs)
 
-        fallback_used = False
-        segmentation_model = "fallback_rule"
-        segmentation_version = EpisodeSegmentationService.SEGMENTATION_VERSION
-
-        try:
-            llm_result = await self.segmentation_service.segment(
-                source=source,
-                window_start=group_start,
-                window_end=group_end,
-                paragraphs=paragraphs,
-            )
-            episodes = list(llm_result.get("episodes") or [])
-            segmentation_model = str(llm_result.get("segmentation_model", "") or "").strip() or "auto"
-            segmentation_version = str(llm_result.get("segmentation_version", "") or "").strip() or EpisodeSegmentationService.SEGMENTATION_VERSION
-            if not episodes:
-                raise ValueError("llm_empty_episodes")
-        except Exception as e:
-            logger.warning(
-                "Episode segmentation fallback: "
-                f"source={source} "
-                f"size={len(group_hashes)} "
-                f"err={e}"
-            )
-            episodes = [self._build_fallback_episode(group)]
-            fallback_used = True
+        llm_result = await self.segmentation_service.segment(
+            source=source,
+            window_start=group_start,
+            window_end=group_end,
+            paragraphs=paragraphs,
+        )
+        episodes = list(llm_result["episodes"])
+        segmentation_model = str(llm_result.get("segmentation_model", "") or "").strip() or "auto"
+        segmentation_version = (
+            str(llm_result.get("segmentation_version", "") or "").strip()
+            or EpisodeSegmentationService.SEGMENTATION_VERSION
+        )
 
         stored_payloads: List[Dict[str, Any]] = []
         for episode in episodes:
@@ -408,7 +464,7 @@ class EpisodeService:
             participants = [str(x).strip() for x in (episode.get("participants", []) or []) if str(x).strip()]
             keywords = [str(x).strip() for x in (episode.get("keywords", []) or []) if str(x).strip()]
             if not participants:
-                participants = self._collect_participants(ordered_hashes, limit=16)
+                participants = self._collect_participants(sub_paragraphs, limit=16)
             if not keywords:
                 keywords = self._derive_keywords(sub_paragraphs, limit=12)
 
@@ -422,6 +478,8 @@ class EpisodeService:
                     "source": source,
                     "hashes": ordered_hashes,
                     "version": segmentation_version,
+                    "title": title,
+                    "summary": summary,
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -446,176 +504,323 @@ class EpisodeService:
                 "paragraph_count": len(ordered_hashes),
                 "llm_confidence": self._clamp_score(
                     episode.get("llm_confidence"),
-                    default=0.0 if fallback_used else 0.6,
+                    default=0.6,
                 ),
                 "segmentation_model": (
                     str(episode.get("segmentation_model", "") or "").strip()
-                    or ("fallback_rule" if fallback_used else segmentation_model)
+                    or segmentation_model
                 ),
                 "segmentation_version": (
-                    str(episode.get("segmentation_version", "") or "").strip()
-                    or segmentation_version
+                    str(episode.get("segmentation_version", "") or "").strip() or segmentation_version
                 ),
+                "input_fingerprint": input_fingerprint,
             }
             stored_payloads.append(payload)
 
+        stored_hashes = {
+            str(paragraph_hash or "").strip()
+            for payload in stored_payloads
+            for paragraph_hash in (payload.get("evidence_ids") or [])
+            if str(paragraph_hash or "").strip()
+        }
         return {
             "payloads": stored_payloads,
-            "done_hashes": group_hashes,
+            "done_hashes": [hash_value for hash_value in group_hashes if hash_value in stored_hashes],
             "episode_count": len(stored_payloads),
-            "fallback_count": 1 if fallback_used else 0,
+            "fallback_count": 0,
         }
 
-    async def process_group(self, group: Dict[str, Any]) -> Dict[str, Any]:
-        result = await self._build_episode_payloads_for_group(group)
-        stored_count = 0
-        for payload in result.get("payloads") or []:
-            stored = self.metadata_store.upsert_episode(payload)
-            final_id = str(stored.get("episode_id") or payload.get("episode_id") or "")
-            if final_id:
-                self.metadata_store.bind_episode_paragraphs(
-                    final_id,
-                    list(payload.get("evidence_ids") or []),
-                )
-                stored_count += 1
-
-        result["episode_count"] = stored_count
-        return {
-            "done_hashes": list(result.get("done_hashes") or []),
-            "episode_count": stored_count,
-            "fallback_count": int(result.get("fallback_count") or 0),
-        }
-
-    async def process_pending_rows(self, pending_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-        loaded, missing_hashes = self.load_pending_paragraphs(pending_rows)
-        groups = self.group_paragraphs(loaded)
-
-        done_hashes: List[str] = list(missing_hashes)
-        failed_hashes: Dict[str, str] = {}
-        episode_count = 0
-        fallback_count = 0
-
-        for group in groups:
-            group_hashes = [str(p.get("hash", "") or "").strip() for p in (group.get("paragraphs") or [])]
-            try:
-                result = await self.process_group(group)
-                done_hashes.extend(result.get("done_hashes") or [])
-                episode_count += int(result.get("episode_count") or 0)
-                fallback_count += int(result.get("fallback_count") or 0)
-            except Exception as e:
-                err = str(e)[:500]
-                for h in group_hashes:
-                    if h:
-                        failed_hashes[h] = err
-
-        dedup_done = list(dict.fromkeys([h for h in done_hashes if h]))
-        return {
-            "done_hashes": dedup_done,
-            "failed_hashes": failed_hashes,
-            "episode_count": episode_count,
-            "fallback_count": fallback_count,
-            "missing_count": len(missing_hashes),
-            "group_count": len(groups),
-        }
-
-    def generation_hash(self) -> str:
-        return compute_hash(json.dumps({
-            "protocol": 1,
-            "episode": self._cfg("episode", {}),
-            "exclude_stale": self._cfg("integration.feedback_correction_paragraph_hard_filter_enabled", True),
-        }, sort_keys=True, ensure_ascii=False, default=str))
-
-    async def rebuild_source(self, source: str) -> Dict[str, Any]:
-        source = str(source or "").strip()
-        if not source:
-            raise ValueError("source is empty")
-        self.metadata_store.enqueue_episode_rebuilds([source], "manual_rebuild")
-        job = self.metadata_store.claim_episode_rebuild(self.generation_hash(), source=source)
-        if job is None:
-            return {"source": source, "status": "pending", "episode_count": 0}
-        return await self._run_rebuild_job(job)
-
-    async def process_rebuild_batch(self, *, limit=20, max_retry=3) -> Dict[str, Any]:
-        items, failures = [], []
-        for _ in range(max(1, int(limit))):
-            job = self.metadata_store.claim_episode_rebuild(self.generation_hash(), max_retry=max_retry)
-            if job is None:
-                break
-            try:
-                items.append(await self._run_rebuild_job(job))
-            except Exception as exc:
-                failures.append({"source": job["source"], "error": str(exc)[:500]})
-                logger.warning("Episode rebuild failed for source=%s: %s", job["source"], exc)
-        return {"processed": len(items) + len(failures),
-                "rebuilt": sum(item.get("status") == "done" for item in items),
-                "failed": len(failures), "items": items, "failures": failures}
-
-    async def _run_rebuild_job(self, job) -> Dict[str, Any]:
-        async def heartbeat():
-            while True:
-                await asyncio.sleep(40)
-                if not self.metadata_store.renew_episode_rebuild(job):
-                    return
-
-        keeper = asyncio.create_task(heartbeat(), name="memorix-episode-lease")
-        try:
-            plan = await self.plan_source_rebuild(job["source"])
-            payloads = plan.pop("payloads")
-            result = self.metadata_store.publish_episode_rebuild(job, payloads, self.generation_hash())
-            return {**plan, **result}
-        except asyncio.CancelledError:
-            self.metadata_store.fail_episode_rebuild(job)
-            raise
-        except Exception as exc:
-            self.metadata_store.fail_episode_rebuild(job, str(exc))
-            raise
-        finally:
-            keeper.cancel()
-            await asyncio.gather(keeper, return_exceptions=True)
-
-    async def plan_source_rebuild(self, source: str) -> Dict[str, Any]:
+    async def plan_source_rebuild(
+        self,
+        source: str,
+        *,
+        segmentation_generation: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """读取完整来源并生成可供CAS发布的确定性物化计划。"""
         token = str(source or "").strip()
         if not token:
             return {
-                "payloads": [],
                 "source": "",
+                "payloads": [],
                 "episode_count": 0,
                 "fallback_count": 0,
                 "group_count": 0,
                 "paragraph_count": 0,
             }
 
-        hard_filter_enabled = bool(
-            self._cfg("integration.feedback_correction_paragraph_hard_filter_enabled", True)
+        memory_cfg = global_config.a_memorix.integration
+        paragraphs = await asyncio.to_thread(
+            self.metadata_store.get_live_paragraphs_by_source, token,
+            exclude_stale=bool(getattr(memory_cfg, "feedback_correction_paragraph_hard_filter_enabled", True)),
         )
-        paragraphs = self.metadata_store.get_live_paragraphs_by_source(
-            token,
-            exclude_stale=hard_filter_enabled,
+        generation = (
+            dict(segmentation_generation)
+            if isinstance(segmentation_generation, dict)
+            else self.generation_signature()
         )
+        generation_hash = self.generation_hash(generation)
         if not paragraphs:
             return {
                 "source": token,
-                "episode_count": 0,
                 "payloads": [],
+                "episode_count": 0,
                 "fallback_count": 0,
                 "group_count": 0,
                 "paragraph_count": 0,
+                "generation_hash": generation_hash,
+                "reused_group_count": 0,
+                "reused_episode_count": 0,
+                "recomputed_group_count": 0,
             }
 
+        paragraphs = await asyncio.to_thread(self._enrich_paragraph_participants, paragraphs)
         groups = self.group_paragraphs(paragraphs)
+        existing_episodes = await asyncio.to_thread(self.metadata_store.get_episodes_by_source, token)
+        cached_empty_groups = set(await asyncio.to_thread(
+            self.metadata_store.get_episode_empty_group_fingerprints, token,
+        ))
+        empty_group_fingerprints: List[str] = []
+        cached_by_fingerprint: Dict[str, List[Dict[str, Any]]] = {}
+        for episode in existing_episodes:
+            input_fingerprint = str(episode.get("input_fingerprint", "") or "").strip()
+            if input_fingerprint:
+                cached_by_fingerprint.setdefault(input_fingerprint, []).append(episode)
         payloads: List[Dict[str, Any]] = []
         fallback_count = 0
+        reused_group_count = 0
+        reused_episode_count = 0
+        recomputed_group_count = 0
 
         for group in groups:
+            group["_segmentation_generation"] = generation
+            input_fingerprint = self._group_input_fingerprint(group)
+            group["_input_fingerprint"] = input_fingerprint
+            if input_fingerprint in cached_empty_groups:
+                empty_group_fingerprints.append(input_fingerprint)
+                reused_group_count += 1
+                continue
+            cached_payloads = self._reusable_group_payloads(
+                group,
+                input_fingerprint,
+                cached_by_fingerprint,
+            )
+            if cached_payloads:
+                payloads.extend(cached_payloads)
+                reused_group_count += 1
+                reused_episode_count += len(cached_payloads)
+                continue
             result = await self._build_episode_payloads_for_group(group)
-            payloads.extend(list(result.get("payloads") or []))
+            group_payloads = list(result.get("payloads") or [])
+            payloads.extend(group_payloads)
+            if not group_payloads:
+                empty_group_fingerprints.append(input_fingerprint)
             fallback_count += int(result.get("fallback_count") or 0)
+            recomputed_group_count += 1
 
         return {
             "source": token,
-            "episode_count": len(payloads),
             "payloads": payloads,
+            "episode_count": len(payloads),
             "fallback_count": fallback_count,
             "group_count": len(groups),
             "paragraph_count": len(paragraphs),
+            "reused_group_count": reused_group_count,
+            "reused_episode_count": reused_episode_count,
+            "recomputed_group_count": recomputed_group_count,
+            "generation_hash": generation_hash,
+            "empty_group_fingerprints": empty_group_fingerprints,
         }
+
+    async def rebuild_source(self, source: str) -> Dict[str, Any]:
+        """离线管理入口；在线后台必须使用带租约的来源发布流程。"""
+        plan = await self.plan_source_rebuild(source)
+        token = str(plan.get("source", "") or "").strip()
+        if not token:
+            return {key: value for key, value in plan.items() if key != "payloads"}
+        replace_result = await asyncio.to_thread(
+            self.metadata_store.replace_episodes_for_source, token,
+            list(plan.get("payloads") or []),
+            empty_group_fingerprints=list(plan.get("empty_group_fingerprints") or []),
+        )
+        result = {key: value for key, value in plan.items() if key != "payloads"}
+        result["episode_count"] = int(replace_result.get("episode_count") or 0)
+        return result
+
+    async def _maintain_source_lease(
+        self,
+        *,
+        source: str,
+        lease_token: str,
+        claimed_revision: int,
+        generation_hash: str,
+        lease_seconds: float,
+        stop_event: asyncio.Event,
+    ) -> bool:
+        safe_lease_seconds = max(1.0, float(lease_seconds))
+        heartbeat_interval = max(0.1, safe_lease_seconds / 3.0)
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=heartbeat_interval)
+            except asyncio.TimeoutError:
+                renewed = await asyncio.to_thread(
+                    self.metadata_store.renew_episode_source_rebuild_lease,
+                    source,
+                    lease_token=lease_token,
+                    claimed_revision=claimed_revision,
+                    generation_hash=generation_hash,
+                    lease_seconds=safe_lease_seconds,
+                )
+                if not renewed:
+                    return False
+        return True
+
+    async def process_rebuild_batch(
+        self,
+        *,
+        sources: Optional[Sequence[str]] = None,
+        limit: int = 20,
+        max_retry: int = 3,
+        lease_seconds: float = 1800.0,
+        max_wait_seconds: float = 60.0,
+    ) -> Dict[str, Any]:
+        """按 v2.0 来源租约领取物化任务，并以 revision CAS 原子发布 Episode 快照。"""
+        safe_max_retry = max(1, int(max_retry or 1))
+        generation = self.generation_signature()
+        generation_hash = self.generation_hash(generation)
+        source_scope = list(
+            dict.fromkeys(str(item or "").strip() for item in (sources or []) if str(item or "").strip())
+        )
+        if sources is not None and not source_scope:
+            return {
+                "processed": 0,
+                "rebuilt": 0,
+                "superseded": 0,
+                "failed": 0,
+                "episode_count": 0,
+                "fallback_count": 0,
+                "items": [],
+                "failures": [],
+                "unfinished": 0,
+                "unfinished_items": [],
+            }
+
+        rebuilt_items: List[Dict[str, Any]] = []
+        failures: List[Dict[str, str]] = []
+        unfinished_items: List[Dict[str, str]] = []
+        superseded = 0
+        fallback_count = 0
+        episode_count = 0
+
+        for _ in range(max(1, int(limit or 1))):
+            claims = await asyncio.to_thread(
+                self.metadata_store.claim_episode_source_rebuild_batch,
+                generation_hash=generation_hash,
+                sources=source_scope if sources is not None else None,
+                limit=1,
+                max_retry=safe_max_retry,
+                lease_seconds=max(1.0, float(lease_seconds)),
+                max_wait_seconds=max(0.0, float(max_wait_seconds)),
+            )
+            if not claims:
+                break
+            claim = claims[0]
+            source = str(claim.get("source", "") or "").strip()
+            if sources is not None and source in source_scope:
+                source_scope.remove(source)
+            lease_token = str(claim.get("lease_token", "") or "").strip()
+            claimed_revision = int(claim.get("claimed_revision", 0) or 0)
+            try:
+                heartbeat_stop = asyncio.Event()
+                heartbeat_task = asyncio.create_task(
+                    self._maintain_source_lease(
+                        source=source,
+                        lease_token=lease_token,
+                        claimed_revision=claimed_revision,
+                        generation_hash=generation_hash,
+                        lease_seconds=lease_seconds,
+                        stop_event=heartbeat_stop,
+                    )
+                )
+                try:
+                    source_type = source.split(":", 1)[0]
+                    if profile_policy.should_auto_enqueue_episode(self._cfg, source_type=source_type):
+                        plan = await self.plan_source_rebuild(
+                            source,
+                            segmentation_generation=generation,
+                        )
+                    else:
+                        plan = {
+                            "source": source,
+                            "payloads": [],
+                            "episode_count": 0,
+                            "fallback_count": 0,
+                            "group_count": 0,
+                            "paragraph_count": 0,
+                            "reused_group_count": 0,
+                            "reused_episode_count": 0,
+                            "recomputed_group_count": 0,
+                            "generation_hash": generation_hash,
+                        }
+                finally:
+                    heartbeat_stop.set()
+                    try:
+                        await heartbeat_task
+                    except Exception as heartbeat_exc:
+                        logger.warning(f"Episode 来源租约心跳异常: source={source}, error={heartbeat_exc}")
+
+                publish_result = await asyncio.to_thread(
+                    self.metadata_store.publish_episode_source_rebuild,
+                    source,
+                    lease_token=lease_token,
+                    claimed_revision=claimed_revision,
+                    generation_hash=generation_hash,
+                    episodes_payloads=list(plan.get("payloads") or []),
+                    empty_group_fingerprints=list(plan.get("empty_group_fingerprints") or []),
+                )
+                if not bool(publish_result.get("published")):
+                    is_superseded = bool(publish_result.get("superseded"))
+                    superseded += int(is_superseded)
+                    unfinished_items.append(
+                        {
+                            "source": source,
+                            "reason": "superseded" if is_superseded else "lease_lost_or_claim_mismatch",
+                        }
+                    )
+                    continue
+                item = {key: value for key, value in plan.items() if key != "payloads"}
+                item.update(publish_result)
+                rebuilt_items.append(item)
+                episode_count += int(publish_result.get("episode_count") or 0)
+                fallback_count += int(plan.get("fallback_count") or 0)
+            except Exception as exc:
+                error = str(exc)[:500]
+                retry_count = max(0, int(claim.get("retry_count", 0) or 0))
+                try:
+                    await asyncio.to_thread(
+                        self.metadata_store.fail_episode_source_rebuild,
+                        source,
+                        lease_token=lease_token,
+                        claimed_revision=claimed_revision,
+                        error=error,
+                        retry_backoff_seconds=min(300.0, 5.0 * (2**retry_count)),
+                    )
+                except Exception as mark_exc:
+                    logger.warning(f"Episode 来源失败状态回写异常: source={source}, error={mark_exc}")
+                failures.append({"source": source, "error": error})
+
+        if sources is not None:
+            unfinished_items.extend({"source": source, "reason": "not_claimed"} for source in source_scope)
+
+        return {
+            "processed": len(rebuilt_items) + len(failures) + len(unfinished_items),
+            "rebuilt": len(rebuilt_items),
+            "superseded": superseded,
+            "unfinished": len(unfinished_items),
+            "failed": len(failures),
+            "episode_count": episode_count,
+            "fallback_count": fallback_count,
+            "items": rebuilt_items,
+            "failures": failures,
+            "unfinished_items": unfinished_items,
+        }
+

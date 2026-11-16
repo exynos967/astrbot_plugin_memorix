@@ -10,7 +10,7 @@ from typing import Any
 
 from ...amemorix.common.logging import get_logger
 from .core_schema import CORE_COLUMNS
-from .schema import SCHEMA_VERSION
+from .metadata_schema import SCHEMA_VERSION
 
 logger = get_logger("Memorix.Migration")
 
@@ -115,6 +115,7 @@ def validate_schema_shape(conn: sqlite3.Connection) -> None:
                 "source_operation_id",
             },
             "fact_claims": {"claim_id", "scope_type", "scope_id", "status", "value_text"},
+            "image_description_compensations": {"occurrence_id", "description_hash", "summary_external_id", "status"},
             "person_profile_alias_overrides": {"person_id", "aliases_json"},
             "memory_projection_jobs": {"item_type", "item_hash", "revision", "item_key"},
             "memory_deletion_owners": {"item_type", "item_hash", "operation_id"},
@@ -144,6 +145,9 @@ def migrate_metadata(store: Any) -> dict[str, Any] | None:
     if store._conn.in_transaction:
         raise RuntimeError("自动迁移必须在后台任务启动前、无活动事务时执行")
     backup_path = None
+    foreign_keys_enabled = bool(store._conn.execute("PRAGMA foreign_keys").fetchone()[0])
+    if foreign_keys_enabled:
+        store._conn.execute("PRAGMA foreign_keys = OFF")
     try:
         with store.transaction(immediate=True) as conn:
             # 数据库写锁负责跨连接/进程串行化，等待期间其他实例可能已完成迁移。
@@ -159,7 +163,7 @@ def migrate_metadata(store: Any) -> dict[str, Any] | None:
             store._ensure_plugin_local_schema()
             aliases = store.rebuild_relation_hash_aliases()
             knowledge = store.normalize_paragraph_knowledge_types()
-            if state.version < 22:
+            if state.version < 28:
                 store.backfill_person_fact_claims()
             validate_migrated_schema(conn)
             store.set_schema_version(SCHEMA_VERSION)
@@ -175,3 +179,7 @@ def migrate_metadata(store: Any) -> dict[str, Any] | None:
     except Exception as exc:
         location = f"；备份: {backup_path}" if backup_path else ""
         raise RuntimeError(f"metadata 自动迁移失败，事务已回滚{location}；原因: {exc}") from exc
+    finally:
+        if foreign_keys_enabled:
+            store._conn.execute("PRAGMA foreign_keys = ON")
+

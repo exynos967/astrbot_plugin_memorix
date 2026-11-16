@@ -27,7 +27,7 @@ class ManagedSQLiteConnection(sqlite3.Connection):
 
     def next_savepoint_name(self) -> str:
         self._savepoint_counter += 1
-        return f"memorix_tx_{self._savepoint_counter}"
+        return f"a_memorix_tx_{self._savepoint_counter}"
 
     def begin_managed_scope(self) -> int:
         self._managed_transaction_depth += 1
@@ -75,46 +75,59 @@ class SQLiteConnectionManager:
             check_same_thread=False,
             factory=ManagedSQLiteConnection,
         )
-        try:
-            connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA journal_mode=WAL")
-            connection.execute("PRAGMA synchronous=NORMAL")
-            connection.execute("PRAGMA cache_size=-64000")
-            connection.execute("PRAGMA temp_store=MEMORY")
-            connection.execute("PRAGMA foreign_keys = ON")
-            return connection
-        except BaseException:
-            connection.close()
-            raise
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=NORMAL")
+        connection.execute("PRAGMA cache_size=-64000")
+        connection.execute("PRAGMA temp_store=MEMORY")
+        connection.execute("PRAGMA foreign_keys = ON")
+        return connection
 
     @contextmanager
     def transaction(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection = self.connection()
         savepoint_name: Optional[str] = None
+        prev_isolation_level = connection.isolation_level
+        changed_isolation = False
         if connection.in_transaction:
             savepoint_name = connection.next_savepoint_name()
             connection.execute(f"SAVEPOINT {savepoint_name}")
         else:
-            connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+            if prev_isolation_level is not None:
+                connection.isolation_level = None
+                changed_isolation = True
+            try:
+                connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+            except BaseException:
+                if changed_isolation:
+                    connection.isolation_level = prev_isolation_level
+                raise
         scope_depth = connection.begin_managed_scope()
         try:
             yield connection
         except BaseException:
-            self._rollback_scope(connection, savepoint_name, scope_depth)
+            try:
+                self._rollback_scope(connection, savepoint_name, scope_depth)
+            finally:
+                if changed_isolation:
+                    connection.isolation_level = prev_isolation_level
             raise
         else:
-            rollback_requested = connection.end_managed_scope(scope_depth)
-            if rollback_requested:
-                self._rollback_scope_without_depth_change(connection, savepoint_name)
-                raise RuntimeError("事务中的操作请求了回滚")
             try:
+                rollback_requested = connection.end_managed_scope(scope_depth)
+                if rollback_requested:
+                    self._rollback_scope_without_depth_change(connection, savepoint_name)
+                    raise RuntimeError("事务中的操作请求了回滚")
                 if savepoint_name is not None:
                     connection.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+                elif connection.isolation_level is None:
+                    if connection.in_transaction:
+                        connection.execute("COMMIT")
                 else:
                     connection.force_commit()
-            except BaseException:
-                self._rollback_scope_without_depth_change(connection, savepoint_name)
-                raise
+            finally:
+                if changed_isolation:
+                    connection.isolation_level = prev_isolation_level
 
     @staticmethod
     def _rollback_scope(
@@ -133,6 +146,9 @@ class SQLiteConnectionManager:
         if savepoint_name is not None:
             connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
             connection.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+        elif connection.isolation_level is None:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
         else:
             connection.force_rollback()
 

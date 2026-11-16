@@ -1,18 +1,18 @@
-"""Graph-assisted relation candidate recall for relation-oriented queries."""
+"""面向关系查询的图辅助候选关系召回。"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Set
+from typing import Any, Collection, Dict, List, Optional, Sequence, Set
 
-from ...amemorix.common.logging import get_logger
+from src.common.logger import get_logger
 
 logger = get_logger("A_Memorix.GraphRelationRecall")
 
 
 @dataclass
 class GraphRelationRecallConfig:
-    """Configuration for controlled graph relation recall."""
+    """受控图关系召回配置。"""
 
     enabled: bool = True
     candidate_k: int = 24
@@ -30,7 +30,7 @@ class GraphRelationRecallConfig:
 
 @dataclass
 class GraphRelationCandidate:
-    """A graph-derived relation candidate before retriever-side fusion."""
+    """进入检索器融合前，由图结构生成的关系候选。"""
 
     hash_value: str
     subject: str
@@ -59,7 +59,7 @@ class GraphRelationCandidate:
 
 
 class GraphRelationRecallService:
-    """Collect relation candidates from the entity graph in a controlled way."""
+    """按受控策略从实体图中收集关系候选。"""
 
     def __init__(
         self,
@@ -76,6 +76,7 @@ class GraphRelationRecallService:
         self,
         *,
         seed_entities: Sequence[str],
+        allowed_relation_ids: Optional[Collection[str]] = None,
     ) -> List[GraphRelationCandidate]:
         if not self.config.enabled:
             return []
@@ -87,6 +88,10 @@ class GraphRelationRecallService:
             return []
 
         seen_hashes: Set[str] = set()
+        allowed = None if allowed_relation_ids is None else {str(value) for value in allowed_relation_ids}
+        if allowed is not None and not allowed:
+            return []
+
         candidates: List[GraphRelationCandidate] = []
 
         if len(seeds) >= 2:
@@ -94,23 +99,22 @@ class GraphRelationRecallService:
                 seed_a=seeds[0],
                 seed_b=seeds[1],
                 seen_hashes=seen_hashes,
+                allowed_relation_ids=allowed,
                 out=candidates,
             )
-            if (
-                len(candidates) < 3
-                and self.config.allow_two_hop_pair
-                and len(candidates) < self.config.candidate_k
-            ):
+            if len(candidates) < 3 and self.config.allow_two_hop_pair and len(candidates) < self.config.candidate_k:
                 self._collect_two_hop_pair_candidates(
                     seed_a=seeds[0],
                     seed_b=seeds[1],
                     seen_hashes=seen_hashes,
+                    allowed_relation_ids=allowed,
                     out=candidates,
                 )
         else:
             self._collect_one_hop_seed_candidates(
                 seed=seeds[0],
                 seen_hashes=seen_hashes,
+                allowed_relation_ids=allowed,
                 out=candidates,
             )
 
@@ -140,6 +144,7 @@ class GraphRelationRecallService:
         seed_a: str,
         seed_b: str,
         seen_hashes: Set[str],
+        allowed_relation_ids: Optional[Set[str]],
         out: List[GraphRelationCandidate],
     ) -> None:
         relation_hashes = []
@@ -148,6 +153,7 @@ class GraphRelationRecallService:
         self._append_relation_hashes(
             relation_hashes=relation_hashes,
             seen_hashes=seen_hashes,
+            allowed_relation_ids=allowed_relation_ids,
             out=out,
             candidate_type="direct_pair",
             graph_hops=1,
@@ -160,6 +166,7 @@ class GraphRelationRecallService:
         seed_a: str,
         seed_b: str,
         seen_hashes: Set[str],
+        allowed_relation_ids: Optional[Set[str]],
         out: List[GraphRelationCandidate],
     ) -> None:
         try:
@@ -191,6 +198,7 @@ class GraphRelationRecallService:
                 self._append_relation_hashes(
                     relation_hashes=relation_hashes,
                     seen_hashes=seen_hashes,
+                    allowed_relation_ids=allowed_relation_ids,
                     out=out,
                     candidate_type="two_hop_pair",
                     graph_hops=2,
@@ -202,12 +210,13 @@ class GraphRelationRecallService:
         *,
         seed: str,
         seen_hashes: Set[str],
+        allowed_relation_ids: Optional[Set[str]],
         out: List[GraphRelationCandidate],
     ) -> None:
         try:
             relation_hashes = self.graph_store.get_incident_relation_hashes(
                 seed,
-                limit=self.config.candidate_k,
+                limit=None if allowed_relation_ids is not None else self.config.candidate_k,
             )
         except Exception as e:
             logger.debug(f"graph one-hop recall skipped: {e}")
@@ -216,6 +225,7 @@ class GraphRelationRecallService:
             relation_hashes=relation_hashes,
             seen_hashes=seen_hashes,
             out=out,
+            allowed_relation_ids=allowed_relation_ids,
             candidate_type="one_hop_seed",
             graph_hops=min(1, self.config.max_hop),
             graph_seed_entities=[seed],
@@ -227,6 +237,7 @@ class GraphRelationRecallService:
         relation_hashes: Sequence[str],
         seen_hashes: Set[str],
         out: List[GraphRelationCandidate],
+        allowed_relation_ids: Optional[Set[str]],
         candidate_type: str,
         graph_hops: int,
         graph_seed_entities: Sequence[str],
@@ -235,6 +246,8 @@ class GraphRelationRecallService:
             if len(out) >= self.config.candidate_k:
                 break
             if relation_hash in seen_hashes:
+                continue
+            if allowed_relation_ids is not None and relation_hash not in allowed_relation_ids:
                 continue
             candidate = self._build_candidate(
                 relation_hash=relation_hash,

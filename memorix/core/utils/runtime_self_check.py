@@ -1,13 +1,14 @@
-"""Runtime self-check helpers for A_Memorix."""
+"""A_Memorix 运行时自检辅助工具。"""
 
 from __future__ import annotations
 
+import inspect
 import time
 from typing import Any, Dict, Optional
 
 import numpy as np
 
-from ...amemorix.common.logging import get_logger
+from src.common.logger import get_logger
 
 logger = get_logger("A_Memorix.RuntimeSelfCheck")
 
@@ -155,7 +156,7 @@ async def run_embedding_runtime_self_check(
     graph_vector_store: Optional[Any] = None,
     sample_text: str = _DEFAULT_SAMPLE_TEXT,
 ) -> Dict[str, Any]:
-    """Probe the real embedding path and compare dimensions with runtime storage."""
+    """探测真实 embedding 链路，并与运行时存储维度比较。"""
     configured_dimension = _safe_int(_get_config_value(config, "embedding.dimension", 0), 0)
     vector_store_dimension = _safe_int(getattr(vector_store, "dimension", 0), 0)
     requested_dimension = _get_requested_dimension(embedding_manager, configured_dimension)
@@ -166,11 +167,11 @@ async def run_embedding_runtime_self_check(
         graph_vector_store=graph_vector_store,
     )
 
-    if vector_store is None or embedding_manager is None:
+    if embedding_manager is None:
         return _build_report(
             ok=False,
             code="runtime_components_missing",
-            message="vector_store 或 embedding_manager 未初始化",
+            message="embedding_manager 未初始化",
             configured_dimension=configured_dimension,
             requested_dimension=requested_dimension,
             vector_store_dimension=vector_store_dimension,
@@ -187,7 +188,13 @@ async def run_embedding_runtime_self_check(
     try:
         detected_dimension = _safe_int(await embedding_manager._detect_dimension(), 0)
         requested_dimension = _get_requested_dimension(embedding_manager, detected_dimension or configured_dimension)
-        encoded = await embedding_manager.encode(sample_text)
+        # 自检必须请求真实服务，不能用已有向量掩盖连接故障。
+        encode_fn = embedding_manager.encode
+        sig_params = inspect.signature(encode_fn).parameters
+        accepts_use_cache = "use_cache" in sig_params or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_params.values()
+        )
+        encoded = await (encode_fn(sample_text, use_cache=False) if accepts_use_cache else encode_fn(sample_text))
         encoded_array = _normalize_encoded_vector(encoded)
         encoded_dimension = int(encoded_array.shape[0])
     except Exception as exc:
@@ -225,10 +232,7 @@ async def run_embedding_runtime_self_check(
         )
 
     if encoded_dimension != expected_dimension:
-        msg = (
-            "embedding 真实输出维度与当前向量存储不一致: "
-            f"expected={expected_dimension}, encoded={encoded_dimension}"
-        )
+        msg = f"embedding 真实输出维度与当前向量存储不一致: expected={expected_dimension}, encoded={encoded_dimension}"
         logger.error(msg)
         return _build_report(
             ok=False,
@@ -265,7 +269,7 @@ async def ensure_runtime_self_check(
     force: bool = False,
     sample_text: str = _DEFAULT_SAMPLE_TEXT,
 ) -> Dict[str, Any]:
-    """Run or reuse cached runtime self-check report."""
+    """执行运行时自检，或复用已有的自检报告缓存。"""
     if plugin_or_config is None:
         return _build_report(
             ok=False,
@@ -301,8 +305,6 @@ async def ensure_runtime_self_check(
         else plugin_or_config.get("graph_vector_store"),
         sample_text=sample_text,
     )
-    try:
+    if not isinstance(plugin_or_config, dict):
         plugin_or_config._runtime_self_check_report = report
-    except Exception:
-        pass
     return report

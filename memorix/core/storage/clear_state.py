@@ -12,6 +12,11 @@ def clear_profile_state(store, conn):
     for row in conn.execute("SELECT * FROM fact_claims WHERE status IN ('active', 'conflicted')").fetchall():
         claim = dict(row)
         deleted = store.retract_fact_claim(claim["claim_id"], reason="memory_scope_cleared")
+        tx_row = conn.execute(
+            "SELECT MAX(transition_id) FROM fact_transitions WHERE old_claim_id = ? OR new_claim_id = ?",
+            (claim["claim_id"], claim["claim_id"]),
+        ).fetchone()
+        deleted_transition_id = int(tx_row[0]) if tx_row and tx_row[0] is not None else None
         paragraph_evidence = [
             item[0]
             for item in conn.execute(
@@ -20,7 +25,12 @@ def clear_profile_state(store, conn):
             )
         ]
         snapshot["claims"].append(
-            {"row": claim, "deleted_updated_at": deleted["updated_at"], "paragraph_evidence": paragraph_evidence}
+            {
+                "row": claim,
+                "deleted_updated_at": deleted["updated_at"],
+                "deleted_transition_id": deleted_transition_id,
+                "paragraph_evidence": paragraph_evidence,
+            }
         )
     for table in OVERRIDE_TABLES:
         snapshot["overrides"][table] = [dict(row) for row in conn.execute(f"SELECT * FROM {table}")]
@@ -36,6 +46,14 @@ def restore_profile_state(store, conn, snapshot):
         claim = store.get_fact_claim(old["claim_id"])
         if claim is None or claim["status"] != "retracted" or claim["updated_at"] != item["deleted_updated_at"]:
             continue
+        if "deleted_transition_id" in item and item["deleted_transition_id"] is not None:
+            tx_row = conn.execute(
+                "SELECT MAX(transition_id) FROM fact_transitions WHERE old_claim_id = ? OR new_claim_id = ?",
+                (old["claim_id"], old["claim_id"]),
+            ).fetchone()
+            current_tx_id = int(tx_row[0]) if tx_row and tx_row[0] is not None else None
+            if current_tx_id != item["deleted_transition_id"]:
+                continue
         if any(
             not conn.execute("SELECT 1 FROM paragraphs WHERE hash = ? AND COALESCE(is_deleted, 0) = 0", (h,)).fetchone()
             for h in item.get("paragraph_evidence", [])

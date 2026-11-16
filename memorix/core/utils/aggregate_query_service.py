@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
-from ...amemorix.common.logging import get_logger
+from src.common.logger import get_logger
 
 logger = get_logger("A_Memorix.AggregateQueryService")
 
@@ -300,7 +300,9 @@ class AggregateQueryService:
                 *[task for _, task in scheduled],
                 return_exceptions=True,
             )
-            for (branch_name, _), payload in zip(scheduled, done):
+            for (branch_name, _), payload in zip(scheduled, done, strict=True):
+                if isinstance(payload, asyncio.CancelledError):
+                    raise payload
                 if isinstance(payload, Exception):
                     logger.error(f"aggregate branch failed: branch={branch_name} error={payload}")
                     normalized = self._normalize_branch_payload(
@@ -329,10 +331,7 @@ class AggregateQueryService:
                     }
                 )
 
-        success = any(
-            bool(branches.get(name, {}).get("success", False))
-            for name in ("search", "time", "episode")
-        )
+        success = any(bool(branches.get(name, {}).get("success", False)) for name in ("search", "time", "episode"))
         mixed_results: Optional[List[Dict[str, Any]]] = None
         if mix:
             mixed_results = self._build_mixed_results(branches=branches, top_k=safe_mix_top_k)

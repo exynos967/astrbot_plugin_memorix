@@ -1,13 +1,11 @@
 """结构化事实账本存储与确定性状态机。"""
 
-from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional, Sequence
-
 import hashlib
 import json
 import math
 import unicodedata
-
+from datetime import datetime
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 _SCOPE_TYPES = {"person", "chat"}
 _POLARITIES = {"positive", "negative"}
@@ -16,7 +14,6 @@ _STABILITIES = {"stable", "temporal", "uncertain"}
 _AUTHORITIES = {"manual", "direct_user", "imported", "summary_derived"}
 _STATUSES = {"active", "conflicted", "superseded", "retracted"}
 _EVIDENCE_STANCES = {"support", "refute"}
-_TRUSTED_FACT_ORIGINS = {"manual_confirmed", "server_verified", "trusted_import"}
 _PROFILE_SECTIONS = {
     "identity_settings",
     "relationship_settings",
@@ -322,14 +319,10 @@ class MetadataFactMixin:
         normalized_evidence_type, normalized_evidence_id = _evidence_identity(evidence_type, evidence_id)
         if normalized_evidence_type and normalized_evidence_stance != "support":
             raise ValueError("upsert_fact_claim 只能用 support 证据断言事实；反向证据请使用 add_fact_evidence")
-        normalized_confidence = float(confidence)
-        if not math.isfinite(normalized_confidence) or not 0 <= normalized_confidence <= 1:
-            raise ValueError("confidence 必须是 0 到 1 之间的有限数值")
+        normalized_confidence = min(1.0, max(0.0, float(confidence)))
         now = float(observed_at) if observed_at is not None else datetime.now().timestamp()
         normalized_valid_from = float(valid_from) if valid_from is not None else None
         normalized_valid_to = float(valid_to) if valid_to is not None else None
-        if any(value is not None and not math.isfinite(value) for value in (now, normalized_valid_from, normalized_valid_to)):
-            raise ValueError("事实时间必须是有限数值")
         if (
             normalized_valid_from is not None
             and normalized_valid_to is not None
@@ -489,55 +482,69 @@ class MetadataFactMixin:
                 )
             else:
                 previous_status = str(existing.get("status", ""))
-                if previous_status in {"superseded", "retracted"} and not requested_supersedes and normalized_authority != "manual":
-                    self._upsert_fact_evidence_in_transaction(
-                        cursor, claim_id=claim_id, evidence_type=normalized_evidence_type,
-                        evidence_id=normalized_evidence_id, stance=normalized_evidence_stance,
-                        weight=evidence_weight, observed_at=now, metadata=evidence_metadata,
+                preserve_manual_retraction = False
+                if previous_status == "retracted" and normalized_authority != "manual":
+                    cursor.execute(
+                        """
+                        SELECT transition_type, reason
+                        FROM fact_transitions
+                        WHERE (old_claim_id = ? OR new_claim_id = ?)
+                          AND transition_type IN ('assert', 'retract', 'restore', 'supersede', 'detach_evidence')
+                        ORDER BY transition_id DESC
+                        LIMIT 1
+                        """,
+                        (claim_id, claim_id),
                     )
-                    # 自动写回只能补充证据；撤回/取代后的状态须通过显式管理操作恢复。
-                    return {
-                        **existing, "created": False, "reinforced": False, "restored": False,
-                        "idempotent": False, "superseded_claim_ids": [], "conflicting_claim_ids": [],
-                    }
-                restored = previous_status in {"superseded", "retracted"}
-                cursor.execute(
-                    """
-                    UPDATE fact_claims
-                    SET value_text = ?, cardinality = ?, conflict_group = ?,
-                        stability = ?, profile_section = ?, authority = ?, status = ?,
-                        confidence = MAX(confidence, ?),
-                        valid_from = COALESCE(?, valid_from),
-                        valid_to = ?, last_confirmed_at = ?, updated_at = ?
-                    WHERE claim_id = ?
-                    """,
-                    (
-                        normalized_value_text,
-                        normalized_cardinality,
-                        conflict_group,
-                        normalized_stability,
-                        normalized_profile_section,
-                        normalized_authority,
-                        target_status,
-                        normalized_confidence,
-                        normalized_valid_from,
-                        normalized_valid_to,
-                        now,
-                        now,
-                        claim_id,
-                    ),
-                )
-                reinforced = previous_status in {"active", "conflicted"}
-                self._append_fact_transition(
-                    cursor,
-                    old_claim_id=claim_id,
-                    new_claim_id=claim_id,
-                    transition_type="restore" if restored else "reinforce",
-                    reason=reason,
-                    evidence_type=normalized_evidence_type,
-                    evidence_id=normalized_evidence_id,
-                    created_at=now,
-                )
+                    last_tx_row = cursor.fetchone()
+                    if (
+                        last_tx_row is not None
+                        and str(last_tx_row[0] or "") == "retract"
+                        and str(last_tx_row[1] or "") != "memory_scope_cleared"
+                    ):
+                        preserve_manual_retraction = True
+
+                if preserve_manual_retraction:
+                    restored = False
+                    reinforced = False
+                else:
+                    restored = previous_status in {"superseded", "retracted"}
+                    cursor.execute(
+                        """
+                        UPDATE fact_claims
+                        SET value_text = ?, cardinality = ?, conflict_group = ?,
+                            stability = ?, profile_section = ?, authority = ?, status = ?,
+                            confidence = MAX(confidence, ?),
+                            valid_from = COALESCE(?, valid_from),
+                            valid_to = ?, last_confirmed_at = ?, updated_at = ?
+                        WHERE claim_id = ?
+                        """,
+                        (
+                            normalized_value_text,
+                            normalized_cardinality,
+                            conflict_group,
+                            normalized_stability,
+                            normalized_profile_section,
+                            normalized_authority,
+                            target_status,
+                            normalized_confidence,
+                            normalized_valid_from,
+                            normalized_valid_to,
+                            now,
+                            now,
+                            claim_id,
+                        ),
+                    )
+                    reinforced = previous_status in {"active", "conflicted"}
+                    self._append_fact_transition(
+                        cursor,
+                        old_claim_id=claim_id,
+                        new_claim_id=claim_id,
+                        transition_type="restore" if restored else "reinforce",
+                        reason=reason,
+                        evidence_type=normalized_evidence_type,
+                        evidence_id=normalized_evidence_id,
+                        created_at=now,
+                    )
 
             for old_claim_id in superseded:
                 cursor.execute(
@@ -672,6 +679,28 @@ class MetadataFactMixin:
             previous = self._fact_claim_row(cursor.fetchone())
             if previous is None:
                 raise ValueError(f"事实 claim 不存在: {token}")
+            prev_updated = float(previous.get("updated_at") or 0.0)
+            if retracted_at is None and now <= prev_updated:
+                now = math.nextafter(prev_updated, math.inf)
+            cursor.execute(
+                """
+                SELECT transition_type, reason
+                FROM fact_transitions
+                WHERE (old_claim_id = ? OR new_claim_id = ?)
+                  AND transition_type IN ('assert', 'retract', 'restore', 'supersede', 'detach_evidence')
+                ORDER BY transition_id DESC
+                LIMIT 1
+                """,
+                (token, token),
+            )
+            last_tx = cursor.fetchone()
+            last_tx_type = str(last_tx[0] or "") if last_tx is not None else ""
+            last_tx_reason = str(last_tx[1] or "") if last_tx is not None else ""
+            should_record_transition = (
+                str(previous.get("status", "")) != "retracted"
+                or last_tx_type != "retract"
+                or (bool(reason) and last_tx_reason != reason)
+            )
             cursor.execute(
                 """
                 UPDATE fact_claims
@@ -680,7 +709,7 @@ class MetadataFactMixin:
                 """,
                 (now, now, token),
             )
-            if str(previous.get("status", "")) != "retracted":
+            if should_record_transition:
                 self._append_fact_transition(
                     cursor,
                     old_claim_id=token,
@@ -716,6 +745,9 @@ class MetadataFactMixin:
             previous = self._fact_claim_row(cursor.fetchone())
             if previous is None:
                 raise ValueError(f"事实 claim 不存在: {token}")
+            prev_updated = float(previous.get("updated_at") or 0.0)
+            if restored_at is None and now <= prev_updated:
+                now = math.nextafter(prev_updated, math.inf)
             cursor.execute(
                 """
                 SELECT claim_id
@@ -912,7 +944,11 @@ class MetadataFactMixin:
             FROM fact_claims
             WHERE scope_type = 'person' AND scope_id = ? AND status = 'active'
               AND stability = 'stable'
-              AND authority IN ('manual', 'direct_user', 'imported')
+              AND NOT EXISTS (
+                  SELECT 1 FROM fact_evidence e JOIN paragraphs p ON p.hash=e.evidence_id
+                  WHERE e.claim_id=fact_claims.claim_id AND e.evidence_type='paragraph'
+                    AND json_extract(p.metadata, '$.dedup_phase')='pending'
+              )
               AND (valid_from IS NULL OR valid_from <= ?)
               AND (valid_to IS NULL OR valid_to > ?)
             ORDER BY
@@ -957,10 +993,14 @@ class MetadataFactMixin:
             WHERE scope_type = 'person' AND scope_id = ? AND status = 'active'
               AND (valid_from IS NULL OR valid_from <= ?)
               AND (valid_to IS NULL OR valid_to > ?)
+              AND NOT EXISTS (
+                  SELECT 1 FROM fact_evidence e JOIN paragraphs p ON p.hash=e.evidence_id
+                  WHERE e.claim_id=fact_claims.claim_id AND e.evidence_type='paragraph'
+                    AND json_extract(p.metadata, '$.dedup_phase')='pending'
+              )
               AND (
                     (
                         stability = 'stable'
-                        AND authority IN ('manual', 'direct_user', 'imported')
                     )
                     OR (
                         stability = 'uncertain'
@@ -992,6 +1032,45 @@ class MetadataFactMixin:
         )
         return [self._fact_claim_row(row) or {} for row in cursor.fetchall()]
 
+    def count_uncertain_person_fact_claims(self, person_id: str) -> int:
+        """统计人物有效的未确认事实，避免为计数加载全部记录。"""
+
+        token = _required_token("person_id", person_id)
+        point = datetime.now().timestamp()
+        rows = self.query(
+            """
+            SELECT COUNT(*) AS total FROM fact_claims
+            WHERE scope_type = 'person' AND scope_id = ? AND status = 'active'
+              AND stability = 'uncertain' AND authority = 'summary_derived'
+              AND profile_section = 'uncertain_notes'
+              AND (valid_from IS NULL OR valid_from <= ?)
+              AND (valid_to IS NULL OR valid_to > ?)
+            """,
+            (token, point, point),
+        )
+        return int(rows[0]["total"])
+
+    def list_uncertain_person_fact_claims(self, person_id: str, *, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """读取人物有效的未确认事实，可限制用于画像候选的记录数。"""
+
+        token = _required_token("person_id", person_id)
+        point = datetime.now().timestamp()
+        sql = """
+            SELECT * FROM fact_claims
+            WHERE scope_type = 'person' AND scope_id = ? AND status = 'active'
+              AND stability = 'uncertain' AND authority = 'summary_derived'
+              AND profile_section = 'uncertain_notes'
+              AND (valid_from IS NULL OR valid_from <= ?)
+              AND (valid_to IS NULL OR valid_to > ?)
+            ORDER BY last_confirmed_at DESC, claim_id ASC
+            """
+        params: List[Any] = [token, point, point]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(max(1, int(limit)))
+        rows = self.query(sql, tuple(params))
+        return [self._fact_claim_row(row) or {} for row in rows]
+
     def backfill_person_fact_claims(self, *, limit: Optional[int] = None) -> Dict[str, int]:
         """把现有原子人物事实段落确定性迁移到事实账本。
 
@@ -1022,44 +1101,35 @@ class MetadataFactMixin:
             if not paragraph_hash or not content or not source.startswith("person_fact:"):
                 continue
             raw_metadata = row.get("metadata")
-            metadata = self._decode_metadata(raw_metadata)
-            person_ids = metadata.get("person_ids") if isinstance(metadata.get("person_ids"), list) else []
-            person_id = str(metadata.get("person_id", "") or (person_ids[0] if person_ids else "")).strip()
+            try:
+                metadata = json.loads(raw_metadata) if raw_metadata else {}
+            except (TypeError, ValueError):
+                metadata = {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            person_id = str(metadata.get("person_id", "") or source[len("person_fact:") :]).strip()
             if not person_id:
                 continue
             evidence_source = str(metadata.get("evidence_source", "") or "").strip()
             raw_claim = metadata.get("fact_claim")
             claim_spec = dict(raw_claim) if isinstance(raw_claim, dict) else {}
             trust = _normalized_token(claim_spec.get("trust"))
-            trusted = trust in _TRUSTED_FACT_ORIGINS
             observed_at = row.get("event_time") or row.get("created_at")
+            # 无分类的旧摘要不能在迁移时获得模型未给出的稳定结论。
+            user_supported = evidence_source == "user_supported"
             result = self.upsert_fact_claim(
                 scope_type="person",
                 scope_id=person_id,
-                fact_key=(
-                    str(claim_spec.get("fact_key", "") or f"statement:{paragraph_hash}")
-                    if trusted
-                    else f"statement:{paragraph_hash}"
-                ),
+                fact_key=str(claim_spec.get("fact_key") or f"statement:{paragraph_hash}"),
                 value_text=content,
-                polarity=str(claim_spec.get("polarity", "positive") or "positive") if trusted else "positive",
-                cardinality=str(claim_spec.get("cardinality", "set") or "set") if trusted else "set",
-                stability=str(claim_spec.get("stability", "stable") or "stable") if trusted else "uncertain",
-                profile_section=(
-                    str(claim_spec.get("profile_section", "stable_facts") or "stable_facts")
-                    if trusted
-                    else "uncertain_notes"
-                ),
-                authority=(
-                    str(claim_spec.get("authority", "") or "direct_user")
-                    if trusted
-                    else "summary_derived"
-                ),
-                confidence=(
-                    float(claim_spec.get("confidence", 1.0) or 1.0)
-                    if trusted
-                    else min(0.5, float(claim_spec.get("confidence", 0.5) or 0.5))
-                ),
+                polarity=str(claim_spec.get("polarity", "positive")),
+                cardinality=str(claim_spec.get("cardinality", "set")),
+                stability=str(claim_spec.get("stability", "stable" if user_supported else "uncertain")),
+                profile_section=str(claim_spec.get("profile_section", "stable_facts" if user_supported else "uncertain_notes")),
+                authority=str(claim_spec.get("authority") or (
+                    "direct_user" if evidence_source == "user_supported" else "summary_derived"
+                )),
+                confidence=float(claim_spec.get("confidence", 1.0 if user_supported else 0.5)),
                 evidence_type="paragraph",
                 evidence_id=paragraph_hash,
                 evidence_metadata={
@@ -1104,6 +1174,37 @@ class MetadataFactMixin:
         )
         return [self._fact_evidence_row(row) or {} for row in cursor.fetchall()]
 
+    def project_fact_paragraph(self, paragraph: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """仅对去重管理的新段落投影有效事实，旧混合段落保留原文。"""
+        metadata = paragraph.get("metadata") or {}
+        if metadata.get("dedup_phase") == "pending":
+            return None
+        if not metadata.get("dedup_managed"):
+            return paragraph
+        now = datetime.now().timestamp()
+        rows = self.query(
+            "SELECT c.claim_id, c.value_text FROM fact_claims c JOIN fact_evidence e ON e.claim_id=c.claim_id "
+            "WHERE e.evidence_type='paragraph' AND e.evidence_id=? AND c.status='active' "
+            "AND (c.valid_from IS NULL OR c.valid_from<=?) AND (c.valid_to IS NULL OR c.valid_to>?)",
+            (paragraph["hash"], now, now),
+        )
+        active = {_normalized_token(row["value_text"]) for row in rows}
+        texts = metadata.get("dedup_fact_texts", [paragraph["content"]])
+        kept = [text for text in texts if _normalized_token(text) in active]
+        if not kept:
+            return None
+        return {**paragraph, "content": "\n".join(kept), "active_fact_claim_ids": [row["claim_id"] for row in rows]}
+
+    def fact_relation_has_support(self, relation_hash: str, paragraph: Dict[str, Any]) -> bool:
+        projected = self.project_fact_paragraph(paragraph)
+        if projected is None:
+            return False
+        metadata = paragraph.get("metadata") or {}
+        if not metadata.get("dedup_managed"):
+            return True
+        claims = metadata.get("dedup_relation_claims", {}).get(relation_hash, [])
+        return bool(set(claims).intersection(projected["active_fact_claim_ids"]))
+
     def snapshot_fact_evidence_for_paragraphs(
         self,
         paragraph_hashes: Sequence[str],
@@ -1128,10 +1229,11 @@ class MetadataFactMixin:
             f"""
             SELECT *
             FROM fact_evidence
-            WHERE evidence_type = 'paragraph' AND evidence_id IN ({placeholders})
+            WHERE (evidence_type = 'paragraph' AND evidence_id IN ({placeholders}))
+               OR (evidence_type = 'source' AND json_extract(metadata_json, '$.paragraph_hash') IN ({placeholders}))
             ORDER BY claim_id ASC, evidence_id ASC, stance ASC
             """,
-            tuple(hashes),
+            tuple(hashes) + tuple(hashes),
         )
         evidence = [self._fact_evidence_row(row) or {} for row in cursor.fetchall()]
         claim_ids = list(
@@ -1175,6 +1277,46 @@ class MetadataFactMixin:
                 )
 
         snapshot = self.snapshot_fact_evidence_for_paragraphs(paragraph_hashes, conn=conn)
+        return self._detach_fact_evidence_snapshot(snapshot, reason=reason, conn=conn, detached_at=detached_at)
+
+    def detach_fact_evidence_for_sources(
+        self, observation_ids: Sequence[str], *, reason: str, detached_at: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """撤销指定实际来源；其他来源仍支持事实时不撤回该事实。"""
+        ids = list(dict.fromkeys(str(value).strip() for value in observation_ids if str(value).strip()))
+        if not ids:
+            return {"paragraph_hashes": [], "claims": [], "evidence": [], "detached_evidence_count": 0,
+                    "retracted_claim_ids": []}
+        with self.transaction(immediate=True) as conn:
+            placeholders = ",".join("?" for _ in ids)
+            rows = conn.execute(
+                f"SELECT * FROM fact_evidence WHERE evidence_type='source' AND evidence_id IN ({placeholders})", ids,
+            ).fetchall()
+            evidence = [self._fact_evidence_row(row) for row in rows]
+            claim_ids = list(dict.fromkeys(row["claim_id"] for row in evidence))
+            claims = [self.get_fact_claim(claim_id) for claim_id in claim_ids]
+            for claim_id in claim_ids:
+                remaining = conn.execute(
+                    "SELECT 1 FROM fact_evidence WHERE claim_id=? AND evidence_type='source' "
+                    f"AND stance='support' AND evidence_id NOT IN ({placeholders}) LIMIT 1", (claim_id, *ids),
+                ).fetchone()
+                if remaining is None:
+                    # 新记忆的段落是来源的投影；最后一份来源撤销时一并撤销投影证据。
+                    # 旧段落本身仍是独立的历史证据，不能连带删除。
+                    anchors = conn.execute(
+                        "SELECT * FROM fact_evidence WHERE claim_id=? AND evidence_type='paragraph' "
+                        "AND json_extract(metadata_json, '$.source_managed')=1", (claim_id,),
+                    ).fetchall()
+                    evidence.extend(self._fact_evidence_row(row) for row in anchors)
+            return self._detach_fact_evidence_snapshot(
+                {"paragraph_hashes": [], "claims": claims, "evidence": evidence},
+                reason=reason, conn=conn, detached_at=detached_at,
+            )
+
+    def _detach_fact_evidence_snapshot(
+        self, snapshot: Dict[str, Any], *, reason: str, conn: Any, detached_at: Optional[float],
+    ) -> Dict[str, Any]:
+        """共享段落删除与来源撤销的证据移除和状态更新。"""
         evidence = [dict(item) for item in snapshot.get("evidence", []) if isinstance(item, dict)]
         if not evidence:
             return {**snapshot, "detached_evidence_count": 0, "retracted_claim_ids": []}
@@ -1233,6 +1375,17 @@ class MetadataFactMixin:
                 created_at=now,
             )
             retracted_claim_ids.append(claim_id)
+
+        if retracted_claim_ids:
+            for claim in snapshot.get("claims", []):
+                if claim["claim_id"] in retracted_claim_ids and claim["scope_type"] == "person":
+                    cursor.execute("UPDATE person_profile_snapshots SET expires_at=0 WHERE person_id=?", (claim["scope_id"],))
+            paragraph_ids = {row["metadata"].get("paragraph_hash") for row in evidence
+                             if row.get("evidence_type") == "source" and row.get("metadata")}
+            for paragraph_id in paragraph_ids:
+                paragraph = self.get_paragraph(paragraph_id) if paragraph_id else None
+                if paragraph and paragraph.get("source"):
+                    self.enqueue_episode_source_rebuild(paragraph["source"], reason="fact_evidence_retracted")
 
         return {
             **snapshot,
@@ -1295,7 +1448,8 @@ class MetadataFactMixin:
                 """
                 SELECT transition_type
                 FROM fact_transitions
-                WHERE old_claim_id = ? OR new_claim_id = ?
+                WHERE (old_claim_id = ? OR new_claim_id = ?)
+                  AND transition_type IN ('assert', 'retract', 'restore', 'supersede', 'detach_evidence')
                 ORDER BY transition_id DESC
                 LIMIT 1
                 """,

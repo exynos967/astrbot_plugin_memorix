@@ -4,17 +4,25 @@ Episode 语义切分服务（LLM 主路径）。
 职责：
 1. 组装语义切分提示词
 2. 调用 LLM 生成结构化 episode JSON
-3. 严格校验输出结构，返回标准化结果
+3. 将模型返回的段落序号映射为内部 hash，返回标准化结果
 """
 
 from __future__ import annotations
 
+from typing import Any, Dict, List, Optional, Tuple
 import json
-from typing import Any, Dict, List, Optional
 
-from ...amemorix.common.logging import get_logger
+from src.common.logger import get_logger
+from src.config.model_configs import TaskConfig
+from src.services import llm_service as llm_api
 
-from .model_routing import generate_text
+from .model_routing import (
+    ResolvedLLMModel,
+    generate_with_resolved_model,
+    get_text_generation_model_tasks,
+    pick_text_generation_task,
+    resolve_text_generation_model_selector,
+)
 
 logger = get_logger("A_Memorix.EpisodeSegmentationService")
 
@@ -22,12 +30,10 @@ logger = get_logger("A_Memorix.EpisodeSegmentationService")
 class EpisodeSegmentationService:
     """基于 LLM 的 episode 语义切分服务。"""
 
-    SEGMENTATION_VERSION = "episode_mvp_v1"
+    SEGMENTATION_VERSION = "episode_indices_v2"
 
-    def __init__(self, plugin_config: Optional[dict] = None, ctx: Any = None):
+    def __init__(self, plugin_config: Optional[dict] = None):
         self.plugin_config = plugin_config or {}
-        # 本土化命脉：segment() 调 generate_text 时据此取 provider_bridge。
-        self._ctx = ctx
 
     def _cfg(self, key: str, default: Any = None) -> Any:
         current: Any = self.plugin_config
@@ -37,6 +43,79 @@ class EpisodeSegmentationService:
             else:
                 return default
         return current
+
+    @staticmethod
+    def _is_task_config(obj: Any) -> bool:
+        return hasattr(obj, "model_list") and bool(getattr(obj, "model_list", []))
+
+    def _pick_template_task(self, available_tasks: Dict[str, Any]) -> Optional[TaskConfig]:
+        _, task_config = pick_text_generation_task(
+            available_tasks,
+            preferred=("memory", "utils", "replyer", "planner", "tool_use"),
+        )
+        return task_config
+
+    def _resolve_model_config(self) -> Tuple[Optional[ResolvedLLMModel], str]:
+        available_tasks = get_text_generation_model_tasks(llm_api) or {}
+        if not available_tasks:
+            return None, "unavailable"
+
+        selector = str(self._cfg("episode.segmentation_model", "auto") or "auto").strip()
+
+        if selector and selector.lower() != "auto":
+            task_name, task_config, selected_model_name = resolve_text_generation_model_selector(
+                available_tasks,
+                selector,
+            )
+            if task_name and task_config:
+                return (
+                    ResolvedLLMModel(
+                        task_name=task_name,
+                        task_config=task_config,
+                        selected_model_name=selected_model_name,
+                    ),
+                    selector,
+                )
+
+            logger.warning(f"episode.segmentation_model='{selector}' 不可用，回退 auto")
+
+        task_name, task_config = pick_text_generation_task(
+            available_tasks,
+            preferred=("memory", "utils", "replyer", "planner", "tool_use"),
+        )
+        if task_name and task_config:
+            return ResolvedLLMModel(task_name=task_name, task_config=task_config), task_name
+
+        fallback = self._pick_template_task(available_tasks)
+        if fallback is not None:
+            task_name, task_config = pick_text_generation_task(available_tasks)
+            if task_name and task_config:
+                return ResolvedLLMModel(task_name=task_name, task_config=task_config), "auto"
+        return None, "unavailable"
+
+    def generation_signature(self) -> Dict[str, Any]:
+        """返回会影响分段输出的实现与模型配置签名。"""
+        model, selector = self._resolve_model_config()
+        if model is None:
+            return {
+                "segmentation_version": self.SEGMENTATION_VERSION,
+                "selector": selector,
+                "mode": "unavailable",
+            }
+        return {
+            "segmentation_version": self.SEGMENTATION_VERSION,
+            "selector": selector,
+            "mode": "llm",
+            "task_name": model.task_name,
+            "selected_model_name": model.selected_model_name,
+            "model_list": [
+                str(item).strip()
+                for item in getattr(model.task_config, "model_list", [])
+                if str(item).strip()
+            ],
+            "temperature": getattr(model.task_config, "temperature", None),
+            "max_tokens": getattr(model.task_config, "max_tokens", None),
+        }
 
     @staticmethod
     def _clamp_score(value: Any, default: float = 0.0) -> float:
@@ -69,8 +148,8 @@ class EpisodeSegmentationService:
             data = json.loads(raw)
             if isinstance(data, dict):
                 return data
-        except Exception:
-            pass
+        except json.JSONDecodeError:
+            logger.debug("Episode 分段响应不是完整 JSON，继续尝试提取对象片段")
 
         start = raw.find("{")
         end = raw.rfind("}")
@@ -79,15 +158,6 @@ class EpisodeSegmentationService:
             data = json.loads(candidate)
             if isinstance(data, dict):
                 return data
-
-        try:
-            from json_repair import repair_json
-
-            repaired = repair_json(raw, return_objects=True)
-            if isinstance(repaired, dict):
-                return repaired
-        except Exception:
-            pass
 
         raise ValueError("invalid_json_response")
 
@@ -101,7 +171,6 @@ class EpisodeSegmentationService:
     ) -> str:
         rows: List[str] = []
         for idx, item in enumerate(paragraphs, 1):
-            p_hash = str(item.get("hash", "") or "").strip()
             content = str(item.get("content", "") or "").strip().replace("\r\n", "\n")
             content = content[:800]
             event_start = item.get("event_time_start")
@@ -109,7 +178,7 @@ class EpisodeSegmentationService:
             event_time = item.get("event_time")
             rows.append(
                 (
-                    f"[{idx}] hash={p_hash}\n"
+                    f"[{idx}]\n"
                     f"event_time={event_time}\n"
                     f"event_time_start={event_start}\n"
                     f"event_time_end={event_end}\n"
@@ -120,16 +189,16 @@ class EpisodeSegmentationService:
         source_text = str(source or "").strip() or "unknown"
         return (
             "You are an episode segmentation engine.\n"
-            "Group the given paragraphs into one or more coherent episodes.\n"
+            "Group meaningful events into coherent episodes. Skip paragraphs that do not describe an event.\n"
             "Return JSON ONLY. No markdown, no explanation.\n"
             "\n"
-            "Hard JSON schema:\n"
+            "JSON schema:\n"
             "{\n"
             '  "episodes": [\n'
             "    {\n"
             '      "title": "string",\n'
             '      "summary": "string",\n'
-            '      "paragraph_hashes": ["hash1", "hash2"],\n'
+            '      "paragraph_indices": [1, 2],\n'
             '      "participants": ["person1", "person2"],\n'
             '      "keywords": ["kw1", "kw2"],\n'
             '      "time_confidence": 0.0,\n'
@@ -139,7 +208,9 @@ class EpisodeSegmentationService:
             "}\n"
             "\n"
             "Rules:\n"
-            "1) paragraph_hashes must come from input only.\n"
+            "1) paragraph_indices are the 1-based numbers shown in the input.\n"
+            "   You may omit irrelevant paragraphs and reuse a paragraph across related episodes.\n"
+            '   Return {"episodes": []} if there are no meaningful events.\n'
             "2) title and summary must be non-empty.\n"
             "3) keep participants/keywords concise and deduplicated.\n"
             "4) if uncertain, still provide best effort confidence values.\n"
@@ -147,8 +218,7 @@ class EpisodeSegmentationService:
             f"source={source_text}\n"
             f"window_start={window_start}\n"
             f"window_end={window_end}\n"
-            "paragraphs:\n"
-            + "\n\n".join(rows)
+            "paragraphs:\n" + "\n\n".join(rows)
         )
 
     def _normalize_episodes(
@@ -161,32 +231,26 @@ class EpisodeSegmentationService:
         if not isinstance(raw_episodes, list):
             raise ValueError("episodes_missing_or_not_list")
 
-        valid_hashes = set(input_hashes)
         normalized: List[Dict[str, Any]] = []
         for item in raw_episodes:
             if not isinstance(item, dict):
-                continue
+                raise ValueError("episode_not_object")
 
             title = str(item.get("title", "") or "").strip()
             summary = str(item.get("summary", "") or "").strip()
             if not title or not summary:
-                continue
+                raise ValueError("episode_title_or_summary_missing")
 
-            raw_hashes = item.get("paragraph_hashes")
-            if not isinstance(raw_hashes, list):
-                continue
-
+            indices = item.get("paragraph_indices")
+            if not isinstance(indices, list) or not indices:
+                raise ValueError("episode_paragraph_indices_missing")
             dedup_hashes: List[str] = []
-            seen_hashes = set()
-            for h in raw_hashes:
-                token = str(h or "").strip()
-                if not token or token in seen_hashes or token not in valid_hashes:
-                    continue
-                seen_hashes.add(token)
-                dedup_hashes.append(token)
-
-            if not dedup_hashes:
-                continue
+            for index in indices:
+                if type(index) is not int or not 1 <= index <= len(input_hashes):
+                    raise ValueError(f"episode_paragraph_index_invalid: {index}")
+                paragraph_hash = input_hashes[index - 1]
+                if paragraph_hash not in dedup_hashes:
+                    dedup_hashes.append(paragraph_hash)
 
             participants = []
             for p in item.get("participants", []) or []:
@@ -212,8 +276,6 @@ class EpisodeSegmentationService:
                 }
             )
 
-        if not normalized:
-            raise ValueError("episodes_all_invalid")
         return normalized
 
     async def segment(
@@ -227,26 +289,34 @@ class EpisodeSegmentationService:
         if not paragraphs:
             raise ValueError("paragraphs_empty")
 
+        resolved_model, model_label = self._resolve_model_config()
+        if resolved_model is None:
+            raise RuntimeError("episode segmentation model unavailable")
+
         prompt = self._build_prompt(
             source=source,
             window_start=window_start,
             window_end=window_end,
             paragraphs=paragraphs,
         )
-        result = await generate_text(
-            self._ctx,
-            prompt,
+        result = await generate_with_resolved_model(
+            resolved_model,
             request_type="A_Memorix.EpisodeSegmentation",
+            prompt=prompt,
+            temperature=getattr(resolved_model.task_config, "temperature", None),
+            max_tokens=getattr(resolved_model.task_config, "max_tokens", None),
         )
-        if not result.success or not result.text:
+        success = bool(result.success)
+        response = str(result.completion.response or "")
+        if not success or not response:
             raise RuntimeError("llm_generate_failed")
 
-        payload = self._safe_json_loads(str(result.text))
+        payload = self._safe_json_loads(str(response))
         input_hashes = [str(p.get("hash", "") or "").strip() for p in paragraphs]
         episodes = self._normalize_episodes(payload=payload, input_hashes=input_hashes)
 
         return {
             "episodes": episodes,
-            "segmentation_model": "auto",
+            "segmentation_model": model_label,
             "segmentation_version": self.SEGMENTATION_VERSION,
         }
