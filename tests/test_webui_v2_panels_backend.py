@@ -785,3 +785,87 @@ def test_canonical_person_id_resolution_guard_in_profile_and_fact_admin(tmp_path
             await rm.close_all()
 
     asyncio.run(_run())
+
+
+def test_legacy_single_pool_online_upgrade_to_dual_via_webui_rebuild(tmp_path: Path) -> None:
+    """Upgraded v1.x scope without dual_ready.json starts in single fallback and promotes live to dual on rebuild_all_vectors."""
+
+    async def _run() -> None:
+        from astrbot_plugin_memorix.memorix.services.ingest_service import IngestService
+
+        scope = "aiocqhttp:group:888"
+        rm = ScopeRuntimeManager(
+            base_data_dir=tmp_path / "data",
+            plugin_config={"retrieval": {"vector_pools": {"mode": "dual"}}},
+        )
+        ingest = IngestService(rm, rm.plugin_config)
+        admin = AdminService(rm)
+        bridge = PluginPageWebUIBridge(
+            runtime_manager=rm,
+            scope_resolver=lambda: scope,
+            admin_service=admin,
+        )
+        try:
+            rt = await rm.get_runtime(scope)
+            ctx = rt.context
+            assert ctx._dual_vector_pools_enabled() is False
+
+            await ingest.ingest_text(
+                scope_key=scope,
+                external_id="legacy-msg-1",
+                text="哈雷大小姐最喜欢优雅简洁的代码架构。",
+                source_type="legacy_chat",
+                entities=["哈雷大小姐", "代码架构"],
+                relations=[{"subject": "哈雷大小姐", "predicate": "偏好", "object": "代码架构"}],
+            )
+
+            # Before upgrade: self_check reports configured_mode="dual", effective_mode="single", ready=False
+            before_check = await bridge.dispatch(
+                method="POST",
+                url=f"/v1/runtime/self_check?force=true&_scope={scope}",
+                body={},
+            )
+            vp_before = before_check["vector_pools"]
+            assert vp_before["configured_mode"] == "dual"
+            assert vp_before["effective_mode"] == "single"
+            assert vp_before["ready"] is False
+            assert vp_before["single_pool"]["num_vectors"] >= 1
+
+            # Trigger online dual-pool rebuild from WebUI endpoint
+            rebuild_res = await bridge.dispatch(
+                method="POST",
+                url=f"/v1/admin/memory_runtime_admin?_scope={scope}",
+                body={"action": "rebuild_all_vectors", "payload": {}},
+            )
+            assert rebuild_res["success"] is True
+            assert rebuild_res["dual_activated"] is True
+            assert rebuild_res["effective_mode"] == "dual"
+            assert rebuild_res["paragraph_generated"] == 1
+            assert rebuild_res["entity_generated"] >= 2
+
+            # Manifest written & live context promoted without restart
+            manifest_path = Path(ctx.data_dir) / "vectors" / "dual_ready.json"
+            assert manifest_path.is_file()
+            assert ctx._dual_vector_pools_enabled() is True
+            assert ctx.retriever.paragraph_vector_store is ctx.paragraph_vector_store
+            assert ctx.retriever.graph_vector_store is ctx.graph_vector_store
+            assert ctx.retriever.config.vector_pools.mode == "dual"
+
+            # After upgrade: self_check reports effective_mode="dual", ready=True (hiding the upgrade banner!)
+            after_check = await bridge.dispatch(
+                method="POST",
+                url=f"/v1/runtime/self_check?force=true&_scope={scope}",
+                body={},
+            )
+            vp_after = after_check["vector_pools"]
+            assert vp_after["configured_mode"] == "dual"
+            assert vp_after["effective_mode"] == "dual"
+            assert vp_after["ready"] is True
+            assert vp_after["paragraph_pool"]["num_vectors"] == 1
+            assert vp_after["graph_pool"]["num_vectors"] >= 2
+        finally:
+            await bridge.close()
+            await admin.close()
+            await rm.close_all()
+
+    asyncio.run(_run())
