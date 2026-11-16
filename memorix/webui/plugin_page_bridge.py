@@ -4,14 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import importlib
+import inspect
+import json
+import os
+import re
+import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Set
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 from astrbot.api import logger
 
+from ..amemorix.context import activate_context_shims
 from ..amemorix.import_write_guard import ImportWriteGuardMiddleware
 from ..amemorix.routers.v1_router import router as v1_router
 from ..amemorix.services import ImportService, SummaryService
@@ -26,6 +34,48 @@ TASK_STATUS_CANCELED = "canceled"
 
 PLUGIN_PAGE_API_ROUTE = "webui/request"
 PLUGIN_PAGE_UPLOAD_ROUTE = "webui/upload"
+PLUGIN_PAGE_TICKET_UPLOAD_ROUTE = "webui/upload/<ticket_id>"
+PLUGIN_PAGE_BUNDLE_DOWNLOAD_ROUTE = "webui/bundle-download"
+
+UPLOAD_TICKET_TTL_SECONDS = 600.0
+MAX_ACTIVE_UPLOAD_TICKETS = 256
+MAX_BUNDLE_UPLOAD_BYTES = 256 * 1024 * 1024
+
+
+def _make_json_response(json_response_fn: Any, payload: Dict[str, Any], *, status_code: int = 200) -> Any:
+    if status_code == 200:
+        return json_response_fn(payload)
+    for kw in ("status_code", "status"):
+        try:
+            return json_response_fn(payload, **{kw: status_code})
+        except TypeError:
+            continue
+    return json_response_fn(payload)
+
+
+def _get_request_arg(request: Any, key: str, default: str = "") -> str:
+    for attr in ("args", "query"):
+        mapping = getattr(request, attr, None)
+        if mapping is not None and hasattr(mapping, "get"):
+            val = mapping.get(key)
+            if val is not None:
+                return str(val)
+    return default
+
+
+async def _read_upload_bounded(upload: Any, max_bytes: int) -> bytes:
+    reader = getattr(upload, "read", None)
+    if not callable(reader):
+        raise ValueError("无效的上传文件对象")
+    try:
+        chunk = reader(max_bytes + 1)
+    except TypeError:
+        chunk = reader()
+    if inspect.isawaitable(chunk):
+        chunk = await chunk
+    if isinstance(chunk, (bytes, bytearray, memoryview)):
+        return bytes(chunk)
+    return str(chunk or "").encode("utf-8")
 
 
 class _WebV1TaskManager:
@@ -56,10 +106,10 @@ class _WebV1TaskManager:
             return task
 
         # ImportTaskManager exposes an async get_task(), while the v1 router calls
-        # this compatibility manager synchronously. Keep a narrow read-only bridge
-        # for native import tasks created through enqueue_import_task().
-        task_key = str(task_id or "")
-        if task_key not in self._native_import_task_ids:
+        # this compatibility manager synchronously. Read directly from _tasks so both
+        # bridge-enqueued tasks and AdminService.import_admin tasks are queryable.
+        task_key = str(task_id or "").strip()
+        if not task_key:
             return None
         native_tasks = getattr(self.import_task_manager, "_tasks", {})
         native_task = native_tasks.get(task_key) if isinstance(native_tasks, dict) else None
@@ -74,10 +124,17 @@ class _WebV1TaskManager:
         mode = str(payload.get("mode", "text") or "text").strip().lower()
         body = payload.get("payload")
         options = payload.get("options") if isinstance(payload.get("options"), dict) else {}
-        import_options = {key: options[key] for key in ("source", "chat_log", "narrative_window_size", "narrative_overlap") if key in options}
+        import_options = {
+            key: options[key]
+            for key in ("source", "input_mode", "chat_log", "narrative_window_size", "narrative_overlap")
+            if key in options
+        }
         try:
             if mode == "text":
-                content = body if isinstance(body, str) else str(body or "")
+                if isinstance(body, (dict, list)):
+                    content = json.dumps(body, ensure_ascii=False)
+                else:
+                    content = body if isinstance(body, str) else str(body or "")
                 if not content.strip():
                     raise ValueError("content 不能为空")
                 return await self.import_task_manager.create_paste_task(
@@ -148,7 +205,8 @@ class _WebV1TaskManager:
             mode = str(payload.get("mode", "text"))
             body = payload.get("payload")
             options = payload.get("options") if isinstance(payload.get("options"), dict) else {}
-            result = await self.import_service.run_import(mode=mode, payload=body, options=options)
+            with activate_context_shims(self.ctx):
+                result = await self.import_service.run_import(mode=mode, payload=body, options=options)
             self.ctx.metadata_store.update_async_task(
                 task_id=task_id,
                 status=TASK_STATUS_SUCCEEDED,
@@ -187,13 +245,14 @@ class _WebV1TaskManager:
             source = str(payload.get("source", f"chat_summary:{session_id}"))
             context_length = int(payload.get("context_length", self.ctx.get_config("summarization.context_length", 50)))
             persist_messages = bool(payload.get("persist_messages", False))
-            result = await self.summary_service.import_from_transcript(
-                session_id=session_id,
-                messages=messages,
-                source=source,
-                context_length=context_length,
-                persist_messages=persist_messages,
-            )
+            with activate_context_shims(self.ctx):
+                result = await self.summary_service.import_from_transcript(
+                    session_id=session_id,
+                    messages=messages,
+                    source=source,
+                    context_length=context_length,
+                    persist_messages=persist_messages,
+                )
             status = TASK_STATUS_SUCCEEDED if result.get("success") else TASK_STATUS_FAILED
             self.ctx.metadata_store.update_async_task(
                 task_id=task_id,
@@ -221,6 +280,7 @@ class _EmbeddedWebUIApp:
     client: httpx.AsyncClient
     task_manager: _WebV1TaskManager
     import_task_manager: ImportTaskManager
+    owns_import_task_manager: bool = True
 
 
 class PluginPageWebUIBridge:
@@ -243,6 +303,7 @@ class PluginPageWebUIBridge:
         self.scope_resolver = scope_resolver
         self.admin_service = admin_service
         self._apps: Dict[str, _EmbeddedWebUIApp] = {}
+        self._upload_tickets: Dict[str, Dict[str, Any]] = {}
         self._lock = asyncio.Lock()
         self._closing = False
 
@@ -262,6 +323,18 @@ class PluginPageWebUIBridge:
             f"/{plugin_name}/{PLUGIN_PAGE_UPLOAD_ROUTE}", self.handle_upload,
             ["POST"], "Memorix file import",
         )
+        register_web_api(
+            f"/{plugin_name}/{PLUGIN_PAGE_TICKET_UPLOAD_ROUTE}",
+            self.handle_ticket_upload,
+            ["POST"],
+            "Memorix ticket-based file and bundle upload",
+        )
+        register_web_api(
+            f"/{plugin_name}/{PLUGIN_PAGE_BUNDLE_DOWNLOAD_ROUTE}",
+            self.handle_bundle_download,
+            ["GET"],
+            "Memorix bundle download",
+        )
 
     async def close(self) -> None:
         self._closing = True
@@ -272,10 +345,11 @@ class PluginPageWebUIBridge:
                 await app.client.aclose()
             except Exception as exc:
                 logger.warning("[memorix] embedded WebUI client close failed: %s", exc)
-            try:
-                await app.import_task_manager.stop()
-            except Exception as exc:
-                logger.warning("[memorix] embedded WebUI import task manager stop failed: %s", exc)
+            if app.owns_import_task_manager:
+                try:
+                    await app.import_task_manager.stop()
+                except Exception as exc:
+                    logger.warning("[memorix] embedded WebUI import task manager stop failed: %s", exc)
             try:
                 await app.task_manager.stop()
             except Exception as exc:
@@ -317,7 +391,8 @@ class PluginPageWebUIBridge:
             options = {key: request.query.get(key) for key in
                        ("source", "input_mode", "knowledge_type", "chat_log", "narrative_window_size", "narrative_overlap")
                        if key in request.query}
-            task = await app.task_manager.enqueue_upload_task([upload], options)
+            with activate_context_shims(app.task_manager.ctx):
+                task = await app.task_manager.enqueue_upload_task([upload], options)
             return json_response({"status": "ok", "data": task})
         except (TypeError, ValueError) as exc:
             return error_response(str(exc))
@@ -325,11 +400,355 @@ class PluginPageWebUIBridge:
             logger.warning("[memorix] file upload failed: %s", exc, exc_info=True)
             return error_response("上传失败，请检查插件日志", status_code=500)
 
+    def _evict_expired_tickets(self, now: Optional[float] = None) -> None:
+        current = time.monotonic() if now is None else float(now)
+        expired = [
+            tid
+            for tid, entry in self._upload_tickets.items()
+            if float(entry.get("expires_at", 0.0)) <= current
+        ]
+        for tid in expired:
+            self._upload_tickets.pop(tid, None)
+
+    def _resolve_scope_from_url(self, url: str) -> str:
+        normalized = self._normalize_url(url)
+        _, scope_override = self._extract_scope_override(normalized)
+        return self._resolve_scope_key(scope_override)
+
+    def create_upload_ticket(self, *, scope_key: str, body: Any) -> Dict[str, Any]:
+        if not isinstance(body, dict):
+            raise ValueError("upload ticket payload must be a JSON object")
+        kind = str(body.get("kind") or "").strip().lower()
+        if kind not in {"import", "bundle"}:
+            raise ValueError(f"unsupported upload ticket kind: {kind or '<empty>'}")
+        raw_options = body.get("options")
+        if raw_options is None:
+            options: Dict[str, Any] = {}
+        elif isinstance(raw_options, dict):
+            options = dict(raw_options)
+        else:
+            raise ValueError("upload ticket options must be a JSON object")
+
+        now = time.monotonic()
+        self._evict_expired_tickets(now)
+        while len(self._upload_tickets) >= MAX_ACTIVE_UPLOAD_TICKETS:
+            oldest_key = min(
+                self._upload_tickets,
+                key=lambda key: float(self._upload_tickets[key].get("expires_at", 0.0)),
+            )
+            self._upload_tickets.pop(oldest_key, None)
+
+        ticket_id = uuid.uuid4().hex
+        self._upload_tickets[ticket_id] = {
+            "ticket_id": ticket_id,
+            "scope_key": str(scope_key or "").strip() or "default",
+            "kind": kind,
+            "options": options,
+            "expires_at": now + UPLOAD_TICKET_TTL_SECONDS,
+        }
+        return {"success": True, "ticket_id": ticket_id}
+
+    def _consume_upload_ticket(self, ticket_id: str) -> Optional[Dict[str, Any]]:
+        now = time.monotonic()
+        key = str(ticket_id or "").strip()
+        ticket = self._upload_tickets.pop(key, None) if key else None
+        self._evict_expired_tickets(now)
+        if ticket is None or float(ticket.get("expires_at", 0.0)) <= now:
+            return None
+        return ticket
+
+    async def handle_ticket_upload(self, ticket_id: str = ""):
+        web_api = importlib.import_module("astrbot.api.web")
+
+        json_response = web_api.json_response
+        request = web_api.request
+        upload_cls = getattr(web_api, "PluginUploadFile", None)
+
+        try:
+            resolved_ticket_id = str(
+                ticket_id
+                or (getattr(request, "path_params", None) or {}).get("ticket_id", "")
+                or ""
+            ).strip()
+            if not resolved_ticket_id:
+                raw_path = str(getattr(request, "path", "") or "")
+                if "/webui/upload/" in raw_path:
+                    resolved_ticket_id = raw_path.rsplit("/webui/upload/", 1)[-1].strip("/")
+
+            ticket = self._consume_upload_ticket(resolved_ticket_id)
+            if ticket is None:
+                return _make_json_response(
+                    json_response,
+                    {"status": "error", "message": "上传凭证无效或已过期"},
+                    status_code=400,
+                )
+
+            scope_key = str(ticket["scope_key"])
+            kind = str(ticket["kind"])
+            options = dict(ticket.get("options") or {})
+            app = await self._get_app(scope_key)
+
+            headers = getattr(request, "headers", None)
+            content_length = headers.get("content-length") if headers is not None and hasattr(headers, "get") else None
+
+            files = await request.files()
+            upload = files.get("file") if hasattr(files, "get") else None
+            if upload is None or (
+                upload_cls is not None
+                and not isinstance(upload, upload_cls)
+                and not callable(getattr(upload, "read", None))
+            ):
+                return _make_json_response(
+                    json_response,
+                    {"status": "error", "message": "请选择上传文件"},
+                    status_code=400,
+                )
+
+            if kind == "import":
+                limits = app.import_task_manager.get_import_limits()
+                max_size = int(limits.get("max_file_size_bytes", 20 * 1024 * 1024))
+                allowed_exts = {
+                    str(ext).lower()
+                    for ext in (limits.get("allowed_extensions") or [".txt", ".md", ".json", ".jsonl"])
+                }
+                if content_length is not None:
+                    parsed_len = int(content_length)
+                    if parsed_len < 0 or parsed_len > max_size + 65536:
+                        return _make_json_response(
+                            json_response,
+                            {"status": "error", "message": "文件超过上传大小限制"},
+                            status_code=413,
+                        )
+
+                raw_filename = str(getattr(upload, "filename", "") or "")
+                suffix = Path(raw_filename).suffix.lower()
+                custom_name = str(options.get("name") or "").strip()
+                if custom_name:
+                    custom_suffix = Path(custom_name).suffix.lower()
+                    if not custom_suffix and suffix:
+                        custom_name = f"{custom_name}{suffix}"
+                        custom_suffix = suffix
+                    if not suffix:
+                        suffix = custom_suffix
+                if allowed_exts and suffix not in allowed_exts:
+                    return _make_json_response(
+                        json_response,
+                        {"status": "error", "message": f"不支持的文件后缀: {suffix or '(none)'}"},
+                        status_code=400,
+                    )
+
+                upload_target = upload
+                if custom_name and Path(custom_name).suffix.lower() in allowed_exts:
+                    class _NamedUploadProxy:
+                        def __init__(self, inner: Any, filename: str) -> None:
+                            self._inner = inner
+                            self.filename = filename
+
+                        def read(self, *args: Any, **kwargs: Any) -> Any:
+                            return self._inner.read(*args, **kwargs)
+
+                    upload_target = _NamedUploadProxy(upload, custom_name)
+
+                with activate_context_shims(app.server.plugin):
+                    task = await app.task_manager.enqueue_upload_task([upload_target], options)
+                return _make_json_response(json_response, {"status": "ok", "data": task})
+
+            if kind == "bundle":
+                raw_filename = Path(str(getattr(upload, "filename", "") or "")).name
+                if not raw_filename.lower().endswith(".amembundle"):
+                    return _make_json_response(
+                        json_response,
+                        {"status": "error", "message": "记忆包必须使用 .amembundle 扩展名"},
+                        status_code=400,
+                    )
+                if content_length is not None:
+                    parsed_len = int(content_length)
+                    if parsed_len < 0 or parsed_len > MAX_BUNDLE_UPLOAD_BYTES + 65536:
+                        return _make_json_response(
+                            json_response,
+                            {"status": "error", "message": "记忆包超过 256 MiB 上传大小限制"},
+                            status_code=413,
+                        )
+
+                raw_bytes = await _read_upload_bounded(upload, MAX_BUNDLE_UPLOAD_BYTES)
+                if not raw_bytes:
+                    return _make_json_response(
+                        json_response,
+                        {"status": "error", "message": "上传的记忆包文件为空"},
+                        status_code=400,
+                    )
+                if len(raw_bytes) > MAX_BUNDLE_UPLOAD_BYTES:
+                    return _make_json_response(
+                        json_response,
+                        {"status": "error", "message": "记忆包超过 256 MiB 上传大小限制"},
+                        status_code=413,
+                    )
+
+                stem = raw_filename[: -len(".amembundle")]
+                safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-") or "bundle"
+                saved_name = f"{safe_stem}-{uuid.uuid4().hex[:8]}.amembundle"
+                bundles_dir = (Path(app.server.plugin.data_dir) / "imports" / "bundles").resolve()
+                bundles_dir.mkdir(parents=True, exist_ok=True)
+                saved_path = (bundles_dir / saved_name).resolve()
+                if saved_path.parent != bundles_dir:
+                    return _make_json_response(
+                        json_response,
+                        {"status": "error", "message": "记忆包目标路径越界"},
+                        status_code=400,
+                    )
+
+                tmp_path = bundles_dir / f".{saved_name}.{uuid.uuid4().hex[:8]}.tmp"
+                try:
+                    tmp_path.write_bytes(raw_bytes)
+                    os.replace(tmp_path, saved_path)
+                finally:
+                    if tmp_path.exists():
+                        tmp_path.unlink(missing_ok=True)
+
+                admin_svc = self.admin_service
+                temp_admin_svc = False
+                if admin_svc is None:
+                    from ..services.admin_service import AdminService
+
+                    admin_svc = AdminService(self.runtime_manager)
+                    temp_admin_svc = True
+
+                try:
+                    with activate_context_shims(app.server.plugin):
+                        inspect_res = await admin_svc.bundle_admin(
+                            scope_key=scope_key,
+                            action="inspect",
+                            path=saved_name,
+                        )
+                except Exception as exc:
+                    saved_path.unlink(missing_ok=True)
+                    return _make_json_response(
+                        json_response,
+                        {"status": "error", "message": str(exc)},
+                        status_code=400,
+                    )
+                finally:
+                    if temp_admin_svc:
+                        await admin_svc.close()
+
+                if not isinstance(inspect_res, dict) or not inspect_res.get("success"):
+                    saved_path.unlink(missing_ok=True)
+                    err_msg = str((inspect_res or {}).get("error") or "记忆包校验失败")
+                    return _make_json_response(
+                        json_response,
+                        {"status": "error", "message": err_msg},
+                        status_code=400,
+                    )
+
+                return _make_json_response(
+                    json_response,
+                    {
+                        "status": "ok",
+                        "data": {
+                            "success": True,
+                            "path": saved_name,
+                            "file_name": saved_name,
+                            "inspect": inspect_res,
+                        },
+                    },
+                )
+
+            return _make_json_response(
+                json_response,
+                {"status": "error", "message": f"不支持的上传类型: {kind}"},
+                status_code=400,
+            )
+        except (TypeError, ValueError) as exc:
+            return _make_json_response(
+                json_response,
+                {"status": "error", "message": str(exc)},
+                status_code=400,
+            )
+        except Exception as exc:
+            logger.warning("[memorix] ticket upload failed: %s", exc, exc_info=True)
+            return _make_json_response(
+                json_response,
+                {"status": "error", "message": "上传失败，请检查插件日志"},
+                status_code=500,
+            )
+
+    async def handle_bundle_download(self):
+        web_api = importlib.import_module("astrbot.api.web")
+
+        json_response = web_api.json_response
+        request = web_api.request
+        file_resp_fn = getattr(web_api, "file_response", None)
+
+        try:
+            raw_scope = _get_request_arg(request, "_scope", "")
+            raw_file_name = _get_request_arg(request, "file_name", "").strip()
+            if (
+                not raw_file_name
+                or "/" in raw_file_name
+                or "\\" in raw_file_name
+                or raw_file_name in {".", ".."}
+                or Path(raw_file_name).name != raw_file_name
+                or not raw_file_name.lower().endswith(".amembundle")
+            ):
+                return _make_json_response(
+                    json_response,
+                    {"status": "error", "message": "非法的记忆包文件名"},
+                    status_code=400,
+                )
+
+            scope_key = self._resolve_scope_key(raw_scope)
+            app = await self._get_app(scope_key)
+            bundles_dir = (Path(app.server.plugin.data_dir) / "imports" / "bundles").resolve()
+            bundles_dir.mkdir(parents=True, exist_ok=True)
+            candidate = bundles_dir / raw_file_name
+            if candidate.is_symlink():
+                return _make_json_response(
+                    json_response,
+                    {"status": "error", "message": "不允许下载符号链接文件"},
+                    status_code=400,
+                )
+            resolved_path = candidate.resolve()
+            if resolved_path.parent != bundles_dir or resolved_path.suffix.lower() != ".amembundle":
+                return _make_json_response(
+                    json_response,
+                    {"status": "error", "message": "记忆包路径超出允许目录"},
+                    status_code=400,
+                )
+            if not resolved_path.is_file():
+                return _make_json_response(
+                    json_response,
+                    {"status": "error", "message": f"记忆包不存在: {raw_file_name}"},
+                    status_code=404,
+                )
+
+            if callable(file_resp_fn):
+                return file_resp_fn(str(resolved_path), filename=resolved_path.name)
+
+            from fastapi.responses import FileResponse
+
+            return FileResponse(
+                str(resolved_path),
+                filename=resolved_path.name,
+                media_type="application/octet-stream",
+            )
+        except Exception as exc:
+            logger.warning("[memorix] bundle download failed: %s", exc, exc_info=True)
+            return _make_json_response(
+                json_response,
+                {"status": "error", "message": str(exc)},
+                status_code=500,
+            )
+
     async def dispatch(self, *, method: str, url: str, body: Any = None) -> Any:
         method = self._normalize_method(method)
         target = self._normalize_url(url)
         if self._is_scope_options_request(target):
             return self._scope_options()
+        if urlsplit(target).path == "/v1/upload-tickets":
+            if method != "POST":
+                raise ValueError("upload-tickets only supports POST")
+            scope_key = self._resolve_scope_from_url(url)
+            return self.create_upload_ticket(scope_key=scope_key, body=body)
 
         target, scope_override = self._extract_scope_override(target)
         scope_key = self._resolve_scope_key(scope_override)
@@ -339,7 +758,8 @@ class PluginPageWebUIBridge:
         if method != "GET" and body is not None:
             request_kwargs["json"] = body
 
-        response = await app.client.request(method, target, **request_kwargs)
+        with activate_context_shims(app.task_manager.ctx):
+            response = await app.client.request(method, target, **request_kwargs)
         content_type = response.headers.get("content-type", "")
         if response.status_code >= 400:
             message = response.text or response.reason_phrase or f"HTTP {response.status_code}"
@@ -454,34 +874,43 @@ class PluginPageWebUIBridge:
 
     async def _create_app(self, scope_key: str) -> _EmbeddedWebUIApp:
         runtime = await self.runtime_manager.get_runtime(scope_key)
-        server = MemorixServer(plugin_instance=runtime.context)
-        app = server.app
-        app.state.context = runtime.context
-        app.state.scope_key = scope_key
-        if self.admin_service is not None:
-            app.state.admin_service = self.admin_service
-        if not bool(getattr(app.state, "_memorix_v1_router_registered", False)):
-            app.include_router(v1_router)
-            app.state._memorix_v1_router_registered = True
-        if not bool(getattr(app.state, "_memorix_import_guard_registered", False)):
-            app.add_middleware(ImportWriteGuardMiddleware)
-            app.state._memorix_import_guard_registered = True
+        with activate_context_shims(runtime.context):
+            server = MemorixServer(plugin_instance=runtime.context)
+            app = server.app
+            app.state.context = runtime.context
+            app.state.scope_key = scope_key
+            app.state.webui_bridge = self
+            if self.admin_service is not None:
+                app.state.admin_service = self.admin_service
+            if not bool(getattr(app.state, "_memorix_v1_router_registered", False)):
+                app.include_router(v1_router)
+                app.state._memorix_v1_router_registered = True
+            if not bool(getattr(app.state, "_memorix_import_guard_registered", False)):
+                app.add_middleware(ImportWriteGuardMiddleware)
+                app.state._memorix_import_guard_registered = True
 
-        import_task_manager = ImportTaskManager(runtime.context)
-        await import_task_manager.start()
-        app.state.import_task_manager = import_task_manager
+            shared_import_getter = getattr(self.admin_service, "_import_manager", None)
+            if callable(shared_import_getter):
+                import_task_manager = await shared_import_getter(scope_key, runtime.context)
+                owns_import_task_manager = False
+            else:
+                import_task_manager = ImportTaskManager(runtime.context)
+                await import_task_manager.start()
+                owns_import_task_manager = True
+            app.state.import_task_manager = import_task_manager
 
-        task_manager = _WebV1TaskManager(runtime.context, import_task_manager=import_task_manager)
-        await task_manager.start()
-        app.state.task_manager = task_manager
+            task_manager = _WebV1TaskManager(runtime.context, import_task_manager=import_task_manager)
+            await task_manager.start()
+            app.state.task_manager = task_manager
 
-        transport = httpx.ASGITransport(app=app)
-        client = httpx.AsyncClient(transport=transport, base_url="http://memorix.local")
-        logger.info("[memorix] embedded WebUI app ready: scope=%s", scope_key)
-        return _EmbeddedWebUIApp(
-            scope_key=scope_key,
-            server=server,
-            client=client,
-            task_manager=task_manager,
-            import_task_manager=import_task_manager,
-        )
+            transport = httpx.ASGITransport(app=app)
+            client = httpx.AsyncClient(transport=transport, base_url="http://memorix.local")
+            logger.info("[memorix] embedded WebUI app ready: scope=%s", scope_key)
+            return _EmbeddedWebUIApp(
+                scope_key=scope_key,
+                server=server,
+                client=client,
+                task_manager=task_manager,
+                import_task_manager=import_task_manager,
+                owns_import_task_manager=owns_import_task_manager,
+            )
