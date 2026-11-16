@@ -791,3 +791,197 @@ def test_message_api_shim_reads_transcript_window(tmp_path):
         assert identity.group_id == "g1"
     finally:
         store.close()
+
+
+def test_v23_pickled_metadata_migrates_cleanly_on_connect_and_bootstrap(tmp_path):
+    """回归生产日志：Schema 23 遗留 pickle BLOB (0x80) 在回填事实与 bootstrap 启动迁移中均零报错转换。"""
+    import asyncio
+    import json
+    import pickle
+
+    from astrbot_plugin_memorix.memorix.amemorix.bootstrap import build_context
+    from astrbot_plugin_memorix.memorix.amemorix.settings import DEFAULT_CONFIG, AppSettings, _deep_merge
+
+    # 1. 验证直接 MetadataStore.connect() 对含 0x80 pickle BLOB 的 v23 库执行 backfill_person_fact_claims 不崩溃
+    direct_dir = tmp_path / "direct_meta"
+    direct_dir.mkdir(parents=True, exist_ok=True)
+    seed_store = MetadataStore(direct_dir)
+    seed_store.connect()
+    seed_store.close()
+
+    conn = sqlite3.connect(direct_dir / "metadata.db")
+    try:
+        conn.execute("DELETE FROM schema_migrations WHERE version > 23")
+        pickled_meta = pickle.dumps(
+            {
+                "person_id": "aiocqhttp:10001",
+                "tags": {"legacy_set_a", "legacy_set_b"},
+                "person_fact": {
+                    "fact_key": "居住城市",
+                    "value": "上海",
+                    "section": "basic_facts",
+                },
+            },
+            protocol=4,
+        )
+        assert pickled_meta[0] == 0x80
+        conn.execute(
+            """
+            INSERT INTO paragraphs(hash, content, created_at, updated_at, metadata, source, word_count)
+            VALUES (?, ?, 100.0, 100.0, ?, ?, 5)
+            """,
+            ("pf_legacy_1", "用户住在上海", sqlite3.Binary(pickled_meta), "person_fact:aiocqhttp:10001"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    migrated_store = MetadataStore(direct_dir)
+    migrated_store.connect()
+    try:
+        assert migrated_store.get_schema_version() == SCHEMA_VERSION
+        para = migrated_store.get_paragraph("pf_legacy_1")
+        assert para is not None
+        assert para["metadata"]["person_id"] == "aiocqhttp:10001"
+        assert sorted(para["metadata"]["tags"]) == ["legacy_set_a", "legacy_set_b"]
+        raw_col = migrated_store._conn.execute(
+            "SELECT typeof(metadata), metadata FROM paragraphs WHERE hash = 'pf_legacy_1'"
+        ).fetchone()
+        assert raw_col[0] == "text"
+        assert isinstance(json.loads(raw_col[1]), dict)
+    finally:
+        migrated_store.close()
+
+    # 2. 验证完整 build_context 同时迁移 SQLite pickle BLOB + vectors_metadata.pkl + graph_metadata.pkl
+    scope_dir = tmp_path / "legacy_scope"
+    (scope_dir / "metadata").mkdir(parents=True, exist_ok=True)
+    (scope_dir / "vectors").mkdir(parents=True, exist_ok=True)
+    (scope_dir / "graph").mkdir(parents=True, exist_ok=True)
+
+    s2 = MetadataStore(scope_dir / "metadata")
+    s2.connect()
+    s2.close()
+    conn2 = sqlite3.connect(scope_dir / "metadata" / "metadata.db")
+    try:
+        conn2.execute("DELETE FROM schema_migrations WHERE version > 23")
+        conn2.execute(
+            """
+            INSERT INTO paragraphs(hash, content, created_at, updated_at, metadata, source, word_count)
+            VALUES ('p_blob', '旧版二进制元数据段落', 50.0, 50.0, ?, 'chat:group_1', 6)
+            """,
+            (sqlite3.Binary(pickle.dumps({"chat_id": "group_1", "legacy": True}, protocol=4)),),
+        )
+        conn2.commit()
+    finally:
+        conn2.close()
+
+    with (scope_dir / "vectors" / "vectors_metadata.pkl").open("wb") as vf:
+        pickle.dump(
+            {
+                "dimension": 768,
+                "quantization_type": "int8",
+                "is_trained": False,
+                "vector_norm": "l2",
+                "deleted_ids": [],
+                "known_hashes": [],
+            },
+            vf,
+            protocol=4,
+        )
+    with (scope_dir / "graph" / "graph_metadata.pkl").open("wb") as gf:
+        pickle.dump(
+            {
+                "nodes": ["上海"],
+                "node_to_idx": {"上海": 0},
+                "node_attrs": {},
+                "matrix_format": "csr",
+                "total_nodes_added": 1,
+                "total_edges_added": 0,
+                "total_nodes_deleted": 0,
+                "total_edges_deleted": 0,
+                "edge_hash_map": {(0, 0): {"rel_1"}},
+            },
+            gf,
+            protocol=4,
+        )
+
+    cfg = _deep_merge(DEFAULT_CONFIG, {"storage": {"data_dir": str(scope_dir)}, "embedding": {"enabled": False}})
+    ctx = build_context(AppSettings(config=cfg))
+    try:
+        assert ctx.vector_store.dimension == 768
+        assert (scope_dir / "vectors" / "vectors_metadata.json").exists()
+        assert (scope_dir / "graph" / "graph_metadata.json").exists()
+        p_blob = ctx.metadata_store.get_paragraph("p_blob")
+        assert p_blob is not None and p_blob["metadata"]["chat_id"] == "group_1"
+    finally:
+        asyncio.run(ctx.close())
+
+
+def test_decode_metadata_rejects_unsafe_pickle_globals():
+    """安全边界：_decode_metadata 绝不允许反序列化任意全局对象（如 os.system）。"""
+    import os
+    import pickle
+
+    class _Exploit:
+        def __reduce__(self):
+            return (os.system, ("echo should_never_run",))
+
+    malicious_blob = pickle.dumps({"bad": _Exploit()}, protocol=4)
+    with pytest.raises(UnicodeDecodeError):
+        MetadataStore._decode_metadata(malicious_blob)
+
+
+def test_embedding_401_fails_fast_without_retries_and_surfaces_auth_message():
+    """回归生产日志：401 Invalid token 不得无意义重试 2s+4s，且自检报告必须明确指出鉴权失败。"""
+    import asyncio
+
+    from astrbot_plugin_memorix.memorix.core.embedding.api_adapter import EmbeddingAPIAdapter
+    from astrbot_plugin_memorix.memorix.core.utils.runtime_self_check import run_embedding_runtime_self_check
+
+    class _FakeAuthError(Exception):
+        def __init__(self, message: str, status_code: int = 401) -> None:
+            super().__init__(message)
+            self.status_code = status_code
+
+    class _FakeEmbeddingsAPI:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def create(self, **kwargs):
+            self.calls += 1
+            raise _FakeAuthError(
+                "Error code: 401 - {'error': {'message': 'Invalid token', 'type': 'new_api_error'}}",
+                status_code=401,
+            )
+
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.embeddings = _FakeEmbeddingsAPI()
+
+    adapter = EmbeddingAPIAdapter(
+        default_dimension=1024,
+        base_url="http://192.168.5.29:3000",
+        api_key="invalid-key",
+        openai_model="Qwen3-Embedding-8B",
+        max_retries=3,
+        retry_config={"max_attempts": 3, "min_wait_seconds": 2.0, "max_wait_seconds": 5.0},
+    )
+    adapter.set_embedding_dimension(1024)
+    fake_client = _FakeClient()
+    adapter._client = fake_client  # type: ignore[assignment]
+
+    report = asyncio.run(
+        run_embedding_runtime_self_check(
+            config={"embedding": {"dimension": 1024}, "retrieval": {"vector_pools": {"mode": "dual"}}},
+            vector_store=None,
+            embedding_manager=adapter,
+        )
+    )
+    assert report["ok"] is False
+    assert report["code"] == "embedding_probe_failed"
+    assert "API 鉴权失败" in report["message"]
+    assert "Invalid token" in report["message"]
+    assert "non-finite" not in report["message"]
+    assert fake_client.embeddings.calls == 1
+    assert adapter._dimensions_support_detected is False
+

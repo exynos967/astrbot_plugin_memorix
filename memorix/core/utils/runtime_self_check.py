@@ -195,7 +195,18 @@ async def run_embedding_runtime_self_check(
             p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_params.values()
         )
         encoded = await (encode_fn(sample_text, use_cache=False) if accepts_use_cache else encode_fn(sample_text))
-        encoded_array = _normalize_encoded_vector(encoded)
+        try:
+            encoded_array = _normalize_encoded_vector(encoded)
+        except ValueError as vec_exc:
+            last_err = str(getattr(embedding_manager, "last_error", "") or "").strip()
+            if last_err:
+                lowered = last_err.lower()
+                if any(token in lowered for token in ("401", "403", "invalid token", "unauthorized", "authentication")):
+                    raise RuntimeError(
+                        f"API 鉴权失败（请检查 embedding.openapi.api_key 是否有效）: {last_err}"
+                    ) from vec_exc
+                raise RuntimeError(last_err) from vec_exc
+            raise
         encoded_dimension = int(encoded_array.shape[0])
     except Exception as exc:
         elapsed_ms = (time.perf_counter() - start) * 1000.0

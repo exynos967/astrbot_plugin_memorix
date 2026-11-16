@@ -24,6 +24,32 @@ from src.common.logger import get_logger
 logger = get_logger("A_Memorix.EmbeddingAPIAdapter")
 
 
+def _extract_http_status_code(exc: BaseException) -> Optional[int]:
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return status
+    resp = getattr(exc, "response", None)
+    resp_status = getattr(resp, "status_code", None)
+    if isinstance(resp_status, int):
+        return resp_status
+    return None
+
+
+def _is_auth_embedding_error(exc: BaseException) -> bool:
+    status = _extract_http_status_code(exc)
+    if status in {401, 403}:
+        return True
+    text = str(exc or "").lower()
+    return "error code: 401" in text or "error code: 403" in text or "invalid token" in text
+
+
+def _is_non_retryable_embedding_error(exc: BaseException) -> bool:
+    if _is_auth_embedding_error(exc):
+        return True
+    status = _extract_http_status_code(exc)
+    return status in {400, 404, 422}
+
+
 def _normalize_openai_base_url(raw: Optional[str]) -> str:
     """Normalize OpenAI-compatible base URL (append /v1 when omitted)."""
     text = str(raw or "").strip().rstrip("/")
@@ -117,7 +143,8 @@ class EmbeddingAPIAdapter:
         self.model_name = str(model_name or "auto")
         self.dimension_request_mode = self._normalize_dimension_request_mode(dimension_request_mode)
         self.timeout_seconds = float(timeout_seconds or 30.0)
-        self.max_retries = max(1, int(max_retries if max_retries is not None else 3))
+        raw_max_retries = 3 if max_retries is None else int(max_retries)
+        self.max_retries = max(0, raw_max_retries)
         self.extra_kwargs = kwargs
 
         self.base_url = _normalize_openai_base_url(base_url)
@@ -130,8 +157,11 @@ class EmbeddingAPIAdapter:
             self.openai_model = ""
 
         self.retry_config = retry_config or {}
-        configured_attempts = int(self.retry_config.get("max_attempts", self.max_retries))
-        self.max_attempts = max(1, min(configured_attempts, self.max_retries))
+        if self.max_retries == 0:
+            self.max_attempts = 1
+        else:
+            configured_attempts = int(self.retry_config.get("max_attempts", self.max_retries))
+            self.max_attempts = max(1, min(configured_attempts, self.max_retries))
         self.max_wait_seconds = max(0.1, min(5.0, float(self.retry_config.get("max_wait_seconds", 30))))
         self.min_wait_seconds = max(
             0.1,
@@ -144,6 +174,7 @@ class EmbeddingAPIAdapter:
         self._supports_dimensions: bool = self.dimension_request_mode != "never"
         self._dimensions_support_detected: bool = self.dimension_request_mode == "never"
         self._client: Optional[AsyncOpenAI] = None
+        self.last_error: Optional[str] = None
 
         self._total_encoded = 0
         self._total_errors = 0
@@ -207,16 +238,22 @@ class EmbeddingAPIAdapter:
         for attempt in range(1, self.max_attempts + 1):
             try:
                 resp = await client.embeddings.create(**payload)
-                return _coerce_embedding_rows(resp)
+                rows = _coerce_embedding_rows(resp)
+                self.last_error = None
+                return rows
             except AttributeError as exc:
                 try:
-                    return await self._request_embeddings_raw(payload)
+                    rows = await self._request_embeddings_raw(payload)
+                    self.last_error = None
+                    return rows
                 except Exception as raw_exc:
                     last_error = raw_exc
                     logger.debug("OpenAI SDK embedding parse failed before raw fallback: %s", exc)
             except Exception as exc:
                 last_error = exc
 
+            if last_error is not None and _is_non_retryable_embedding_error(last_error):
+                break
             if attempt >= self.max_attempts:
                 break
             wait_s = min(
@@ -233,6 +270,7 @@ class EmbeddingAPIAdapter:
             await asyncio.sleep(wait_s)
 
         assert last_error is not None
+        self.last_error = str(last_error)
         raise last_error
 
     async def _request_embeddings_raw(self, payload: dict) -> List[List[float]]:
@@ -268,6 +306,9 @@ class EmbeddingAPIAdapter:
                 self._dimension = len(probed[0])
                 self._dimension_detected = True
         except Exception as exc:
+            if _is_auth_embedding_error(exc):
+                self.last_error = str(exc)
+                raise
             logger.debug("Dimensions param probe failed, treat as unsupported: %s", exc)
             self._supports_dimensions = False
         self._dimensions_support_detected = True
@@ -282,7 +323,13 @@ class EmbeddingAPIAdapter:
             self._dimension_detected = True
             return self.default_dimension
 
-        supports = await self._detect_dimensions_support()
+        try:
+            supports = await self._detect_dimensions_support()
+        except Exception as exc:
+            logger.warning("Dimension detection aborted due to authentication error, fallback to default: %s", exc)
+            self._dimension = self.default_dimension
+            self._dimension_detected = True
+            return self.default_dimension
         if self._dimension_detected and self._dimension is not None:
             return self._dimension
 
@@ -457,7 +504,13 @@ class EmbeddingAPIAdapter:
             return out[0] if single else out
 
         if not self._dimensions_support_detected:
-            await self._detect_dimensions_support()
+            try:
+                await self._detect_dimensions_support()
+            except Exception as exc:
+                self._total_errors += len(input_texts)
+                logger.error("Embedding authentication failed: %s", exc)
+                nan_arr = np.full((len(input_texts), target_dim), np.nan, dtype=np.float32)
+                return nan_arr[0] if single else nan_arr
 
         use_batch = max(1, int(batch_size or self.batch_size))
         semaphore = asyncio.Semaphore(self.max_concurrent)
