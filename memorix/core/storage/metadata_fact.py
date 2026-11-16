@@ -1048,13 +1048,19 @@ class MetadataFactMixin:
             """,
             (token, point, point),
         )
-        return int(rows[0]["total"])
+        return int(rows[0]["total"] if rows else 0)
 
-    def list_uncertain_person_fact_claims(self, person_id: str, *, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    def list_uncertain_person_fact_claims(
+        self,
+        person_id: str,
+        *,
+        effective_at: Optional[float] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
         """读取人物有效的未确认事实，可限制用于画像候选的记录数。"""
 
         token = _required_token("person_id", person_id)
-        point = datetime.now().timestamp()
+        point = float(effective_at) if effective_at is not None else datetime.now().timestamp()
         sql = """
             SELECT * FROM fact_claims
             WHERE scope_type = 'person' AND scope_id = ? AND status = 'active'

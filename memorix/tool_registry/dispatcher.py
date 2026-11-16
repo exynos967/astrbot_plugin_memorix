@@ -138,7 +138,11 @@ def build_default_admin_dispatcher() -> AdminContractDispatcher:
         AdminToolRegistration(
             name="memory_episode_admin",
             admin_method="episode_admin",
-            allowed_actions=_upstream_actions("memory_episode_admin", "process_pending"),
+            allowed_actions=_upstream_actions(
+                "memory_episode_admin",
+                "process_pending",
+                "discard_migration_rebuilds",
+            ),
         )
     )
     dispatcher.register(

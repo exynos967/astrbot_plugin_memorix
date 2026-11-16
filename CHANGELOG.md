@@ -25,7 +25,14 @@
 - **加固后台写入跨取消护航与有界优雅停机排空**：引入 `cancellation_safe_to_thread` 与 `cancel_and_wait_for_tasks`，覆盖 `AppContext.save_all()`、`TaskManager`、`ImportTaskManager`、`FeedbackService`、`PersonFactWritebackService` 及内核运行时服务；若后台同步写盘在停机超时窗口内尚未排空，保留 worker 引用、临时目录与 `ScopeRuntime` 句柄直至安全落盘，杜绝关闭底层连接导致的半写异常；同时为人物事实提取增加有界 LRU 缓存（跳过异常与截断 JSON）及总结严格 `facts` 校验。
 - **修复事实撤回单调时间戳与向量索引后台回填**：确保同一毫秒内快速先增后撤不会因时间戳相同被误判恢复，补齐 `runtime_admin` 向量重建与缺失回填链路。
 - **修复内嵌 WebUI 沙箱兼容与跨作用域串数据缺陷**：引入无查询串上传凭据（`POST /v1/upload-tickets` + `POST /{plugin}/webui/upload/<ticket_id>`）修复 AstrBot `normalizePluginEndpoint` 上传报错；新增知识包原生下载（`GET /{plugin}/webui/bundle-download`）与 `read_chunk` 分块回退、图片二进制 `data_url` 沙箱读取；修复来源列表/批量删除漏传 `_scope`、人物覆盖写入非规范 ID、粘贴 JSON 聊天记录被 Python `repr` 破坏、图谱暗色弹窗与节点切边失灵、检索 `aggregate`/`entity` 丢结果等问题。
-- **自动化验证**：新增并通过全套离线 Mock 单元与集成测试（共 247 项后端测试全部通过，`vue-tsc --noEmit` 零错误通过并完成 `pages/memorix/` 生产包构建）。
+- **自动化验证**：新增并通过全套离线 Mock 单元与集成测试（共 258 项后端测试全部通过，`vue-tsc --noEmit` 零错误通过并完成 `pages/memorix/` 生产包构建）。
+
+## v1.4.0
+
+- 对齐 A_memorix 最新人物事实语义：新增未确认事实计数/候选查询，画像注入显式标注未确认信息，并保留上下文相关候选。
+- Episode 来源重建阻塞判断改为批量查询，已有物化 Episode 的来源不再被历史失败任务错误阻塞。
+- `memory_episode_admin` 新增 `discard_migration_backfill`（默认 dry-run），清理 schema 19/21 迁移遗留任务时不阻塞事件循环。
+- 保持 AstrBot 4.26+ 公开 API 与现有 schema 23 兼容；未引入破坏性数据迁移。
 
 ## v1.3.0
 

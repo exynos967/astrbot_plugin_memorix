@@ -32,6 +32,7 @@ from ..engine.host_shims.embedding_shim import (
 from .chat_migration_service import AstrBotChatMigrationService
 from .fact_admin_service import FactAdminService, resolve_canonical_person_id
 from .graph_mutation_service import GraphMutationService
+from .profile_service import ProfileService
 
 
 class _TuningPluginAdapter:
@@ -403,7 +404,7 @@ class AdminService:
                 )
                 pending_rows = ctx.metadata_store.fetch_episode_pending_batch(limit=1, max_retry=self._int(kwargs.get("max_retry"), 3, 0, 50))
                 return {"success": True, **summary, "has_pending_paragraphs": bool(pending_rows)}
-            if act == "discard_migration_backfill":
+            if act in {"discard_migration_backfill", "discard_migration_rebuilds"}:
                 result = await asyncio.to_thread(
                     ctx.metadata_store.discard_migration_episode_rebuilds,
                     dry_run=bool(kwargs.get("dry_run", True)),
@@ -487,13 +488,24 @@ class AdminService:
                 except (TypeError, ValueError) as error:
                     return self._err(str(error))
             if act == "query":
-                return await service.query(
+                result = await service.query(
                     person_id=str(kwargs.get("person_id", "") or ""),
                     person_keyword=str(kwargs.get("person_keyword") or kwargs.get("keyword") or ""),
                     top_k=self._int(kwargs.get("limit", kwargs.get("top_k")), 12, 1, 100),
                     force_refresh=bool(kwargs.get("force_refresh", False)),
                     source_note="astrbot:memory_profile_admin.query",
                 )
+                if not isinstance(result, dict):
+                    return self._err("invalid profile payload")
+                if result.get("success") and result.get("person_id"):
+                    result.update(
+                        ProfileService.uncertain_profile_candidates(
+                            ctx,
+                            str(result.get("person_id")),
+                            str(kwargs.get("context_text", "") or ""),
+                        )
+                    )
+                return result
             if act == "evidence":
                 profile = await service.query(
                     person_id=str(kwargs.get("person_id", "") or ""),
