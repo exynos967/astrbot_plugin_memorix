@@ -1,4 +1,7 @@
+import json
+import os
 import sqlite3
+import time
 from contextlib import closing
 from pathlib import Path
 
@@ -180,3 +183,85 @@ def test_validation_failure_cannot_commit_new_version(tmp_path, monkeypatch):
     with closing(sqlite3.connect(db)) as old:
         assert old.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 8
         assert old.execute("SELECT 1 FROM sqlite_master WHERE name='fact_claims'").fetchone() is None
+
+
+def fake_backup(directory, *, age_seconds, index):
+    directory.mkdir(parents=True, exist_ok=True)
+    item = directory / f"metadata.db.v8-to-v{SCHEMA_VERSION}.20260101-00000{index}.{index:012x}.sqlite3"
+    item.write_bytes(b"SQLite format 3\x00")
+    stamp = time.time() - age_seconds
+    os.utime(item, (stamp, stamp))
+    return item
+
+
+def test_old_backups_are_pruned_to_retention(tmp_path):
+    db = tmp_path / "metadata.db"
+    legacy_database(db).close()
+    backups = tmp_path / "backups"
+    for index in range(5):
+        fake_backup(backups, age_seconds=100 - index, index=index)
+    store = MetadataStore(tmp_path)
+    try:
+        store.connect()
+        assert store.get_schema_version() == SCHEMA_VERSION
+        remaining = sorted(backups.glob("*.sqlite3"))
+        assert len(remaining) == migration.BACKUP_RETENTION
+        assert Path(store.migration_report["backup_path"]) in remaining
+    finally:
+        store.close()
+
+
+def test_failure_writes_breaker_marker_and_blocks_retry(tmp_path, monkeypatch):
+    db = tmp_path / "metadata.db"
+    legacy_database(db).close()
+    store = MetadataStore(tmp_path)
+
+    def fail_after_ddl():
+        raise RuntimeError("simulated failure")
+
+    monkeypatch.setattr(store, "_migrate_schema", fail_after_ddl)
+    with pytest.raises(RuntimeError, match="事务已回滚"):
+        store.connect()
+    marker = tmp_path / ".migration-failed"
+    assert marker.exists()
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["from_version"] == 8
+    assert payload["to_version"] == SCHEMA_VERSION
+    assert "simulated failure" in payload["error"]
+    backups_after_failure = list((tmp_path / "backups").glob("*.sqlite3"))
+    assert len(backups_after_failure) == 1
+
+    retry = MetadataStore(tmp_path)
+    with pytest.raises(RuntimeError, match="熔断冷却期"):
+        retry.connect()
+    assert len(list((tmp_path / "backups").glob("*.sqlite3"))) == len(backups_after_failure)
+
+
+def test_breaker_expires_after_cooldown_and_is_cleared_on_success(tmp_path):
+    db = tmp_path / "metadata.db"
+    legacy_database(db).close()
+    marker = tmp_path / ".migration-failed"
+    marker.write_text(
+        json.dumps({"failed_at": time.time() - migration.MIGRATION_FAILURE_COOLDOWN_SECONDS - 60}),
+        encoding="utf-8",
+    )
+    store = MetadataStore(tmp_path)
+    try:
+        store.connect()
+        assert store.get_schema_version() == SCHEMA_VERSION
+        assert not marker.exists()
+    finally:
+        store.close()
+
+
+def test_corrupt_breaker_marker_does_not_lock_the_store(tmp_path):
+    db = tmp_path / "metadata.db"
+    legacy_database(db).close()
+    (tmp_path / ".migration-failed").write_text("not json", encoding="utf-8")
+    store = MetadataStore(tmp_path)
+    try:
+        store.connect()
+        assert store.get_schema_version() == SCHEMA_VERSION
+        assert not (tmp_path / ".migration-failed").exists()
+    finally:
+        store.close()

@@ -1,5 +1,6 @@
 """启动与离线命令共用的 metadata 自动迁移边界。"""
 
+import json
 import sqlite3
 import time
 import uuid
@@ -13,6 +14,13 @@ from .core_schema import CORE_COLUMNS
 from .metadata_schema import SCHEMA_VERSION
 
 logger = get_logger("Memorix.Migration")
+
+# 迁移失败后写入 `.migration-failed` 标记并进入冷却期：期间直接拒绝重试，
+# 避免高频事件循环反复触发「整库备份 + 迁移回滚」把磁盘写爆（单份备份≈整库大小）。
+MIGRATION_FAILURE_COOLDOWN_SECONDS = 6 * 3600
+# 迁移备份保留份数（含本次新建的一份）。数据库越大，这个上限越是磁盘占用的硬约束。
+BACKUP_RETENTION = 2
+FAILURE_MARKER_NAME = ".migration-failed"
 
 
 @dataclass(frozen=True)
@@ -90,13 +98,111 @@ def backup_database(path: Path, *, source_version: int) -> Path:
         # 避免在持写事务的同一连接上调用 backup 导致等待自身锁。
         with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as source:
             with closing(sqlite3.connect(backup_path)) as target:
-                source.backup(target, pages=256, progress=progress, sleep=0.05)
+                # 本地文件备份无需限流：pages=1024 减少步数，sleep=0 取消每步等待。
+                # 写入迁移事务的写锁随备份一起持有，吞吐直接决定该库的不可写时长。
+                source.backup(target, pages=1024, progress=progress, sleep=0)
                 if target.execute("PRAGMA quick_check").fetchone()[0] != "ok":
                     raise RuntimeError("数据库备份完整性检查失败")
     except BaseException:
         backup_path.unlink(missing_ok=True)
         raise
     return backup_path
+
+
+def _backup_directory(path: Path) -> Path:
+    return path.parent / "backups"
+
+
+def _failure_marker(path: Path) -> Path:
+    return path.parent / FAILURE_MARKER_NAME
+
+
+def prune_old_backups(path: Path, *, keep: int = BACKUP_RETENTION) -> int:
+    """只保留该库最近 keep 份迁移备份，返回删除份数；清理失败不影响迁移。"""
+    directory = _backup_directory(path)
+    if keep < 0 or not directory.is_dir():
+        return 0
+    prefix = f"{path.name}."
+    candidates = sorted(
+        (
+            item
+            for item in directory.iterdir()
+            if item.is_file() and item.name.startswith(prefix) and item.name.endswith(".sqlite3")
+        ),
+        key=lambda item: (item.stat().st_mtime_ns, item.name),
+        reverse=True,
+    )
+    removed = 0
+    for stale in candidates[keep:]:
+        try:
+            stale.unlink()
+            removed += 1
+        except OSError as exc:
+            logger.warning("清理历史迁移备份失败: %s (%s)", stale, exc)
+    if removed:
+        logger.info("已清理历史迁移备份 %s 份，保留最近 %s 份", removed, keep)
+    return removed
+
+
+def check_migration_breaker(path: Path, *, source_version: int) -> None:
+    """冷却期内拒绝重复迁移，避免失败重试把「整库备份」无限放大。"""
+    marker = _failure_marker(path)
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError):
+        # 标记损坏视为已失效，避免把插件永久锁死。
+        logger.warning("迁移熔断标记不可读，忽略: %s", marker)
+        return
+    try:
+        failed_at = float(payload.get("failed_at") or 0)
+    except (TypeError, ValueError):
+        failed_at = 0.0
+    elapsed = time.time() - failed_at
+    if elapsed >= MIGRATION_FAILURE_COOLDOWN_SECONDS:
+        return
+    remaining = int(MIGRATION_FAILURE_COOLDOWN_SECONDS - elapsed)
+    raise RuntimeError(
+        f"metadata 迁移处于熔断冷却期，{remaining} 秒内不再重试："
+        f"上次 {payload.get('from_version', source_version)} -> {payload.get('to_version', SCHEMA_VERSION)} "
+        f"迁移失败于 {payload.get('failed_at_text', '未知时间')}，原因: {payload.get('error', '未知')}。"
+        f"请修复数据库或升级插件后删除标记文件 {marker} 再重试"
+    )
+
+
+def write_migration_failure(path: Path, *, source_version: int, error: str) -> None:
+    """写入熔断标记（时间戳 + 失败原因），供冷却期拒绝重试与人工排查。"""
+    marker = _failure_marker(path)
+    payload = {
+        "failed_at": time.time(),
+        "failed_at_text": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "from_version": source_version,
+        "to_version": SCHEMA_VERSION,
+        "error": error[:500],
+    }
+    try:
+        marker.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        marker.chmod(0o600)
+    except OSError as exc:
+        logger.warning("写入迁移熔断标记失败: %s (%s)", marker, exc)
+        return
+    logger.error(
+        "已写入迁移熔断标记，%s 秒内不再重试: %s", MIGRATION_FAILURE_COOLDOWN_SECONDS, marker
+    )
+
+
+def clear_migration_failure(path: Path) -> None:
+    """迁移成功或已处于目标版本时清除熔断标记。"""
+    marker = _failure_marker(path)
+    try:
+        marker.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        logger.warning("清理迁移熔断标记失败: %s (%s)", marker, exc)
+        return
+    logger.info("已清除迁移熔断标记: %s", marker)
 
 
 def validate_schema_shape(conn: sqlite3.Connection) -> None:
@@ -141,9 +247,11 @@ def validate_migrated_schema(conn: sqlite3.Connection) -> None:
 def migrate_metadata(store: Any) -> dict[str, Any] | None:
     state = inspect_database(store._conn)
     if state.kind == "current":
+        clear_migration_failure(store._db_path)
         return None
     if store._conn.in_transaction:
         raise RuntimeError("自动迁移必须在后台任务启动前、无活动事务时执行")
+    check_migration_breaker(store._db_path, source_version=state.version)
     backup_path = None
     foreign_keys_enabled = bool(store._conn.execute("PRAGMA foreign_keys").fetchone()[0])
     if foreign_keys_enabled:
@@ -153,10 +261,13 @@ def migrate_metadata(store: Any) -> dict[str, Any] | None:
             # 数据库写锁负责跨连接/进程串行化，等待期间其他实例可能已完成迁移。
             state = inspect_database(conn)
             if state.kind == "current":
+                # 写锁等待期间其他实例已完成迁移，本连接无需再备份。
+                clear_migration_failure(store._db_path)
                 return None
             if state.kind != "empty":
                 backup_path = backup_database(store._db_path, source_version=state.version)
                 logger.info("metadata 迁移备份已保存: %s", backup_path)
+                prune_old_backups(store._db_path)
                 store._migrate_schema()
                 from .format_migration import _migrate_sqlite_metadata, _sqlite_legacy_metadata_exists
 
@@ -171,6 +282,7 @@ def migrate_metadata(store: Any) -> dict[str, Any] | None:
                 store.backfill_person_fact_claims()
             validate_migrated_schema(conn)
             store.set_schema_version(SCHEMA_VERSION)
+        clear_migration_failure(store._db_path)
         report = {
             "from_version": state.version,
             "to_version": SCHEMA_VERSION,
@@ -188,9 +300,9 @@ def migrate_metadata(store: Any) -> dict[str, Any] | None:
         last_frame = tb_frames[-1] if tb_frames else None
         where = f" [v2-migrator {Path(last_frame.filename).name}:{last_frame.lineno}]" if last_frame else " [v2-migrator]"
         location = f"；备份: {backup_path}" if backup_path else ""
-        raise RuntimeError(
-            f"metadata 自动迁移失败，事务已回滚{location}；原因{where}: {type(exc).__name__}: {exc}"
-        ) from exc
+        message = f"metadata 自动迁移失败，事务已回滚{location}；原因{where}: {type(exc).__name__}: {exc}"
+        write_migration_failure(store._db_path, source_version=state.version, error=message)
+        raise RuntimeError(message) from exc
     finally:
         if foreign_keys_enabled:
             store._conn.execute("PRAGMA foreign_keys = ON")
