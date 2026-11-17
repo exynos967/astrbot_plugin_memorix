@@ -1,7 +1,7 @@
 name: astrbot_plugin_memorix
 display_name: Memorix
 desc: 让AstrBot拥有可检索、可维护、可追溯的长期记忆——基于 A_Memorix v2.0 双向量池+知识图谱混合检索，支持结构化事实账本、知识包迁移、多模态图片记忆与内嵌 WebUI。
-version: v2.0.0
+version: v2.0.1
 author: 薄暝
 repo: https://github.com/exynos967/astrbot_plugin_memorix
 support_platforms:
